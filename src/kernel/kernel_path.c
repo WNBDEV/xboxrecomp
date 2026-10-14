@@ -260,14 +260,44 @@ static BOOL xbox_partition_device_path(const char *xbox_path, WCHAR *out, DWORD 
         return FALSE;
 
     rest = xbox_path + len + 1;
-    /* Nothing below it, allowing for a single trailing separator. */
-    if (*rest == '\\' || *rest == '/')
+    /* Nothing below it, allowing for a single trailing separator -- except on
+     * the cache partitions. There "PartitionN\" is the root directory of the
+     * utility drive, and the rules table already sends everything under that
+     * root to the Cache directory, so the root itself belongs there too.
+     * XMountUtilityDrive opens it as a directory to check the cluster size of
+     * the volume it has just formatted; handed the image instead, the check
+     * never looked at the utility drive at all. */
+    if (*rest == '\\' || *rest == '/') {
+        if (digit >= '3' && digit <= '5')
+            return FALSE;
         rest++;
+    }
     if (*rest != '\0')
         return FALSE;
 
     swprintf_s(out, n, L"%s\\Partition%c.img", s_save_dir, (WCHAR)digit);
     return TRUE;
+}
+
+/*
+ * Is a host path on the utility drive -- the Cache directory that Z: and the
+ * cache partitions 3-5 all map to? kernel_file.c asks because that volume's
+ * cluster size is the title's choice rather than FATX's fixed 16 KB. Accepts
+ * the "\\?\" form GetFinalPathNameByHandleW returns.
+ */
+BOOL xbox_path_is_utility_drive(const WCHAR *host_path)
+{
+    WCHAR cache[MAX_PATH];
+    size_t n;
+
+    if (!host_path || !s_initialized)
+        return FALSE;
+    if (wcsncmp(host_path, L"\\\\?\\", 4) == 0)
+        host_path += 4;
+    swprintf_s(cache, MAX_PATH, L"%s\\Cache", s_save_dir);
+    n = wcslen(cache);
+    return _wcsnicmp(host_path, cache, n) == 0 &&
+           (host_path[n] == L'\0' || host_path[n] == L'\\');
 }
 
 void xbox_path_init(const char* game_dir, const char* save_dir)

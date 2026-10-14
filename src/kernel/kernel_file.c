@@ -16,6 +16,7 @@
 
 #define _GNU_SOURCE   /* FNM_CASEFOLD */
 #include "kernel.h"
+#include "xbox_memory_layout.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -51,6 +52,29 @@ static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
  * Reporting the host's PC-typical 4 KB cluster (512 x 8) fails that check. */
 #define XBOX_BYTES_PER_SECTOR       512u
 #define XBOX_SECTORS_PER_CLUSTER    32u      /* 512 * 32 = 16384 */
+
+/* The utility drive is the exception. That check lives in XMountUtilityDrive,
+ * and the size it wants is the title's own: XBE init flags bits 30-31 pick
+ * 16, 32, 64 or 128 KB, Z: is formatted with that size, and the volume is
+ * rejected unless FileFsSizeInformation reports the same product. Half-Life 2
+ * asks for 16 KB, which is why the fixed answer above worked for it; Alter
+ * Echo asks for 64 KB, failed the check, and XapiInitProcess sent it to the
+ * dashboard with "invalid hard disk" before it drew a frame. */
+#define XBE_INIT_FLAGS_VA           (XBOX_BASE_ADDRESS + 0x124u)
+
+#if defined(_WIN32)
+static ULONG xbox_utility_sectors_per_cluster(void)
+{
+    uint32_t flags;
+
+    if (!xbox_GetMemoryBase())
+        return XBOX_SECTORS_PER_CLUSTER;
+    memcpy(&flags,
+           (const uint8_t *)(uintptr_t)XBE_INIT_FLAGS_VA + xbox_GetMemoryOffset(),
+           sizeof(flags));
+    return (0x4000u << (flags >> 30)) / XBOX_BYTES_PER_SECTOR;
+}
+#endif
 
 /* ======================================================================== */
 /* Shared by both backends. kernel_bridge.c calls xbox_LastFileError()
@@ -507,7 +531,7 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FsInformation, ULONG Length, XBOX_FS_INFORMATION_CLASS FsInformationClass)
 {
-    (void)FileHandle; (void)Length;
+    (void)Length;
     if (!IoStatusBlock || !FsInformation)
         return STATUS_INVALID_PARAMETER;
 
@@ -515,15 +539,23 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
         case XboxFileFsSizeInformation: {
             PXBOX_FILE_FS_SIZE_INFORMATION info = (PXBOX_FILE_FS_SIZE_INFORMATION)FsInformation;
             ULARGE_INTEGER free_bytes, total_bytes, total_free;
+            ULONG spc = XBOX_SECTORS_PER_CLUSTER;
+            WCHAR handle_path[MAX_PATH];
+            DWORD path_len = GetFinalPathNameByHandleW(FileHandle, handle_path,
+                                                       MAX_PATH, FILE_NAME_NORMALIZED);
+
+            if (path_len && path_len < MAX_PATH &&
+                xbox_path_is_utility_drive(handle_path))
+                spc = xbox_utility_sectors_per_cluster();
             if (GetDiskFreeSpaceExW(NULL, &free_bytes, &total_bytes, &total_free)) {
                 info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
-                info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
+                info->SectorsPerAllocationUnit = spc;
                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
                 info->TotalAllocationUnits.QuadPart = total_bytes.QuadPart / cs;
                 info->AvailableAllocationUnits.QuadPart = free_bytes.QuadPart / cs;
             } else {
                 info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
-                info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
+                info->SectorsPerAllocationUnit = spc;
                 info->TotalAllocationUnits.QuadPart = 1048576;
                 info->AvailableAllocationUnits.QuadPart = 524288;
             }
