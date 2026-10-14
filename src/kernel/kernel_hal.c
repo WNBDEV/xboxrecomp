@@ -167,6 +167,88 @@ void xbox_IrqlDumpHolders(void)
     fflush(stderr);
 }
 
+/* RECOMP_IRQL_LOCK: DISPATCH_LEVEL as one processor.
+ *
+ * The count above lets a device model hold an interrupt off while the guest is
+ * raised, but nothing holds the guest off while a host thread runs an ISR or a
+ * DPC -- and on the console nothing has to, because there is one CPU and the
+ * guest thread is simply not running. Here the two run side by side, and code
+ * that raises to DISPATCH_LEVEL to read what a DPC writes can see it half
+ * written. Alter Echo's XPP does exactly that: its enumeration DPC sets the
+ * pad's bit in the connected mask, then marks the device entry ready a few
+ * instructions later. The title, spinning on XGetDeviceChanges, saw the bit in
+ * between, called XInputOpen, got ERROR_DEVICE_NOT_CONNECTED, and never asked
+ * again because the insertion had been consumed.
+ *
+ * With this set, crossing up into DISPATCH_LEVEL takes one process-wide lock
+ * and crossing back down releases it, so only one thread is ever at or above
+ * DISPATCH_LEVEL -- what a single processor gives the guest. Both kinds of
+ * wait are bounded: a raise that is never lowered must cost a delay and a
+ * message, not a deadlock, which is the same trade the OHCI hold-off makes.
+ * Host delivery of an ISR or DPC gives up sooner than a guest thread does,
+ * because a guest at DISPATCH_LEVEL may be spinning on an effect only the
+ * interrupt can produce. Off unless set, so a title that works keeps the
+ * timing it has. */
+#define DISPATCH_WAIT_GUEST_MS     2000
+#define DISPATCH_WAIT_DELIVERY_MS  100
+
+static CRITICAL_SECTION s_dispatch_cs;
+static INIT_ONCE s_dispatch_once = INIT_ONCE_STATIC_INIT;
+static int s_dispatch_on;
+static XBOX_THREAD_LOCAL int t_dispatch_held;
+static XBOX_THREAD_LOCAL int t_delivering;   /* inside xbox_IrqlEnterInterrupt */
+
+static BOOL CALLBACK dispatch_init(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    (void)once; (void)param; (void)ctx;
+    s_dispatch_on = getenv("RECOMP_IRQL_LOCK") != NULL;
+    if (s_dispatch_on) {
+        InitializeCriticalSection(&s_dispatch_cs);
+        fprintf(stderr, "  [IRQL] DISPATCH_LEVEL lock on (RECOMP_IRQL_LOCK)\n");
+        fflush(stderr);
+    }
+    return TRUE;
+}
+
+static void dispatch_acquire(void)
+{
+    int budget, waited;
+
+    InitOnceExecuteOnce(&s_dispatch_once, dispatch_init, NULL, NULL);
+    if (!s_dispatch_on || t_dispatch_held)
+        return;
+    if (TryEnterCriticalSection(&s_dispatch_cs)) {
+        t_dispatch_held = 1;
+        return;
+    }
+    budget = t_delivering ? DISPATCH_WAIT_DELIVERY_MS : DISPATCH_WAIT_GUEST_MS;
+    for (waited = 0; waited < budget; waited++) {
+        Sleep(1);
+        if (TryEnterCriticalSection(&s_dispatch_cs)) {
+            t_dispatch_held = 1;
+            return;
+        }
+    }
+    {
+        static volatile LONG n;
+        if (InterlockedIncrement(&n) <= 5) {
+            fprintf(stderr, "  [IRQL] tid %lu waited %d ms for DISPATCH_LEVEL "
+                    "(%s); running without it\n",
+                    (unsigned long)GetCurrentThreadId(), budget,
+                    t_delivering ? "ISR/DPC delivery" : "guest raise");
+            xbox_IrqlDumpHolders();
+        }
+    }
+}
+
+static void dispatch_release(void)
+{
+    if (t_dispatch_held) {
+        t_dispatch_held = 0;
+        LeaveCriticalSection(&s_dispatch_cs);
+    }
+}
+
 static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
 {
     int was = (old_level >= DISPATCH_LEVEL);
@@ -176,6 +258,9 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
     if (now == was)
         return;
 
+    if (now)
+        dispatch_acquire();
+
     d = now ? InterlockedIncrement(&g_irql_raised_count)
             : InterlockedDecrement(&g_irql_raised_count);
     InterlockedIncrement(&s_transitions);
@@ -183,6 +268,9 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
         irql_holder_add(ra);
     else
         irql_holder_drop();
+
+    if (!now)
+        dispatch_release();
 
     /* RECOMP_IRQL_TRACE prints the first few transitions. The pairing is what
      * matters: a raise to 2 followed by a lower from 2 nets out, and a lower
@@ -213,7 +301,9 @@ int xbox_IrqlEnterInterrupt(int level)
 {
     int saved = (int)g_current_irql;
     if (g_current_irql != (KIRQL)level) {
+        t_delivering = 1;               /* bounded wait for the lock */
         irql_track(g_current_irql, (KIRQL)level, IRQL_CALLER());
+        t_delivering = 0;
         g_current_irql = (KIRQL)level;
         irql_publish();
     }
