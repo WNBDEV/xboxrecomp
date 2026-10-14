@@ -2284,6 +2284,93 @@ static void kernel_vblank_tick(void)
     }
 }
 
+/* Software methods: a NO_OPERATION with a non-zero parameter.
+ *
+ * The NV2A treats one as a request for the CPU: PGRAPH traps it, records the
+ * method and its data in TRAPPED_ADDR / TRAPPED_DATA_LOW, flags the error
+ * interrupt with a notification as the source, and the pushbuffer stalls until
+ * the handler has run. XDK D3D uses this to sleep instead of spin: BlockOnTime
+ * queues WAIT_FOR_IDLE, then a NOP carrying 5, and waits on an event in the
+ * device that its ISR sets when it sees that method. Without it nothing ever
+ * sets the event (Alter Echo's state 3 sat in that wait for good).
+ *
+ * The executor runs on the NV2A poll thread, so it can stall here like the
+ * pushbuffer would; the interrupt itself goes out from the timer thread, which
+ * has the guest stack and TIB an ISR needs.
+ *
+ * "Handled" is read from PGRAPH_FIFO. XDK D3D's ISR only claims the interrupt
+ * and queues a DPC; the DPC's PGRAPH handler (0x0016FD30 in Alter Echo) zeroes
+ * PGRAPH_FIFO on entry and sets it to 1 on the way out, unconditionally -- its
+ * "resume the pipeline". So it is zeroed here and the stream waits for the 1.
+ * Until then the timer thread keeps raising the line, as a level-triggered
+ * interrupt stays asserted: an ISR that declines because a vblank has just
+ * masked interrupts is not a lost method, since that vblank's DPC reads
+ * PMC_INTR_0, finds the PGRAPH bit and handles it too.
+ *
+ * The status bits are cleared here once it is handled, never by the timer
+ * thread: the work happens in the DPC, after the ISR returns, so clearing them
+ * at the ISR left the DPC nothing to find. They have to be cleared by someone,
+ * because the aperture is plain memory and the handler's write-one-to-clear
+ * acknowledgement only writes the value back. While this thread is stalled
+ * here, the poll loop that otherwise holds those registers at zero (NV2A_ACK
+ * in xbox_memory_layout.c) is not running, so the DPC sees what was set. */
+#define NV2A_PMC_INTR_PGRAPH           (1u << 12)
+#define NV2A_PGRAPH_INTR               0x00400100u
+#define NV2A_PGRAPH_INTR_ERROR         (1u << 20)
+#define NV2A_PGRAPH_NSOURCE            0x00400108u
+#define NV2A_PGRAPH_NSOURCE_NOTIFY     (1u << 0)
+#define NV2A_PGRAPH_TRAPPED_ADDR       0x00400704u
+#define NV2A_PGRAPH_TRAPPED_DATA_LOW   0x00400708u
+#define NV2A_PGRAPH_FIFO               0x00400720u
+
+static volatile LONG s_swmethod_pending;
+
+void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t method, uint32_t param)
+{
+    static unsigned n_handled, n_lost;
+    int waited, handled = 0;
+
+    if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
+        return;                               /* nobody to tell */
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_FIFO) = 0;
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_TRAPPED_ADDR) =
+        ((subch & 7u) << 16) | (method & 0x1FFFu);   /* channel 0 */
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_TRAPPED_DATA_LOW) = param;
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_NSOURCE) =
+        NV2A_PGRAPH_NSOURCE_NOTIFY;
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_INTR) |= NV2A_PGRAPH_INTR_ERROR;
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)  |= NV2A_PMC_INTR_PGRAPH;
+    InterlockedExchange(&s_swmethod_pending, 1);
+
+    /* Stall the stream until the handler has run, as the hardware does.
+     * Bounded: a timer thread that is not running must not wedge the GPU. */
+    for (waited = 0; waited < 500; waited++) {
+        if (BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_FIFO) & 1u) {
+            handled = 1;
+            break;
+        }
+        Sleep(1);
+    }
+    InterlockedExchange(&s_swmethod_pending, 0);
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_INTR)    &= ~NV2A_PGRAPH_INTR_ERROR;
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_NSOURCE) = 0;
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)     &= ~NV2A_PMC_INTR_PGRAPH;
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_FIFO)    = 1;
+
+    if (handled ? n_handled++ < 3 : n_lost++ < 3) {
+        fprintf(stderr, "  [NV2A] software method %04X=%08X %s after %d ms\n",
+                method, param, handled ? "handled" : "NOT handled", waited);
+        fflush(stderr);
+    }
+}
+
+/* Keep the line up while a software method is waiting (see above). */
+static void kernel_swmethod_tick(void)
+{
+    if (InterlockedCompareExchange(&s_swmethod_pending, 0, 0))
+        kernel_raise_interrupt(NV2A_VECTOR);
+}
+
 /* Run whatever is queued. Called from the timer thread, which has the guest
  * stack and TIB that a deferred routine needs. */
 static void kernel_drain_dpcs(void)
@@ -2572,6 +2659,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 
         Sleep(10);
         kernel_vblank_tick();  /* the GPU's frame clock */
+        kernel_swmethod_tick(); /* a NOP the pushbuffer is stalled on */
         kernel_drain_dpcs();   /* deferred work, before due timers */
         now = (long long)GetTickCount64();
 

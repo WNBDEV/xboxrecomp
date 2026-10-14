@@ -121,6 +121,62 @@ static uint32_t dma_resolve(uint32_t offset)
     return offset;                         /* nothing better to offer */
 }
 
+/* The physical base of a context DMA object, from its handle.
+ *
+ * dma_resolve above takes every offset as physical, which holds for the
+ * objects D3D builds over all of memory and not for the ones it builds over a
+ * single allocation. The semaphore is one of the latter: Alter Echo's D3D
+ * points SET_CONTEXT_DMA_SEMAPHORE at a 0x20-byte object based at physical
+ * 0x2000 and releases at offset 0, so taken as physical the GPU clock went to
+ * address 0 and D3D blocked for good on a time that never advanced.
+ *
+ * D3D writes the hash table and the objects into instance memory through the
+ * register aperture, which this runtime backs with plain memory, so they can
+ * be read back the way PFIFO would. NV_PFIFO_RAMHT gives the table's place
+ * and size; the hash folds the handle in (log2(size) - 1)-bit chunks and
+ * mixes in the channel; an entry is {handle, context} with the instance in
+ * the low 16 bits of the context (in 16-byte units) and bit 31 valid. The
+ * object is {flags, limit, frame}: base = frame & ~0xFFF plus the adjust in
+ * flags[31:20]. Returns 0 with *ok cleared when anything does not check out,
+ * so a caller can fall back rather than write somewhere invented. */
+#define NV2A_APERTURE           0xFD000000u
+#define NV_PFIFO_RAMHT          0x00002210u
+#define NV_PFIFO_CACHE1_PUSH1   0x00003204u
+#define NV_PRAMIN               0x00700000u
+
+static uint32_t dma_object_base(uint32_t handle, int *ok)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    const uint8_t *ramin = mem + NV2A_APERTURE + NV_PRAMIN;
+    uint32_t ramht, ramht_base, ramht_size, bits, hash, h, chid;
+    uint32_t entry_handle, entry_ctx, inst, flags, frame;
+
+    *ok = 0;
+    memcpy(&ramht, mem + NV2A_APERTURE + NV_PFIFO_RAMHT, 4);
+    memcpy(&chid, mem + NV2A_APERTURE + NV_PFIFO_CACHE1_PUSH1, 4);
+    chid &= 0x1F;
+    ramht_base = (ramht & 0x1F0u) << 8;
+    ramht_size = 4096u << ((ramht >> 16) & 3);
+    bits = 11 + ((ramht >> 16) & 3);           /* log2(size) - 1 */
+    hash = 0;
+    for (h = handle; h; h >>= bits)
+        hash ^= h & ((1u << bits) - 1);
+    hash ^= chid << (bits - 4);
+    if ((hash + 1) * 8 > ramht_size)
+        return 0;
+    memcpy(&entry_handle, ramin + ramht_base + hash * 8, 4);
+    memcpy(&entry_ctx,    ramin + ramht_base + hash * 8 + 4, 4);
+    if (entry_handle != handle || !(entry_ctx & 0x80000000u))
+        return 0;
+    inst = (entry_ctx & 0xFFFFu) << 4;
+    if (inst >= 0x100000u)                     /* PRAMIN is 1 MB */
+        return 0;
+    memcpy(&flags, ramin + inst, 4);
+    memcpy(&frame, ramin + inst + 8, 4);
+    *ok = 1;
+    return (frame & 0xFFFFF000u) | (flags >> 20);
+}
+
 static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what)
 {
     static int said;
@@ -322,6 +378,9 @@ static struct {
     int xf_nfmt, xf_seeded;
     uint32_t depth_test, depth_func, depth_mask;
     uint32_t zeta_offset, zstencil_clear;
+    /* SET_CONTEXT_DMA_SEMAPHORE handle and SET_SEMAPHORE_OFFSET, for
+     * BACK_END_WRITE_SEMAPHORE_RELEASE -- D3D's GPU clock. */
+    uint32_t semaphore_dma, semaphore_offset, semaphore_releases;
 } s_gpu;
 
 /* Unhandled methods, ranked. The interesting output is not that something was
@@ -2035,7 +2094,13 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
         sv = (float)s_gpu.texs[0].height;
     }
     for (k = 0; k < 3; k++) {
-        T.iw[k] = 1.0f / v[k]->pos[3];
+        /* A w of infinity (or 0) carries no perspective. D3D's XYZRHW path
+         * outputs w = 1/rhw, and a title that leaves rhw at 0 -- Alter Echo's
+         * text -- gets infinity: 1/w = 0 made every texture coordinate 0/0,
+         * every texel NaN, and the alpha test failed every pixel, so 2000
+         * triangles wrote nothing. Treated as 1, as xemu does for the NV2A. */
+        float w = v[k]->pos[3];
+        T.iw[k] = (w == 0.0f || isinf(w)) ? 1.0f : 1.0f / w;
         T.uv[k][0] = v[k]->tex[0][0] * su * T.iw[k];
         T.uv[k][1] = v[k]->tex[0][1] * sv * T.iw[k];
     }
@@ -2071,6 +2136,27 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     T.inv_area = 1.0f / area;
 
     xf_rows_parallel(&T, &cnt);
+    /* RECOMP_PB_ZERO_DIAG: a triangle that covered pixels and wrote none was
+     * cut by state, not geometry -- colour mask, alpha test, a CLIPPLANE
+     * stage. Print that state for the first few, so "0 pixels written" names
+     * its reason instead of needing a rebuild to find it. */
+    if (cnt.pixels == 0 && cnt.depth_fail == 0) {
+        static int diag = -1, shown;
+        if (diag < 0)
+            diag = getenv("RECOMP_PB_ZERO_DIAG") != NULL;
+        if (diag && shown++ < 4)
+            fprintf(stderr, "[GPU] zero-pixel tri: color_mask=%08X "
+                    "alpha_test=%u func=%04X ref=%u rc=%d stage_program=%05X "
+                    "clip_plane_mode=%04X depth_test=%u func=%04X mask=%u "
+                    "tex0 fmt=%02X pal=%08X  v0 d0=%.2f,%.2f,%.2f,%.2f "
+                    "t0=%.3f,%.3f,%.3f,%.3f\n",
+                    s_gpu.color_mask, s_gpu.alpha_test, s_gpu.alpha_func,
+                    s_gpu.alpha_ref, T.use_rc, s_gpu.rc.stage_program,
+                    s_gpu.clip_plane_mode, s_gpu.depth_test, s_gpu.depth_func,
+                    s_gpu.depth_mask, s_gpu.texs[0].color, s_gpu.texs[0].palette,
+                    va->d0[0], va->d0[1], va->d0[2], va->d0[3],
+                    va->tex[0][0], va->tex[0][1], va->tex[0][2], va->tex[0][3]);
+    }
     s_gpu.xf_depth_fail += cnt.depth_fail;
     s_gpu.xf_pixels += cnt.pixels;
     s_gpu.zpass_count += cnt.zpass;
@@ -2987,6 +3073,41 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         memcpy(mem + at, &stamp, 8);
         memcpy(mem + at + 8, &s_gpu.zpass_count, 4);
         memset(mem + at + 12, 0, 4);
+        break;
+    }
+    case 0x0100:                                  /* NO_OPERATION */
+        /* Non-zero is a software method: the CPU's turn (kernel_bridge.c). */
+        if (param) {
+            extern void xbox_Nv2aSoftwareMethod(uint32_t, uint32_t, uint32_t);
+            xbox_Nv2aSoftwareMethod(subch, method, param);
+        }
+        break;
+    case 0x01A4:                                  /* SET_CONTEXT_DMA_SEMAPHORE */
+        s_gpu.semaphore_dma = param;
+        break;
+    case 0x1D6C:                                  /* SET_SEMAPHORE_OFFSET */
+        s_gpu.semaphore_offset = param;
+        break;
+    case 0x1D70: {                                /* BACK_END_WRITE_SEMAPHORE_RELEASE */
+        /* Write the value once everything before it is done -- which, in an
+         * executor that finishes each method as it reads it, is now. This is
+         * how D3D's clock moves: it queues a release of the next time stamp
+         * after each batch of work and BlockOnTime polls the slot. Dropped,
+         * the first Lock of a resource the GPU had touched never returned. */
+        uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+        int ok;
+        uint32_t base = dma_object_base(s_gpu.semaphore_dma, &ok);
+        uint32_t at = dma_resolve(base + s_gpu.semaphore_offset);
+        if (!ok && s_gpu.semaphore_releases == 0)
+            fprintf(stderr, "[GPU] semaphore DMA 0x%X not found in RAMHT; "
+                    "taking offset 0x%X as physical\n",
+                    s_gpu.semaphore_dma, s_gpu.semaphore_offset);
+        else if (s_gpu.semaphore_releases == 0)
+            fprintf(stderr, "[GPU] semaphore DMA 0x%X base 0x%08X + 0x%X "
+                    "-> 0x%08X\n", s_gpu.semaphore_dma, base,
+                    s_gpu.semaphore_offset, at);
+        memcpy(mem + at, &param, 4);
+        s_gpu.semaphore_releases++;
         break;
     }
     case NV097_SET_BLEND_COLOR:
