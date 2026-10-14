@@ -82,6 +82,16 @@ static inline void mmio_set_flags(PCONTEXT ctx, uint64_t result, int size,
         ctx->EFlags |= 0x0001u;                                   /* CF */
 }
 
+/* Store an operation's result in a register the way the CPU would: 8- and
+ * 16-bit writes keep the rest, a 32-bit write clears the high half. */
+static inline void mmio_set_reg(uint64_t *dst, uint64_t v, int size)
+{
+    if (size == 1)      *dst = (*dst & ~0xFFULL)   | (v & 0xFF);
+    else if (size == 2) *dst = (*dst & ~0xFFFFULL) | (v & 0xFFFF);
+    else if (size == 4) *dst = v & 0xFFFFFFFFULL;
+    else                *dst = v;
+}
+
 /* 1 if the instruction at ctx->Rip was serviced and Rip advanced past it. */
 static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
                                mmio_read_fn rd, mmio_write_fn wr)
@@ -185,6 +195,41 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
         wr(dev, off, rd(dev, off, size) & *mmio_ctx_reg(ctx, reg), size);
         ctx->Rip += prefix + 1 + mlen;
         return 1;
+
+    /* The register-destination forms. GCC folds a register read straight
+     * into the operation that uses it, so guest `mov eax,[ecx+0Ch]; and eax,
+     * edx` can come out as `and r8d,[rcx+rdx]` -- an OHCI interrupt handler
+     * masking HcInterruptStatus with HcInterruptEnable does exactly that. */
+    case 0x0A: case 0x0B:                            /* OR  r, r/m   (read)  */
+    case 0x22: case 0x23:                            /* AND r, r/m   (read)  */
+    case 0x32: case 0x33: {                          /* XOR r, r/m   (read)  */
+        uint64_t m, r, v, *dst;
+        if (!(op[0] & 1)) size = 1;
+        mlen = mmio_modrm_len(op + 1, rex_b);
+        reg  = ((op[1] >> 3) & 7) | (rex_r ? 8 : 0);
+        m    = rd(dev, off, size);
+        dst  = mmio_ctx_reg(ctx, reg);
+        r    = *dst;
+        v    = op[0] <= 0x0B ? (r | m) : op[0] <= 0x23 ? (r & m) : (r ^ m);
+        mmio_set_reg(dst, v, size);
+        mmio_set_flags(ctx, v, size, 0);
+        ctx->Rip += prefix + 1 + mlen;
+        return 1;
+    }
+
+    case 0x3A: case 0x3B: {                          /* CMP r, r/m           */
+        uint64_t m, r, mask;
+        if (op[0] == 0x3A) size = 1;
+        mlen = mmio_modrm_len(op + 1, rex_b);
+        reg  = ((op[1] >> 3) & 7) | (rex_r ? 8 : 0);
+        m    = rd(dev, off, size);
+        r    = *mmio_ctx_reg(ctx, reg);
+        mask = (size < 8) ? ((1ULL << (size * 8)) - 1) : ~0ULL;
+        m &= mask; r &= mask;
+        mmio_set_flags(ctx, r - m, size, r < m);
+        ctx->Rip += prefix + 1 + mlen;
+        return 1;
+    }
 
     case 0x0F:
         if (op[1] == 0xB6 || op[1] == 0xB7) {        /* MOVZX r32, r/m8|16   */

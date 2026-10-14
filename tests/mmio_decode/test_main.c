@@ -159,6 +159,43 @@ int main(void)
       mmio_emulate(&ctx, 0x54, NULL, t_read, t_write);
       CHECK_U64("and masks existing bits", dev.val, 0x0F); }
 
+    /* and r8d, [rcx+rdx] -- 44 23 04 11. The register-destination form, as
+     * GCC emits for an OHCI ISR masking HcInterruptStatus: read only, result
+     * in r8 with the high half cleared, flags from the result. */
+    { const uint8_t c[] = { 0x44, 0x23, 0x04, 0x11 };
+      memset(&dev, 0, sizeof dev);
+      ctx.Rip = (DWORD64)(uintptr_t)c;
+      ctx.R8 = 0xFFFFFFFF80000073ULL; ctx.EFlags = 0;
+      dev.next_read = 0x00000044;
+      CHECK("and r,r/m handled",
+            mmio_emulate(&ctx, 0x54, NULL, t_read, t_write));
+      CHECK_U64("and r,r/m result", ctx.R8, 0x40ULL);
+      CHECK("and r,r/m does not write", dev.reads == 1 && dev.writes == 0);
+      CHECK("and r,r/m nonzero -> ZF clear", (ctx.EFlags & 0x40) == 0);
+      CHECK_U64("and r,r/m length", ctx.Rip - (DWORD64)(uintptr_t)c, 4); }
+
+    /* or ecx, [rax] -- 0B 08; xor ecx, [rax] -- 33 08. */
+    { const uint8_t c[] = { 0x0B, 0x08 };
+      ctx.Rcx = 0x0F;
+      CHECK("or r,r/m handled", run(c, sizeof c, &ctx)); }
+    { const uint8_t c[] = { 0x33, 0x08 };
+      memset(&dev, 0, sizeof dev);
+      ctx.Rip = (DWORD64)(uintptr_t)c;
+      ctx.Rcx = 0xFF; dev.next_read = 0xFF; ctx.EFlags = 0;
+      mmio_emulate(&ctx, 0x54, NULL, t_read, t_write);
+      CHECK_U64("xor r,r/m result", ctx.Rcx, 0);
+      CHECK("xor r,r/m zero -> ZF", (ctx.EFlags & 0x40) != 0); }
+
+    /* cmp ecx, [rax] -- 3B 08. Operands the other way round from 39: the
+     * register is the minuend, so reg < mem sets CF. */
+    { const uint8_t c[] = { 0x3B, 0x08 };
+      memset(&dev, 0, sizeof dev);
+      ctx.Rip = (DWORD64)(uintptr_t)c;
+      ctx.Rcx = 0x10; dev.next_read = 0x20; ctx.EFlags = 0;
+      mmio_emulate(&ctx, 0x54, NULL, t_read, t_write);
+      CHECK("cmp r,r/m below -> CF", (ctx.EFlags & 0x01) != 0);
+      CHECK("cmp r,r/m does not write", dev.writes == 0); }
+
     /* 66 prefix selects 16-bit, REX.W selects 64-bit. */
     { const uint8_t c[] = { 0x66, 0x89, 0x08 };
       ctx.Rcx = 0x1234;
