@@ -144,12 +144,13 @@ static uint32_t dma_resolve(uint32_t offset)
 #define NV_PFIFO_CACHE1_PUSH1   0x00003204u
 #define NV_PRAMIN               0x00700000u
 
-static uint32_t dma_object_base(uint32_t handle, int *ok)
+/* Instance offset in PRAMIN of the object bound to `handle`, via RAMHT. */
+static uint32_t ramht_instance(uint32_t handle, int *ok)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     const uint8_t *ramin = mem + NV2A_APERTURE + NV_PRAMIN;
     uint32_t ramht, ramht_base, ramht_size, bits, hash, h, chid;
-    uint32_t entry_handle, entry_ctx, inst, flags, frame;
+    uint32_t entry_handle, entry_ctx, inst;
 
     *ok = 0;
     memcpy(&ramht, mem + NV2A_APERTURE + NV_PFIFO_RAMHT, 4);
@@ -171,9 +172,20 @@ static uint32_t dma_object_base(uint32_t handle, int *ok)
     inst = (entry_ctx & 0xFFFFu) << 4;
     if (inst >= 0x100000u)                     /* PRAMIN is 1 MB */
         return 0;
+    *ok = 1;
+    return inst;
+}
+
+static uint32_t dma_object_base(uint32_t handle, int *ok)
+{
+    const uint8_t *ramin = (const uint8_t *)xbox_GetMemoryOffset()
+                         + NV2A_APERTURE + NV_PRAMIN;
+    uint32_t inst = ramht_instance(handle, ok), flags, frame;
+
+    if (!*ok)
+        return 0;
     memcpy(&flags, ramin + inst, 4);
     memcpy(&frame, ramin + inst + 8, 4);
-    *ok = 1;
     return (frame & 0xFFFFF000u) | (flags >> 20);
 }
 
@@ -2941,6 +2953,107 @@ static void tex_stage_method(uint32_t method, uint32_t param)
         record_tex_reg(method, param);
 }
 
+/* The 2D engine: surfaces (NV062) and the image blit (NV09F).
+ *
+ * The executor modelled only the 3D class on subchannel 0, and dropped every
+ * other method. Alter Echo renders each in-game frame off-screen and copies it
+ * to the buffer that is shown with an image blit -- NV062 on one subchannel
+ * names the source and destination (format, pitches, offsets in two DMA
+ * objects), NV09F on another gives the points and the size, and the size
+ * write starts the copy. Dropped, the shown buffer was never written: ~140k
+ * triangles a frame rasterised and the screen stayed black.
+ *
+ * Which subchannel holds which class is not fixed, so SET_OBJECT on each is
+ * resolved through RAMHT and the class read from the object (its first word,
+ * low byte), as PGRAPH does. */
+static struct {
+    uint8_t  cls[8];                         /* class bound to each subchannel */
+    uint32_t dma_src, dma_dst, format, pitch, src_off, dst_off;   /* NV062 */
+    uint32_t point_in, point_out;                                  /* NV09F */
+    uint32_t blits;
+} s_2d;
+
+static void bind_object(uint32_t subch, uint32_t handle)
+{
+    const uint8_t *ramin = (const uint8_t *)xbox_GetMemoryOffset()
+                         + NV2A_APERTURE + NV_PRAMIN;
+    int ok;
+    uint32_t inst = ramht_instance(handle, &ok), w = 0;
+    static unsigned shown;
+
+    if (ok)
+        memcpy(&w, ramin + inst, 4);
+    s_2d.cls[subch & 7] = ok ? (uint8_t)(w & 0xFF) : 0;
+    if (shown++ < 8)
+        fprintf(stderr, "[GPU] subchannel %u -> object 0x%08X, class %02X%s\n",
+                subch, handle, s_2d.cls[subch & 7], ok ? "" : " (not in RAMHT)");
+}
+
+static uint32_t surf2d_bpp(uint32_t format)
+{
+    switch (format) {
+    case 0x1:                   return 1;    /* Y8 */
+    case 0x2: case 0x3: case 0x4: case 0x5:
+                                return 2;    /* X1R5G5B5, R5G6B5, Y16 */
+    default:                    return 4;    /* X8R8G8B8, A8R8G8B8, Y32... */
+    }
+}
+
+static void image_blit(uint32_t size)
+{
+    uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+    uint32_t w = size & 0xFFFF, h = size >> 16;
+    uint32_t xi = s_2d.point_in & 0xFFFF, yi = s_2d.point_in >> 16;
+    uint32_t xo = s_2d.point_out & 0xFFFF, yo = s_2d.point_out >> 16;
+    uint32_t sp = s_2d.pitch & 0xFFFF, dp = s_2d.pitch >> 16;
+    uint32_t bpp = surf2d_bpp(s_2d.format), r;
+    int ok_s, ok_d;
+    uint32_t sb = dma_object_base(s_2d.dma_src, &ok_s);
+    uint32_t db = dma_object_base(s_2d.dma_dst, &ok_d);
+    uint32_t src = dma_resolve(sb + s_2d.src_off + yi * sp + xi * bpp);
+    uint32_t dst = dma_resolve(db + s_2d.dst_off + yo * dp + xo * bpp);
+
+    if (!w || !h || !sp || !dp)
+        return;
+    if (s_2d.blits++ < 4)
+        fprintf(stderr, "[GPU] image blit %ux%u: 0x%08X (pitch %u) -> 0x%08X "
+                "(pitch %u), format %X%s\n", w, h, src, sp, dst, dp,
+                s_2d.format, ok_s && ok_d ? "" : " (DMA object not found)");
+    if (surface_write_refused(dst, (h - 1) * dp + w * bpp, "blit into"))
+        return;
+    for (r = 0; r < h; r++)
+        memmove(mem + dst + r * dp, mem + src + r * sp, (size_t)w * bpp);
+}
+
+/* 1 if a non-3D subchannel's method was handled here. */
+static int method_2d(uint32_t subch, uint32_t method, uint32_t param)
+{
+    if (method == 0x0000) {                 /* SET_OBJECT */
+        bind_object(subch, param);
+        return 1;
+    }
+    switch (s_2d.cls[subch & 7]) {
+    case 0x62:                              /* NV10_CONTEXT_SURFACES_2D */
+        switch (method) {
+        case 0x0184: s_2d.dma_src = param; return 1;  /* SET_DMA_IMAGE_SOURCE */
+        case 0x0188: s_2d.dma_dst = param; return 1;  /* SET_DMA_IMAGE_DESTIN */
+        case 0x0300: s_2d.format  = param; return 1;  /* SET_COLOR_FORMAT */
+        case 0x0304: s_2d.pitch   = param; return 1;  /* src | dst << 16 */
+        case 0x0308: s_2d.src_off = param; return 1;  /* SET_OFFSET_SOURCE */
+        case 0x030C: s_2d.dst_off = param; return 1;  /* SET_OFFSET_DESTIN */
+        }
+        break;
+    case 0x9F:                              /* NV10_IMAGE_BLIT */
+        switch (method) {
+        case 0x0300: s_2d.point_in  = param; return 1;  /* y << 16 | x */
+        case 0x0304: s_2d.point_out = param; return 1;
+        case 0x0308: image_blit(param);      return 1;  /* h << 16 | w: go */
+        }
+        break;
+    }
+    return 0;
+}
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
@@ -2996,7 +3109,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         return;
     }
     if (subch != 0) {                      /* 3D class lives on subchannel 0 */
-        note_unhandled(method, param);
+        if (!method_2d(subch, method, param))
+            note_unhandled(method, param);
         return;
     }
     switch (method) {
