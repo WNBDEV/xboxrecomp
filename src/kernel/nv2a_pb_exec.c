@@ -939,6 +939,29 @@ static uint32_t linear_twin(uint32_t fmt)
     }
 }
 
+/* RECOMP_TEX_DIAG=1: texels the sampler could not produce, by reason. The
+ * combiner path paints those white, so a stray white triangle is either one
+ * of these or not a texture problem at all. Printed for the first few and
+ * then at powers of two. Off the sampler's fast path: only failures call it. */
+static void tex_fail(const Texture *t, int why)
+{
+    static const char *const names[3] = { "invalid stage", "no palette",
+                                           "unsupported format" };
+    static volatile LONG n[3];
+    static int on = -1;
+    LONG k;
+
+    if (on < 0)
+        on = getenv("RECOMP_TEX_DIAG") != NULL;
+    if (!on)
+        return;
+    k = InterlockedIncrement(&n[why]);
+    if (k <= 3 || ((k & (k - 1)) == 0 && k <= (1 << 20)))
+        fprintf(stderr, "[TEXFAIL] %s #%ld: fmt %02X %ux%u offset %08X "
+                "palette %08X\n", names[why], (long)k, t->color, t->width,
+                t->height, t->offset, t->palette);
+}
+
 /* Sample texel (u, v) of stage texture `t`; `face` offsets a cube map. */
 static int sample_tex(const Texture *t, uint32_t face_offset,
                       uint32_t u, uint32_t v, uint32_t *argb)
@@ -947,8 +970,10 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
     const uint8_t *p;
     uint32_t fmt, base = t->offset + face_offset;
 
-    if (!t->valid)
+    if (!t->valid) {
+        tex_fail(t, 0);
         return 0;
+    }
     u = wrap_coord(u, t->width,  t->addr_u);
     v = wrap_coord(v, t->height, t->addr_v);
 
@@ -1011,8 +1036,10 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
      * header art this way; without a case every such quad came out as the
      * unsupported-format fill, a white box where the logo should be. */
     case 0x0B:                                      /* SZ_I8_A8R8G8B8 */
-        if (!t->palette)
+        if (!t->palette) {
+            tex_fail(t, 1);
             return 0;
+        }
         *argb = ((const uint32_t *)(mem + t->palette))[p[u]];
         return 1;
 
@@ -1113,6 +1140,7 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
     }
 
     default:
+        tex_fail(t, 2);
         return 0;
     }
 }
