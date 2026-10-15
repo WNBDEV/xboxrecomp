@@ -80,12 +80,47 @@ static float map_out(float x, uint32_t mapping)
     }
 }
 
+/* map_in for three channels, its mapping decoded once rather than per
+ * channel: this runs four times per stage for every pixel the rasteriser
+ * shades, and the per-channel switch was most of the combiner's cost. The
+ * expressions are map_in's own, so the results are bit-identical. */
+#define RC_MAP3(expr) do { float x; x = x0; v[0] = (expr); \
+                           x = x1; v[1] = (expr); x = x2; v[2] = (expr); } while (0)
+#define RC_POS(x) ((x) < 0.0f ? 0.0f : (x))
+
 static void read_rgb(float R[16][4], uint32_t byte, float v[3])
 {
     const float *r = R[byte & 0xF];
-    int i;
-    for (i = 0; i < 3; i++)
-        v[i] = map_in((byte & 0x10) ? r[3] : r[i], byte);
+    float x0, x1, x2;
+    if (byte & 0x10) {
+        x0 = x1 = x2 = r[3];
+    } else {
+        x0 = r[0]; x1 = r[1]; x2 = r[2];
+    }
+    switch ((byte >> 5) & 7) {
+    case 0:  RC_MAP3(RC_POS(x));                         break;
+    case 1:  RC_MAP3(1.0f - clampf(x, 0.0f, 1.0f));      break;
+    case 2:  RC_MAP3(2.0f * RC_POS(x) - 1.0f);           break;
+    case 3:  RC_MAP3(-2.0f * RC_POS(x) + 1.0f);          break;
+    case 4:  RC_MAP3(RC_POS(x) - 0.5f);                  break;
+    case 5:  RC_MAP3(-RC_POS(x) + 0.5f);                 break;
+    case 6:  RC_MAP3(x);                                 break;
+    default: RC_MAP3(-x);                                break;
+    }
+}
+
+/* map_out and the [-1, 1] clamp over three channels, likewise. */
+static void map_out_clamp3(float v[3], uint32_t mapping)
+{
+    float x0 = v[0], x1 = v[1], x2 = v[2];
+    switch (mapping) {
+    case 0x08: RC_MAP3(clampf(x - 0.5f, -1.0f, 1.0f));          break;
+    case 0x10: RC_MAP3(clampf(x * 2.0f, -1.0f, 1.0f));          break;
+    case 0x18: RC_MAP3(clampf((x - 0.5f) * 2.0f, -1.0f, 1.0f)); break;
+    case 0x20: RC_MAP3(clampf(x * 4.0f, -1.0f, 1.0f));          break;
+    case 0x30: RC_MAP3(clampf(x * 0.5f, -1.0f, 1.0f));          break;
+    default:   RC_MAP3(clampf(x, -1.0f, 1.0f));                 break;
+    }
 }
 
 static float read_alpha(float R[16][4], uint32_t byte)
@@ -143,15 +178,19 @@ void nv2a_rc_eval(const Nv2aCombiner *rc, const float v0[4],
         aA = read_alpha(R, aicw >> 24); aB = read_alpha(R, aicw >> 16);
         aC = read_alpha(R, aicw >> 8);  aD = read_alpha(R, aicw);
 
-        for (i = 0; i < 3; i++) {
+        {
             float dab = A[0] * B[0] + A[1] * B[1] + A[2] * B[2];
             float dcd = C[0] * D[0] + C[1] * D[1] + C[2] * D[2];
-            float pab = (fl & 2) ? dab : A[i] * B[i];
-            float pcd = (fl & 1) ? dcd : C[i] * D[i];
-            float sum = (fl & 4) ? (mux_cd ? pcd : pab) : pab + pcd;
-            ab[i] = clampf(map_out(pab, fl & 0x38), -1.0f, 1.0f);
-            cd[i] = clampf(map_out(pcd, fl & 0x38), -1.0f, 1.0f);
-            ms[i] = clampf(map_out(sum, fl & 0x38), -1.0f, 1.0f);
+            for (i = 0; i < 3; i++) {
+                float pab = (fl & 2) ? dab : A[i] * B[i];
+                float pcd = (fl & 1) ? dcd : C[i] * D[i];
+                ms[i] = (fl & 4) ? (mux_cd ? pcd : pab) : pab + pcd;
+                ab[i] = pab;
+                cd[i] = pcd;
+            }
+            map_out_clamp3(ab, fl & 0x38);
+            map_out_clamp3(cd, fl & 0x38);
+            map_out_clamp3(ms, fl & 0x38);
         }
         {
             float pab = aA * aB, pcd = aC * aD;
