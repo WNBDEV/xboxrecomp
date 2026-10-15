@@ -3179,14 +3179,27 @@ class BatchTranslator:
             stub_lines.append(
                 " * they end in a `ret N` -- guessing cdecl there silently walks")
             stub_lines.append(
-                " * esp off by N on every call. */")
+                " * esp off by N on every call.")
+            stub_lines.append(
+                " *")
+            stub_lines.append(
+                " * A stub that runs is code the title needed and did not get, and")
+            stub_lines.append(
+                " * nothing else says so: it returns quietly and the missing work")
+            stub_lines.append(
+                " * shows up later as a NULL pointer or a wait that never ends. So")
+            stub_lines.append(
+                " * each reports its first call, with the guest caller. */")
+            stub_lines.append("")
+            stub_lines.append("void recomp_stub_hit(uint32_t va);")
             stub_lines.append("")
             for addr in sorted(unresolved):
                 popped = self.translator._stub_ret_bytes(addr)
                 note = (f"ret {popped}" if popped else "not detected")
                 stub_lines.append(
-                    f"void {unresolved[addr]}(void) {{ g_esp += {4 + popped}; "
-                    f"/* 0x{addr:08X}: {note} */ }}"
+                    f"void {unresolved[addr]}(void) {{ static int hit; "
+                    f"if (!hit) {{ hit = 1; recomp_stub_hit(0x{addr:08X}u); }} "
+                    f"g_esp += {4 + popped}; /* 0x{addr:08X}: {note} */ }}"
                 )
             stub_lines.append("")
 

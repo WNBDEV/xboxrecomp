@@ -9912,3 +9912,20 @@ void xbox_kernel_bridge_init(void)
             KERNEL_VA_BASE, KERNEL_VA_BASE + (resolved - 1) * 4);
 
 }
+
+/* A generated stub for an unresolved call target ran (recomp_stubs_unresolved.c
+ * calls this once per stub). The stub does nothing and returns, so this is the
+ * only record that the title needed code it did not get -- Alter Echo's
+ * animation keys came back NULL and the slerp that used them spun on t = inf
+ * with nothing to say why. The caller is the return address the stub is about
+ * to consume. If the target is a real function, seed it. */
+void recomp_stub_hit(uint32_t va)
+{
+    static volatile LONG n;
+    if (InterlockedIncrement(&n) > 200)
+        return;
+    fprintf(stderr, "[STUB] unresolved call target 0x%08X reached from 0x%08X "
+            "-- returned without running (seed it if it is a function)\n",
+            va, g_esp ? BRIDGE_MEM32(g_esp) : 0);
+    fflush(stderr);
+}
