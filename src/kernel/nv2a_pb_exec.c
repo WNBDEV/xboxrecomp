@@ -37,6 +37,7 @@
 #include "../d3d/d3d8_swizzle.h"
 #include "nv2a_vsh_interp.h"
 #include "nv2a_combiner.h"
+#include "nv2a_gpu.h"
 #if defined(_WIN32)
 #include <windows.h>
 #define NV_TLS __declspec(thread)
@@ -735,6 +736,8 @@ static void raster_triangle(const float a[2], const float b[2],
                             const float c[2], uint32_t argb,
                             const float uv[3][2]);
 
+static void gpu_state(Nv2aGpuState *g);
+
 static void clear_surface(uint32_t param)
 {
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
@@ -748,6 +751,15 @@ static void clear_surface(uint32_t param)
      * changes what the title would see. */
     if (holes < 0)
         holes = getenv("RECOMP_DEBUG_HOLES") != NULL;
+    if (nv2a_gpu_enabled()) {
+        Nv2aGpuState g;
+        gpu_state(&g);
+        nv2a_gpu_clear(&g, param, s_gpu.clear_color, s_gpu.zstencil_clear);
+        if (s_gpu.flips == 0)
+            xbox_FramebufferWindowSet(dma_resolve(s_gpu.color_offset), s_gpu.pitch);
+        xbox_FramebufferWindowStart();
+        return;
+    }
     if (!(param & NV097_CLEAR_COLOR_MASK)) {
         if (holes) {
             uint32_t saved = s_gpu.clear_color;
@@ -1253,6 +1265,9 @@ static int surface_begin_batch(const uint8_t *mem)
 
     if (surface_hits_image(base, (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch))
         return 0;
+    /* The software rasteriser draws into guest memory: whatever the GPU drew
+     * there has to be in it first. */
+    nv2a_gpu_sync(base, (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch);
     s_surface = (uint8_t *)mem + base;
     return 1;
 }
@@ -2709,6 +2724,149 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
     return 1;
 }
 
+/* ---- the GPU path (RECOMP_GPU=1, nv2a_gpu.h) ---------------------------- */
+
+void nv2a_gpu_decode_texture(const void *tex, uint32_t face, uint32_t *out)
+{
+    const Texture *t = (const Texture *)tex;
+    uint32_t off = face ? face * tex_face_stride(t) : 0, u, v, argb;
+
+    for (v = 0; v < t->height; v++)
+        for (u = 0; u < t->width; u++)
+            out[(size_t)v * t->width + u] = sample_tex(t, off, u, v, &argb)
+                                            ? argb : 0xFFFFFFFFu;
+}
+
+static void gpu_state(Nv2aGpuState *g)
+{
+    static int no_rc = -1;
+    int i;
+
+    if (no_rc < 0)
+        no_rc = getenv("RECOMP_NO_COMBINERS") != NULL;
+    memset(g, 0, sizeof *g);
+    g->color_addr = s_gpu.color_offset ? dma_resolve(s_gpu.color_offset) : 0;
+    g->pitch = s_gpu.pitch;
+    g->bpp = surface_bpp();
+    g->zeta_addr = s_gpu.zeta_offset ? dma_resolve(s_gpu.zeta_offset) : 0;
+    g->zeta_z16 = ((s_gpu.format >> 4) & 0xF) == 1;
+    g->clip[0] = s_gpu.clip_x; g->clip[1] = s_gpu.clip_y;
+    g->clip[2] = s_gpu.clip_w; g->clip[3] = s_gpu.clip_h;
+    g->use_rc = s_gpu.rc_seen && !no_rc;
+    g->rc = s_gpu.rc;
+    g->clip_plane_mode = s_gpu.clip_plane_mode;
+    for (i = 0; i < 4; i++) {
+        const Texture *t = &s_gpu.texs[i];
+        Nv2aGpuTexture *o = &g->tex[i];
+        uint32_t mode = (s_gpu.rc.stage_program >> (i * 5)) & 0x1F;
+        uint32_t mag = (t->filter >> 24) & 0xF, min = (t->filter >> 16) & 0xFF;
+        /* Only stages that sample: a stage the program leaves off, or one in
+         * pass-through or clip-plane mode, never reads its texture. */
+        if (!t->valid || (g->use_rc && (mode == 0 || mode == 4 || mode == 5 || mode > 5))
+            || (!g->use_rc && i > 0))
+            continue;
+        o->valid = 1;
+        o->addr = t->offset;
+        o->bytes = (t->cube ? 6u : 1u) * tex_face_stride(t);
+        o->palette = t->palette;
+        o->palette_bytes = (t->color == 0x0B && t->palette) ? 1024u : 0u;
+        o->width = t->width; o->height = t->height; o->pitch = t->pitch;
+        o->format = t->color;
+        o->cube = t->cube;
+        o->linear = !tex_size_from_format(t->color);
+        o->filter_linear = mag == 2 || min == 2 || min == 4 || min == 6;
+        o->wrap_u = t->addr_u == 1;
+        o->wrap_v = t->addr_v == 1;
+        o->tex = t;
+    }
+    g->blend_enable = s_gpu.blend_enable;
+    g->blend_src = s_gpu.blend_sfactor;
+    g->blend_dst = s_gpu.blend_dfactor;
+    g->blend_eq = s_gpu.blend_equation;
+    g->blend_color = s_gpu.blend_color;
+    g->color_mask = s_gpu.color_mask;
+    g->depth_test = s_gpu.depth_test;
+    g->depth_func = s_gpu.depth_func;
+    g->depth_mask = s_gpu.depth_mask;
+    g->stencil_test = s_gpu.stencil_test;
+    g->stencil_func = s_gpu.stencil_func;
+    g->stencil_ref = s_gpu.stencil_ref;
+    g->stencil_fmask = s_gpu.stencil_fmask;
+    g->stencil_wmask = s_gpu.stencil_wmask;
+    g->stencil_op_fail = s_gpu.stencil_op_fail;
+    g->stencil_op_zfail = s_gpu.stencil_op_zfail;
+    g->stencil_op_zpass = s_gpu.stencil_op_zpass;
+    g->alpha_test = s_gpu.alpha_test;
+    g->alpha_func = s_gpu.alpha_func;
+    g->alpha_ref = s_gpu.alpha_ref;
+    g->fog_color = s_gpu.fog_color;
+}
+
+static void gpu_vertex(const Nv2aVshOutput *v, Nv2aGpuVertex *o)
+{
+    float w = v->pos[3];
+    /* XYZRHW hands over w = 1/rhw, infinite for rhw 0: no perspective. */
+    if (w == 0.0f || !isfinite(w))
+        w = 1.0f;
+    memcpy(o->pos, v->pos, sizeof o->pos);
+    o->pos[3] = w;
+    memcpy(o->d0, v->d0, sizeof o->d0);
+    memcpy(o->d1, v->d1, sizeof o->d1);
+    o->fog[0] = fog_factor(v->fog[0]);
+    o->fog[1] = o->fog[2] = 0.0f;
+    o->fog[3] = 1.0f;
+    memcpy(o->tex, v->tex, sizeof o->tex);
+}
+
+/* The batch as a triangle list for the GPU: the same assembly as the
+ * software path's switch, without its per-triangle clipping, which the GPU
+ * does in clip space. */
+static void gpu_draw_batch(uint32_t n)
+{
+    static Nv2aGpuVertex out[NV_MAX_INDICES * 3];
+    Nv2aGpuState g;
+    uint32_t i, k = 0;
+#define GPU_TRI(a, b, c) do { gpu_vertex(&s_xf[a], &out[k++]); \
+        gpu_vertex(&s_xf[b], &out[k++]); gpu_vertex(&s_xf[c], &out[k++]); } while (0)
+
+    switch (s_gpu.prim) {
+    case NV_PRIM_TRIANGLES:
+        for (i = 0; i + 2 < n; i += 3) GPU_TRI(i, i + 1, i + 2);
+        break;
+    case NV_PRIM_TRIANGLE_STRIP:
+        for (i = 0; i + 2 < n; i++) GPU_TRI(i, i + 1, i + 2);
+        break;
+    case NV_PRIM_TRIANGLE_FAN:
+    case NV_PRIM_POLYGON:
+        for (i = 1; i + 1 < n; i++) GPU_TRI(0, i, i + 1);
+        break;
+    case NV_PRIM_QUADS:
+        for (i = 0; i + 3 < n; i += 4) {
+            GPU_TRI(i, i + 1, i + 2);
+            GPU_TRI(i, i + 2, i + 3);
+        }
+        break;
+    case NV_PRIM_QUAD_STRIP:
+        for (i = 0; i + 3 < n; i += 2) {
+            GPU_TRI(i, i + 1, i + 3);
+            GPU_TRI(i, i + 3, i + 2);
+        }
+        break;
+    default:
+        break;
+    }
+#undef GPU_TRI
+    if (k < 3)
+        return;
+    if (surface_hits_image(dma_resolve(s_gpu.color_offset),
+                           (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch))
+        return;
+    gpu_state(&g);
+    nv2a_gpu_draw(&g, out, k);
+    s_gpu.tris_drawn += k / 3;
+    note_drawn();
+}
+
 static void prof_report(void)
 {
     static DWORD last;
@@ -2836,6 +2994,15 @@ static void raster_batch_program(void)
     }
     if (s_gpu.texs[0].valid)
         note_texture_use();
+
+    if (nv2a_gpu_enabled()) {
+        gpu_draw_batch(n);
+        if (s_prof.on) {
+            s_prof.asm_ += prof_lap();
+            prof_report();
+        }
+        return;
+    }
 
     switch (s_gpu.prim) {
     case NV_PRIM_TRIANGLES:
@@ -3526,10 +3693,13 @@ static void image_blit(uint32_t size)
         fprintf(stderr, "[GPU] image blit %ux%u: 0x%08X (pitch %u) -> 0x%08X "
                 "(pitch %u), format %X%s\n", w, h, src, sp, dst, dp,
                 s_2d.format, ok_s && ok_d ? "" : " (DMA object not found)");
+    nv2a_gpu_sync(src, (h - 1) * sp + w * bpp);
+    nv2a_gpu_sync(dst, (h - 1) * dp + w * bpp);
     if (surface_write_refused(dst, (h - 1) * dp + w * bpp, "blit into"))
         return;
     for (r = 0; r < h; r++)
         memmove(mem + dst + r * dp, mem + src + r * sp, (size_t)w * bpp);
+    nv2a_gpu_guest_written(dst, (h - 1) * dp + w * bpp);
 }
 
 /* 1 if a non-3D subchannel's method was handled here. */
@@ -3868,9 +4038,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch
                                                 : s_gpu.pitch;
             if (done) {
+                /* What the GPU drew has to be in guest memory to be seen. */
+                nv2a_gpu_sync(dma_resolve(done), pitch * (s_gpu.drawn_y + s_gpu.drawn_h));
                 xbox_FramebufferWindowSet(dma_resolve(done), pitch);
                 xbox_FramebufferWindowPresent(dma_resolve(done), pitch);
             }
+            nv2a_gpu_frame();
         }
         {
             /* RECOMP_FB_DUMP_FLIPS: dump every presented frame, not one per
