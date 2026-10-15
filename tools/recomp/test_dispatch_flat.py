@@ -190,3 +190,13 @@ def _run():
 
 if __name__ == "__main__":
     _run()
+
+
+def test_flat_range_stops_at_a_far_cluster():
+    # Runtime-loaded modules translated at fixed bases above the RAM mirrors
+    # (0x74000000+) must not stretch the flat table across 2 GB: it covers the
+    # image's cluster, and the binary search finds the rest.
+    addrs = [0x00011000, 0x00011100, 0x001AD7BD, 0x74001000, 0x74002000]
+    assert BatchTranslator._flat_range(addrs) == (0x00011000, 0x001AD7BD - 0x00011000 + 1)
+    assert BatchTranslator._flat_range([0x74001000]) == (0x74001000, 1)
+    assert BatchTranslator._flat_range([]) == (0, 0)

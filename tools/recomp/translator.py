@@ -3234,6 +3234,24 @@ class BatchTranslator:
         stats["chunk_size"] = chunk_size
         return stats
 
+    @staticmethod
+    def _flat_range(addrs):
+        """(base, span) of the flat dispatch table over sorted `addrs`.
+
+        The table costs 8 bytes per byte of span, so it covers one dense
+        cluster: the run of addresses up to the first gap of 16 MB or more.
+        Code mapped far from the image -- runtime-loaded modules translated at
+        fixed bases above the RAM mirrors -- would otherwise stretch the span
+        across gigabytes; those addresses are found by the binary search."""
+        if not addrs:
+            return 0, 0
+        end = addrs[0]
+        for a in addrs[1:]:
+            if a - end >= 0x01000000:
+                break
+            end = a
+        return addrs[0], end - addrs[0] + 1
+
     def _write_dispatch_table(self, translations, output_path, header_name):
         """
         Generate a dispatch table mapping Xbox VA -> function pointer.
@@ -3270,9 +3288,8 @@ class BatchTranslator:
         for addr, name, _ in translations:
             lines.append(f"    {{ 0x{addr:08X}u, (recomp_func_t){name} }},")
 
-        addrs = [addr for addr, _, _ in translations]
-        flat_base = min(addrs) if addrs else 0
-        flat_span = (max(addrs) - flat_base + 1) if addrs else 0
+        addrs = sorted(addr for addr, _, _ in translations)
+        flat_base, flat_span = self._flat_range(addrs)
 
         lines.extend([
             "};",
@@ -3317,8 +3334,9 @@ class BatchTranslator:
             "                                           sizeof(recomp_func_t));",
             "    if (!g_flat_table) return 0;         /* keep the binary search */",
             "    for (i = 0; i < g_recomp_table_size; i++) {",
-            "        g_flat_table[g_recomp_table[i].xbox_va - g_flat_base] =",
-            "            g_recomp_table[i].func;",
+            "        uint32_t off = g_recomp_table[i].xbox_va - g_flat_base;",
+            "        if (off < g_flat_span)",
+            "            g_flat_table[off] = g_recomp_table[i].func;",
             "    }",
             "    return 1;",
             "}",
@@ -3335,8 +3353,11 @@ class BatchTranslator:
             "    if (g_flat_table) {",
             "        uint32_t off = xbox_va - g_flat_base;",
             "        /* Unsigned: a VA below the base wraps to a huge offset and is",
-            "         * rejected by the same compare, so no separate lower bound. */",
-            "        return (off < g_flat_span) ? g_flat_table[off] : NULL;",
+            "         * rejected by the same compare, so no separate lower bound.",
+            "         * Code outside the flat range -- a cluster far from the image,",
+            "         * see _flat_range -- falls through to the search. */",
+            "        if (off < g_flat_span)",
+            "            return g_flat_table[off];",
             "    }",
             "    lo = 0; hi = g_recomp_table_size;",
             "    while (lo < hi) {",
