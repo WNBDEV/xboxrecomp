@@ -380,6 +380,12 @@ typedef struct MCPXAPUVoiceFilter {
     uint16_t voice;
     float resample_buf[NUM_SAMPLES_PER_FRAME * 2];
     SRC_STATE *resampler;
+    /* voice_resample: source frames fetched but not yet consumed (in
+     * resample_buf), the last four consumed, and how far the output has
+     * moved past the second of them, in source samples. */
+    int rs_have, rs_used;
+    float rs_hist[4][2];
+    float rs_pos;
     sv_filter svf[2];
     HrtfFilter hrtf;
 } MCPXAPUVoiceFilter;

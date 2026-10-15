@@ -74,6 +74,9 @@ static void voice_reset_filters(MCPXAPUState *d, uint16_t v)
     if (d->vp.filters[v].resampler) {
         src_reset(d->vp.filters[v].resampler);
     }
+    d->vp.filters[v].rs_have = d->vp.filters[v].rs_used = 0;
+    memset(d->vp.filters[v].rs_hist, 0, sizeof(d->vp.filters[v].rs_hist));
+    d->vp.filters[v].rs_pos = 3.0f;    /* load three frames, start on the first */
 }
 
 static bool voice_should_mute(uint16_t v)
@@ -940,32 +943,63 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
 }
 
 /* ============================================================
- * Voice resampling (simplified - no libsamplerate)
+ * Voice resampling
  *
- * Since libsamplerate is stubbed, we do a simple nearest-neighbor
- * resample. This gives us functional audio at the cost of quality.
+ * The pitch register says how fast a voice steps through its samples:
+ * `rate` is output samples per source sample, 48000 / the voice's own rate.
+ * This used to be ignored -- every voice was read one source sample per
+ * 48 kHz output sample, so a 22 kHz effect played 2.2 times too fast, more
+ * than an octave up, and Alter Echo's gunshots and impacts came out thin and
+ * metallic while 48 kHz music sounded right.
+ *
+ * Four-point Catmull-Rom interpolation between source samples. Downward
+ * steps larger than 1 (a source faster than 48 kHz) alias a little; no title
+ * seen so far plays one.
  * ============================================================ */
 
 static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
                           int requested_num, float rate)
 {
-    /* Without libsamplerate, just fetch raw samples at native rate.
-     * Rate < 1.0 means we need more source samples than output samples.
-     * For initial functionality, just get the samples directly. */
-    int sample_count = 0;
-    while (sample_count < requested_num) {
-        int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
-                                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
-        if (!active) break;
+    MCPXAPUVoiceFilter *f = &d->vp.filters[v];
+    float (*buf)[2] = (float (*)[2])f->resample_buf;
+    float step = rate > 0.0f ? 1.0f / rate : 1.0f;
+    int n = 0;
 
-        int count = voice_get_samples(d, v, &samples[sample_count],
-                                      requested_num - sample_count);
-        if (count < 0) break;
-        if (count == 0) return -1;
-        sample_count += count;
+    if (!(step >= 1.0f / 256.0f && step <= 32.0f))  /* also catches NaN */
+        step = 1.0f;
+    while (n < requested_num) {
+        while (f->rs_pos >= 1.0f) {
+            if (f->rs_used == f->rs_have) {
+                int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                                            NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
+                int count = active ? voice_get_samples(d, v, buf,
+                                                       NUM_SAMPLES_PER_FRAME) : -1;
+                if (count <= 0)
+                    return n ? n : count;
+                f->rs_have = count;
+                f->rs_used = 0;
+            }
+            memmove(f->rs_hist[0], f->rs_hist[1], 3 * sizeof f->rs_hist[0]);
+            f->rs_hist[3][0] = buf[f->rs_used][0];
+            f->rs_hist[3][1] = buf[f->rs_used][1];
+            f->rs_used++;
+            f->rs_pos -= 1.0f;
+        }
+        {
+            float t = f->rs_pos, t2 = t * t, t3 = t2 * t;
+            /* Catmull-Rom weights for p0..p3, interpolating p1 -> p2. */
+            float w0 = 0.5f * (-t3 + 2.0f * t2 - t);
+            float w1 = 0.5f * (3.0f * t3 - 5.0f * t2 + 2.0f);
+            float w2 = 0.5f * (-3.0f * t3 + 4.0f * t2 + t);
+            float w3 = 0.5f * (t3 - t2);
+            for (int ch = 0; ch < 2; ch++)
+                samples[n][ch] = w0 * f->rs_hist[0][ch] + w1 * f->rs_hist[1][ch]
+                               + w2 * f->rs_hist[2][ch] + w3 * f->rs_hist[3][ch];
+        }
+        n++;
+        f->rs_pos += step;
     }
-    (void)rate; /* Ignored until we add proper resampling */
-    return sample_count;
+    return n;
 }
 
 /* ============================================================
@@ -1249,5 +1283,8 @@ void mcpx_apu_vp_reset(MCPXAPUState *d)
     memset(d->vp.voice_locked, 0, sizeof(d->vp.voice_locked));
     for (int v = 0; v < MCPX_HW_MAX_VOICES; v++) {
         hrtf_filter_init(&d->vp.filters[v].hrtf);
+        d->vp.filters[v].rs_have = d->vp.filters[v].rs_used = 0;
+        memset(d->vp.filters[v].rs_hist, 0, sizeof(d->vp.filters[v].rs_hist));
+        d->vp.filters[v].rs_pos = 3.0f;
     }
 }

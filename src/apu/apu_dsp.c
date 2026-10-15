@@ -79,19 +79,49 @@ static void dsp_ack_init(void)
                 s_dsp_ack_count, s_dsp_ack[0]);
 }
 
-/* SUM EVERY MIXBIN THE GUEST ROUTED TO, NOT JUST THE FIRST TWO.
+/* How the 32 mixbins become two channels; RECOMP_APU_MIXDOWN_ALL picks.
  *
- * Default ON. RECOMP_APU_MIXDOWN_ALL=0 restores the previous two-bin read,
- * because this changes audible output for every title and an escape hatch
- * costs one branch. */
-static int mcpx_apu_mixdown_all(void)
+ *   unset   the speaker bins, folded down to stereo (mixdown_speakers)
+ *   1       every bin, even ones left and odd ones right -- the previous
+ *           default, kept for titles that route audio somewhere unexpected
+ *   0       bins 0 and 1 only, the original stub */
+enum { MIXDOWN_FRONT, MIXDOWN_ALL, MIXDOWN_SPEAKERS };
+
+static int mcpx_apu_mixdown_mode(void)
 {
-    static int on = -1;
-    if (on < 0) {
+    static int mode = -1;
+    if (mode < 0) {
         const char *e = getenv("RECOMP_APU_MIXDOWN_ALL");
-        on = (e && *e) ? (atoi(e) != 0) : 1;
+        mode = (e && *e) ? (atoi(e) ? MIXDOWN_ALL : MIXDOWN_FRONT)
+                         : MIXDOWN_SPEAKERS;
     }
-    return on;
+    return mode;
+}
+
+/* DirectSound's bin assignment (DSMIXBIN_*): 0-5 front L/R, centre, LFE,
+ * back L/R; 6-9 the crosstalk-cancelled front and back pairs 3D voices
+ * render into; 10 the I3DL2 reverb send; 11 and up the effect sends. Bins
+ * 10 and up are inputs to effects the GP would run and output to the
+ * speakers. With no GP they are dry copies of voices already in 0-9, and
+ * summing them -- reverb send into the left only, every odd send into the
+ * right -- doubled sounds, unbalanced them and comb-filtered the ones whose
+ * copies differ by a filter.
+ *
+ * So: front, back and crosstalk pairs to their own side, centre at -3 dB to
+ * both, and LFE low-passed (a subwoofer feed may be full range) into both. */
+static void mixdown_speakers(float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME],
+                             int i, float *left, float *right)
+{
+    static float lfe1, lfe2;
+    const float k = 0.0156f;            /* one-pole at ~120 Hz, 48 kHz */
+    float c = 0.7071f * mixbins[2][i];
+
+    lfe1 += k * (mixbins[3][i] - lfe1);
+    lfe2 += k * (lfe1 - lfe2);
+    *left = mixbins[0][i] + mixbins[4][i] + mixbins[6][i] + mixbins[8][i]
+          + c + 0.7071f * lfe2;
+    *right = mixbins[1][i] + mixbins[5][i] + mixbins[7][i] + mixbins[9][i]
+           + c + 0.7071f * lfe2;
 }
 
 void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
@@ -182,12 +212,15 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
              * Gating the HRTF submix override was tried first and did not fix
              * it, so the defect is the width of this mixdown and nothing else.
              *
-             * Even bins left, odd bins right, which preserves the stereo
-             * pairing the guest set up -- bins 6/7 and 8/9 arrive with matched
-             * counts. This is not what a real EP does; it is the cheapest
-             * mixdown that stops discarding audio. */
+             * The first fix summed every bin, even left and odd right. That
+             * kept JSRF's effects but also mixed in the reverb and effect
+             * sends raw; the default is now a fold-down of the speaker bins
+             * (mixdown_speakers), which still includes 6 to 9. */
             float left, right;
-            if (mcpx_apu_mixdown_all()) {
+            int mode = mcpx_apu_mixdown_mode();
+            if (mode == MIXDOWN_SPEAKERS) {
+                mixdown_speakers(mixbins, i, &left, &right);
+            } else if (mode == MIXDOWN_ALL) {
                 left = 0.0f;
                 right = 0.0f;
                 for (int b = 0; b < NUM_MIXBINS; ++b) {

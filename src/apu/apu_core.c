@@ -513,7 +513,7 @@ static void apu_stats_frame(float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
     static int on = -1, max_voices;
     static float peak;
     static uint32_t bins;
-    static unsigned frames;
+    static unsigned frames, rates[6];
     static int64_t last;
     int64_t now;
     int b, i, voices = 0;
@@ -525,6 +525,14 @@ static void apu_stats_frame(float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
     /* voice_process sets these and nothing clears them (xemu's debug UI
      * does, per frame), so count and clear. */
     for (i = 0; i < 256; i++) {
+        if (g_dbg.vp.v[i].active) {
+            /* The voice's own sample rate, from its pitch (rate = 48000 /
+             * source rate), in bands: <16k, 16-24k, 24-40k, 40-46k, 46-50k,
+             * faster. */
+            float hz = g_dbg.vp.v[i].rate > 0.0f ? 48000.0f / g_dbg.vp.v[i].rate : 0.0f;
+            rates[hz < 16000.0f ? 0 : hz < 24000.0f ? 1 : hz < 40000.0f ? 2
+                  : hz < 46000.0f ? 3 : hz < 50000.0f ? 4 : 5]++;
+        }
         voices += g_dbg.vp.v[i].active;
         g_dbg.vp.v[i].active = false;
     }
@@ -546,6 +554,10 @@ static void apu_stats_frame(float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
         fprintf(stderr, "[APU] %.1f s: %u frames, up to %d voices active, "
                 "mixbin peak %g, bins with signal %08X\n",
                 (now - last) / 1000.0, frames, max_voices, peak, bins);
+        fprintf(stderr, "[APU]   voice-frames by source rate: <16k %u, 16-24k %u,"
+                " 24-40k %u, 40-46k %u, 46-50k %u, >50k %u\n", rates[0],
+                rates[1], rates[2], rates[3], rates[4], rates[5]);
+        memset(rates, 0, sizeof rates);
         frames = 0;
         max_voices = 0;
         peak = 0.0f;
