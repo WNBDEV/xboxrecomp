@@ -2270,7 +2270,12 @@ static void kernel_vblank_tick(void)
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
         return;
 
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |= NV2A_PCRTC_INTR_VBLANK;
+    /* Marked as not yet acknowledged, so the NV2A poll loop leaves it for the
+     * title's DPC (XBOX_NV2A_VBLANK_UNACKED). PCRTC first: the poll loop reads
+     * it to decide whether PMC's bit is fair game. A vblank still unacknowledged
+     * from last time is simply asserted again, as a level-triggered line is. */
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |=
+        NV2A_PCRTC_INTR_VBLANK | XBOX_NV2A_VBLANK_UNACKED;
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
 
     {
@@ -2324,6 +2329,9 @@ static void kernel_vblank_tick(void)
 #define NV2A_PGRAPH_FIFO               0x00400720u
 
 static volatile LONG s_swmethod_pending;
+/* Wakes the timer thread early, so a software method is delivered now rather
+ * than at the next 10 ms tick -- each one stalls the pushbuffer until handled. */
+static HANDLE s_timer_wake;
 
 void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t method, uint32_t param)
 {
@@ -2341,10 +2349,24 @@ void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t method, uint32_t param)
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_INTR) |= NV2A_PGRAPH_INTR_ERROR;
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)  |= NV2A_PMC_INTR_PGRAPH;
     InterlockedExchange(&s_swmethod_pending, 1);
+    if (s_timer_wake)
+        SetEvent(s_timer_wake);
 
     /* Stall the stream until the handler has run, as the hardware does.
-     * Bounded: a timer thread that is not running must not wedge the GPU. */
+     * Bounded: a timer thread that is not running must not wedge the GPU.
+     *
+     * This thread is also the NV2A poll loop, the one that clears an
+     * acknowledged vblank (XBOX_NV2A_VBLANK_UNACKED). D3D's vblank handler
+     * spins after its acknowledgement until PMC_INTR_0's PCRTC bit drops, so
+     * if the DPC is in there it waits on this thread while this thread waits
+     * on it -- for the full timeout, and the method is lost. Do that one job
+     * from here too. */
     for (waited = 0; waited < 500; waited++) {
+        uint32_t pcrtc = BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0);
+        if (pcrtc && !(pcrtc & XBOX_NV2A_VBLANK_UNACKED)) {
+            BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) = 0;
+            BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0) &= ~NV2A_PMC_INTR_PCRTC;
+        }
         if (BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_FIFO) & 1u) {
             handled = 1;
             break;
@@ -2653,11 +2675,17 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         g_fs_base = tib;
     }
 
+    if (!s_timer_wake)
+        s_timer_wake = CreateEventA(NULL, FALSE, FALSE, NULL);
+
     for (;;) {
         long long now;
         int i;
 
-        Sleep(10);
+        if (s_timer_wake)
+            WaitForSingleObject(s_timer_wake, 10);   /* early for a software method */
+        else
+            Sleep(10);
         kernel_vblank_tick();  /* the GPU's frame clock */
         kernel_swmethod_tick(); /* a NOP the pushbuffer is stalled on */
         kernel_drain_dpcs();   /* deferred work, before due timers */

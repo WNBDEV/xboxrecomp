@@ -508,4 +508,13 @@ void  *xbox_thread_debug_handle(void); /* the game thread, or NULL under inline 
 #define XBOX_THREAD_MODE_SPAWN  1
 void xbox_SetThreadMode(int mode);
 
+/* A vblank the title has not acknowledged yet. RECOMP_VBLANK sets this in
+ * PCRTC_INTR_0 next to the VBLANK bit; the title's ISR acknowledges by
+ * writing 1 there (write-one-to-clear on hardware), which drops it. The NV2A
+ * poll loop leaves the vblank's PCRTC and PMC bits alone while it is set and
+ * clears them once it is gone -- the one way to tell "pending" from
+ * "acknowledged" in a register that is plain memory. NV_PCRTC_INTR_0 defines
+ * only bit 0, so nothing reads this bit as anything else. */
+#define XBOX_NV2A_VBLANK_UNACKED 0x80000000u
+
 #endif /* XBOX_MEMORY_LAYOUT_H */

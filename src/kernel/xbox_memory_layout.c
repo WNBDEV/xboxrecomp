@@ -877,11 +877,25 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        /* A delivered vblank stays pending until the title acknowledges it
+         * (XBOX_NV2A_VBLANK_UNACKED): zeroing it here at once, as for every
+         * other interrupt status, beat the title's DPC to the read nearly
+         * every time -- this loop never sleeps -- and Alter Echo's D3D saw 10
+         * of ~1500 vblanks in 25 s and presented two frames a minute. */
+        int vblank_unacked =
+            (regs[0x600100 / 4] & XBOX_NV2A_VBLANK_UNACKED) != 0;
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
             volatile uint32_t *r =
                 (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
-            if (*r & NV2A_ACK[i].busy_mask) {
-                *r &= ~NV2A_ACK[i].busy_mask;
+            uint32_t mask = NV2A_ACK[i].busy_mask;
+            if (vblank_unacked) {
+                if (NV2A_ACK[i].offset == 0x600100)
+                    continue;                  /* PCRTC_INTR_0: still pending */
+                if (NV2A_ACK[i].offset == 0x000100)
+                    mask &= ~(1u << 24);       /* PMC_INTR_0: its PCRTC bit */
+            }
+            if (*r & mask) {
+                *r &= ~mask;
             }
         }
         for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
