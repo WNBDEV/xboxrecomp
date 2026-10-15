@@ -2420,13 +2420,20 @@ static volatile LONG s_swmethod_pending;
  * than at the next 10 ms tick -- each one stalls the pushbuffer until handled. */
 static HANDLE s_timer_wake;
 
+static int wait_profile_on(void);
+static double wait_profile_ms(LARGE_INTEGER a, LARGE_INTEGER b);
+static void wait_profile_add(uint32_t ord, uint32_t caller, uint32_t arg, double ms);
+
 void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t method, uint32_t param)
 {
     static unsigned n_handled, n_lost;
     int waited, handled = 0;
 
+    LARGE_INTEGER t0, t1;
+
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
         return;                               /* nobody to tell */
+    QueryPerformanceCounter(&t0);
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_FIFO) = 0;
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_TRAPPED_ADDR) =
         ((subch & 7u) << 16) | (method & 0x1FFFu);   /* channel 0 */
@@ -2463,6 +2470,10 @@ void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t method, uint32_t param)
     }
     pgraph_w1c_arm(0);
     InterlockedExchange(&s_swmethod_pending, 0);
+    if (wait_profile_on()) {
+        QueryPerformanceCounter(&t1);
+        wait_profile_add(0xFFFF, method, param, wait_profile_ms(t0, t1));
+    }
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_INTR)    &= ~NV2A_PGRAPH_INTR_ERROR;
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_NSOURCE) = 0;
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)     &= ~NV2A_PMC_INTR_PGRAPH;
@@ -9620,6 +9631,87 @@ static void kernel_thunk_dispatch(void)
     (void)held;
 }
 
+/* RECOMP_WAIT_PROFILE=1: where guest threads spend their time blocked.
+ *
+ * Samplers cannot answer it: a thread in a wait is inside Wine's syscall, and
+ * the unwinder stops there, so "waiting" is all they say. Timing each kernel
+ * call names what is being waited on and from where. Every ten seconds the
+ * costliest (ordinal, caller, first argument) triples of the window are
+ * printed with their total milliseconds; calls under 0.1 ms are not counted.
+ * The NV2A software-method stall, which blocks the pushbuffer rather than a
+ * guest thread, is recorded too, as ordinal 0xFFFF with the method's
+ * parameter in place of an object. */
+#define WAIT_PROF_SLOTS 48
+static struct { uint32_t ord, caller, arg; double ms; unsigned n; } s_wprof[WAIT_PROF_SLOTS];
+static CRITICAL_SECTION s_wprof_cs;
+static int s_wprof_on = -1;
+
+static int wait_profile_on(void)
+{
+    if (s_wprof_on < 0) {
+        const char *e = getenv("RECOMP_WAIT_PROFILE");
+        if (e && *e == '1')
+            InitializeCriticalSection(&s_wprof_cs);
+        s_wprof_on = e && *e == '1';
+    }
+    return s_wprof_on;
+}
+
+static double wait_profile_ms(LARGE_INTEGER a, LARGE_INTEGER b)
+{
+    static LARGE_INTEGER f;
+    if (!f.QuadPart)
+        QueryPerformanceFrequency(&f);
+    return (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)f.QuadPart;
+}
+
+static void wait_profile_add(uint32_t ord, uint32_t caller, uint32_t arg, double ms)
+{
+    static DWORD last;
+    DWORD now = GetTickCount();
+    int i, free_slot = -1;
+
+    if (ms < 0.1)
+        return;
+    EnterCriticalSection(&s_wprof_cs);
+    for (i = 0; i < WAIT_PROF_SLOTS; i++) {
+        if (s_wprof[i].n && s_wprof[i].ord == ord && s_wprof[i].caller == caller
+                && s_wprof[i].arg == arg)
+            break;
+        if (!s_wprof[i].n && free_slot < 0)
+            free_slot = i;
+    }
+    if (i == WAIT_PROF_SLOTS)
+        i = free_slot;
+    if (i >= 0) {
+        s_wprof[i].ord = ord; s_wprof[i].caller = caller; s_wprof[i].arg = arg;
+        s_wprof[i].ms += ms; s_wprof[i].n++;
+    }
+    if (!last)
+        last = now;
+    if (now - last >= 10000) {
+        int shown;
+        fprintf(stderr, "  [WAITS] last %.1f s, longest first (ordinal caller arg: ms/calls)\n",
+                (now - last) / 1000.0);
+        for (shown = 0; shown < 8; shown++) {
+            int best = -1;
+            for (i = 0; i < WAIT_PROF_SLOTS; i++)
+                if (s_wprof[i].n && (best < 0 || s_wprof[i].ms > s_wprof[best].ms))
+                    best = i;
+            if (best < 0)
+                break;
+            fprintf(stderr, "  [WAITS]   %4X %08X %08X: %8.1f ms / %u\n",
+                    s_wprof[best].ord, s_wprof[best].caller, s_wprof[best].arg,
+                    s_wprof[best].ms, s_wprof[best].n);
+            s_wprof[best].n = 0;
+        }
+        memset(s_wprof, 0, sizeof s_wprof);
+        fflush(stderr);
+        last = now;
+    }
+    LeaveCriticalSection(&s_wprof_cs);
+}
+
 static void kernel_thunk_dispatch_body(void)
 {
     int slot = g_kernel_dispatch_slot;
@@ -9726,7 +9818,14 @@ static void kernel_thunk_dispatch_body(void)
         }
     }
 
-    if (bridge) {
+    if (bridge && wait_profile_on()) {
+        LARGE_INTEGER t0, t1;
+        uint32_t caller = g_xbox_kernel_caller, arg = STACK_ARG(0);
+        QueryPerformanceCounter(&t0);
+        bridge();
+        QueryPerformanceCounter(&t1);
+        wait_profile_add(ordinal, caller, arg, wait_profile_ms(t0, t1));
+    } else if (bridge) {
         bridge();
     } else {
         /* No specific bridge - return 0. Warn once per ordinal rather than
