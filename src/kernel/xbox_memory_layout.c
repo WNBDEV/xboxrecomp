@@ -154,6 +154,7 @@ static size_t xbox_TiledApertureSize(void)
 
 static HANDLE g_nv2a_ack_thread = NULL;
 static volatile LONG g_nv2a_ack_stop = 0;
+static DWORD s_nv2a_last_work_ms;   /* poll loop: when it last ran commands */
 
 /*
  * NV2A busy-bit acknowledgement.
@@ -1029,6 +1030,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     } else if (put != gpu_get) {
                         gpu_get = nv2a_pb_run(gpu_get, put,
                             (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET));
+                        s_nv2a_last_work_ms = GetTickCount();
                     }
                     /* Periodic, because what the title submits at init is not
                      * what it submits once it is drawing a menu, and the
@@ -1102,7 +1104,18 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
         *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
                                + g_memory_offset) = GetTickCount();
 
-        Sleep(0);  /* yield; the waiter is spinning on another core */
+        /* Yield while there is work about, sleep once there has been none
+         * for a couple of milliseconds. Spinning on Sleep(0) through idle
+         * stretches kept this thread at a full core whether or not the title
+         * was submitting anything -- on a quad-core that is heat for nothing,
+         * and the software rasteriser has the rest of the cores at work
+         * already. A new submission waits at most a millisecond. The PFB
+         * flush and vblank acknowledgements a title spins on are cleared by
+         * nv2a_busy_ack_thread, not here, so they are not delayed by this. */
+        if (GetTickCount() - s_nv2a_last_work_ms > 2)
+            Sleep(1);
+        else
+            Sleep(0);  /* yield; the waiter is spinning on another core */
     }
     return 0;
 }
