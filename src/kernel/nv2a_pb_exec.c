@@ -740,9 +740,23 @@ static void clear_surface(uint32_t param)
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
     uint32_t bpp = surface_bpp();
     uint32_t y, x;
+    static int holes = -1;
 
-    if (!(param & NV097_CLEAR_COLOR_MASK))
+    /* RECOMP_DEBUG_HOLES=1: a depth/stencil-only clear also paints the colour
+     * surface magenta, so pixels nothing draws in a frame show as magenta
+     * rather than as whatever an earlier frame left there. Debug only: it
+     * changes what the title would see. */
+    if (holes < 0)
+        holes = getenv("RECOMP_DEBUG_HOLES") != NULL;
+    if (!(param & NV097_CLEAR_COLOR_MASK)) {
+        if (holes) {
+            uint32_t saved = s_gpu.clear_color;
+            s_gpu.clear_color = 0xFFFF00FFu;
+            clear_surface(param | NV097_CLEAR_COLOR_MASK);
+            s_gpu.clear_color = saved;
+        }
         return;                            /* depth/stencil only */
+    }
     if (!s_gpu.color_offset || !s_gpu.pitch || !s_gpu.clip_h || bpp == 0)
         return;
     {
@@ -1963,6 +1977,74 @@ typedef struct {
 
 typedef struct { uint64_t depth_fail, pixels; uint32_t zpass; } XfCount;
 
+/* RECOMP_WHITE_PROBE=x0,y0,x1,y1: name the draws that paint (near) white in
+ * that rectangle -- once per draw, with the triangle's vertices and the
+ * state that shaded it. Stray white geometry has several possible causes (a
+ * texel that failed, a vertex colour taken as-is, a combiner reading the
+ * wrong register) and this is the evidence that tells them apart.
+ * RECOMP_WHITE_PROBE_ANY=1 reports every write there instead: no report at
+ * all means nothing drew those pixels, and what shows is left over. */
+static int s_wprobe_on, s_wprobe[4];
+static DWORD s_wprobe_from;               /* RECOMP_WHITE_PROBE_MS: not before */
+
+static void white_probe(const XfTri *T, int x, int y, uint32_t argb)
+{
+    static uint32_t last_draw = 0xFFFFFFFFu;
+    static volatile LONG shown;
+    const Nv2aVshOutput *v[3] = { T->va, T->vb, T->vc };
+    int k;
+
+    if ((s_wprobe_on == 1 && (argb & 0x00F0F0F0u) != 0x00F0F0F0u)
+            || x < s_wprobe[0] || y < s_wprobe[1]
+            || x >= s_wprobe[2] || y >= s_wprobe[3] || s_gpu.draws == last_draw
+            || GetTickCount() < s_wprobe_from)
+        return;
+    last_draw = s_gpu.draws;
+    if (InterlockedIncrement(&shown) > 40)
+        return;
+    fprintf(stderr, "[WPROBE] draw %u at %d,%d argb %08X | tex0 %s %08X %ux%u fmt %02X"
+            " | rc %d prog %05X stages %u | blend %u %X/%X | alpha test %u | mask %08X\n",
+            s_gpu.draws, x, y, argb, s_gpu.texs[0].valid ? "on" : "off",
+            s_gpu.texs[0].offset, s_gpu.texs[0].width, s_gpu.texs[0].height,
+            s_gpu.texs[0].color, T->use_rc, s_gpu.rc.stage_program,
+            s_gpu.rc.control & 0xFF, s_gpu.blend_enable, s_gpu.blend_sfactor,
+            s_gpu.blend_dfactor, s_gpu.alpha_test, s_gpu.color_mask);
+    for (k = 0; k < 3; k++)
+        fprintf(stderr, "[WPROBE]   v%d pos %.1f %.1f %.4f %.3g d0 %.2f %.2f %.2f %.2f"
+                " d1 %.2f %.2f %.2f %.2f t0 %.3f %.3f %.3f %.3f\n", k,
+                v[k]->pos[0], v[k]->pos[1], v[k]->pos[2], v[k]->pos[3],
+                v[k]->d0[0], v[k]->d0[1], v[k]->d0[2], v[k]->d0[3],
+                v[k]->d1[0], v[k]->d1[1], v[k]->d1[2], v[k]->d1[3],
+                v[k]->tex[0][0], v[k]->tex[0][1], v[k]->tex[0][2], v[k]->tex[0][3]);
+    if (T->use_rc)
+        fprintf(stderr, "[WPROBE]   icw %08X %08X ocw %08X %08X final %08X %08X\n",
+                s_gpu.rc.color_icw[0], s_gpu.rc.alpha_icw[0], s_gpu.rc.color_ocw[0],
+                s_gpu.rc.alpha_ocw[0], s_gpu.rc.final0, s_gpu.rc.final1);
+}
+
+/* RECOMP_WHITE_PROBE_WHY=1: at the probe rectangle's top-left pixel, what
+ * became of every triangle whose bounding box covers it -- outside its
+ * edges, stencil, depth (with both values), a CLIPPLANE kill, the alpha test,
+ * or drawn. A hole in geometry is one of those, and this says which. */
+static void why_probe(const XfTri *T, const char *why, float z, float stored)
+{
+    static volatile LONG shown;
+    static int traced = -1;
+    if (traced < 0)
+        traced = getenv("RECOMP_FRAME_TRACE") != NULL;
+    if (traced && s_ftrace != 2)
+        return;                           /* only inside the traced frame */
+    if (GetTickCount() < s_wprobe_from || InterlockedIncrement(&shown) > 80)
+        return;
+    fprintf(stderr, "[WHY] draw %u %s z %.1f stored %.1f | tex0 %08X fmt %02X | "
+            "tri %.1f,%.1f %.1f,%.1f %.1f,%.1f w %.3g %.3g %.3g\n",
+            s_gpu.draws, why, z, stored, s_gpu.texs[0].offset, s_gpu.texs[0].color,
+            T->a[0], T->a[1], T->b[0], T->b[1], T->c[0], T->c[1],
+            T->a[3], T->b[3], T->c[3]);
+}
+#define XF_WHY(r, z, st) do { if (s_wprobe_on == 3 && x == s_wprobe[0] \
+        && y == s_wprobe[1]) why_probe(T, (r), (z), (st)); } while (0)
+
 /* Rows y0, y0+step, ... < maxy of triangle T. */
 static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
 {
@@ -1979,8 +2061,10 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
             float l0, l1, l2, z, col[4], pw;
             uint32_t argb;
             if (!((w0 >= 0 && w1 >= 0 && w2 >= 0)
-               || (w0 <= 0 && w1 <= 0 && w2 <= 0)))
+               || (w0 <= 0 && w1 <= 0 && w2 <= 0))) {
+                XF_WHY("outside", 0.0f, 0.0f);
                 continue;
+            }
             /* w1 is opposite a, w2 opposite b, w0 opposite c. */
             l0 = w1 * T->inv_area; l1 = w2 * T->inv_area; l2 = w0 * T->inv_area;
             z = l0 * a[2] + l1 * b[2] + l2 * c[2];
@@ -2002,10 +2086,12 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
                  * Matters only for alpha-tested geometry that writes
                  * stencil. */
                 if (sp && !stencil_pass(*sp)) {
+                    XF_WHY("stencil", z, 0.0f);
                     stencil_update(sp, s_gpu.stencil_op_fail);
                     continue;
                 }
                 if (zp && s_gpu.depth_test && !depth_pass(z, *zp)) {
+                    XF_WHY("depth", z, *zp);
                     if (sp)
                         stencil_update(sp, s_gpu.stencil_op_zfail);
                     cnt->depth_fail++;
@@ -2034,12 +2120,16 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
                                        + l2 * T->stc[2][st][j]) / pw;
                             keep = rc_stage_fetch(st, tc, t[st]);
                         }
-                        if (!keep)
+                        if (!keep) {
+                            XF_WHY("clipplane", z, 0.0f);
                             continue;
+                        }
                         nv2a_rc_eval(&s_gpu.rc, col, d1, fog,
                                      (const float (*)[4])t, out);
-                        if (s_gpu.alpha_test && !alpha_test_pass(out[3]))
+                        if (s_gpu.alpha_test && !alpha_test_pass(out[3])) {
+                            XF_WHY("alpha", z, out[3] * 255.0f);
                             continue;
+                        }
                         argb = pack_color(out);
                     } else {
                         argb = pack_color(col);
@@ -2067,6 +2157,9 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
                     continue;              /* colour writes off: depth only */
                 cnt->pixels++;
             }
+            XF_WHY("drawn", z, (float)(argb & 0xFFFFFF));
+            if (s_wprobe_on == 1 || s_wprobe_on == 2)
+                white_probe(T, x, y, argb);
             put_pixel(T->mem, T->bpp, x, y, argb);
         }
     }
@@ -2598,9 +2691,22 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
     float in[NV2A_VSH_INPUTS][4];
     uint32_t a;
 
+    int k;
+
     for (a = 0; a < NV2A_VSH_INPUTS; a++)
         fetch_attr(&s_gpu.attr[a], index, in[a]);   /* absent: 0,0,0,1 */
-    return nv2a_vsh_run((const float (*)[4])in, out);
+    if (!nv2a_vsh_run((const float (*)[4])in, out))
+        return 0;
+    /* The colour outputs leave the vertex unit saturated to [0, 1]: the
+     * combiners receive them as unsigned 8-bit, and xemu clamps oD0/oD1 the
+     * same way. Unclamped, a lit vertex's diffuse of 2.3 multiplied every
+     * texel by 2.3, and Alter Echo's brightly lit polygons came out as flat
+     * white triangles. */
+    for (k = 0; k < 4; k++) {
+        out->d0[k] = out->d0[k] < 0.0f ? 0.0f : (out->d0[k] > 1.0f ? 1.0f : out->d0[k]);
+        out->d1[k] = out->d1[k] < 0.0f ? 0.0f : (out->d1[k] > 1.0f ? 1.0f : out->d1[k]);
+    }
+    return 1;
 }
 
 static void prof_report(void)
@@ -2638,8 +2744,17 @@ static void raster_batch_program(void)
     static int prof_init;
 
     if (!prof_init) {
+        const char *wp = getenv("RECOMP_WHITE_PROBE");
         prof_init = 1;
         s_prof.on = getenv("RECOMP_GPU_PROFILE") != NULL;
+        s_wprobe_on = wp && sscanf(wp, "%d,%d,%d,%d", &s_wprobe[0], &s_wprobe[1],
+                                   &s_wprobe[2], &s_wprobe[3]) == 4;
+        if (s_wprobe_on && getenv("RECOMP_WHITE_PROBE_ANY"))
+            s_wprobe_on = 2;                      /* every write, not only white */
+        if (s_wprobe_on && getenv("RECOMP_WHITE_PROBE_WHY"))
+            s_wprobe_on = 3;                      /* fate of each triangle there */
+        if (s_wprobe_on && getenv("RECOMP_WHITE_PROBE_MS"))
+            s_wprobe_from = GetTickCount() + (DWORD)atol(getenv("RECOMP_WHITE_PROBE_MS"));
     }
 
     if (s_prof.on) {
