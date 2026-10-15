@@ -1960,6 +1960,35 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
     }
 }
 
+/* A draw's triangles, rasterised together (RECOMP_RASTER_BATCH, on by
+ * default; =0 goes back to one triangle at a time).
+ *
+ * Splitting each triangle by rows only pays for big ones, so a draw of many
+ * small triangles ran on the executor thread alone while the workers slept --
+ * Alter Echo's loading screen is ~50k of them a frame, a distortion grid, at
+ * 4 fps, and its loader advances once a frame, so the level took minutes to
+ * load. Queued until the draw ends instead, every triangle can be split the
+ * same way: worker k takes the rows y = k (mod n) of all of them, so each
+ * pixel still sees its triangles in submission order, on one thread.
+ *
+ * The state a pixel reads is the draw's and does not change before the flush
+ * at its end; the vertices are copied, because clipped ones live on the
+ * clipper's stack. */
+typedef struct { XfTri T; Nv2aVshOutput v[3]; } XfQueued;
+#define NV_XFQ_MAX 4096
+static XfQueued *s_xfq;
+static int s_xfq_n;
+static long s_xfq_px;                       /* bounding-box area queued */
+
+static void xf_rows_queued(int k, int n, XfCount *cnt)
+{
+    int i;
+    for (i = 0; i < s_xfq_n; i++) {
+        const XfTri *T = &s_xfq[i].T;
+        xf_rows(T, T->miny + (((k - T->miny) % n) + n) % n, n, cnt);
+    }
+}
+
 /* Worker threads for big triangles.
  *
  * The rasteriser is a software GPU, and a Burnout 3 frame is dominated by a
@@ -1980,7 +2009,7 @@ static struct {
     int n;                                  /* threads incl. the caller */
     HANDLE start[NV_RASTER_MAX_THREADS], done;
     volatile LONG pending;
-    const XfTri *tri;
+    const XfTri *tri;                       /* NULL: the queue */
     XfCount cnt[NV_RASTER_MAX_THREADS];
 } s_pool;
 
@@ -1990,7 +2019,10 @@ static DWORD WINAPI raster_worker(LPVOID arg)
     for (;;) {
         WaitForSingleObject(s_pool.start[k], INFINITE);
         memset(&s_pool.cnt[k], 0, sizeof s_pool.cnt[k]);
-        xf_rows(s_pool.tri, s_pool.tri->miny + k, s_pool.n, &s_pool.cnt[k]);
+        if (s_pool.tri)
+            xf_rows(s_pool.tri, s_pool.tri->miny + k, s_pool.n, &s_pool.cnt[k]);
+        else
+            xf_rows_queued(k, s_pool.n, &s_pool.cnt[k]);
         if (InterlockedDecrement(&s_pool.pending) == 0)
             SetEvent(s_pool.done);
     }
@@ -2049,12 +2081,74 @@ static void xf_rows_parallel(const XfTri *T, XfCount *total)
         total->zpass += s_pool.cnt[k].zpass;
     }
 }
+
+/* Rasterise the queue: all of it on every thread, each its own rows. */
+static void xf_queue_run(XfCount *total)
+{
+    int n = raster_pool_size(), k;
+
+    if (n <= 1 || s_xfq_px < NV_RASTER_MT_MIN_PIXELS) {
+        xf_rows_queued(0, 1, total);
+        return;
+    }
+    s_pool.tri = NULL;
+    s_pool.pending = n - 1;
+    for (k = 0; k < n - 1; k++)
+        SetEvent(s_pool.start[k]);
+    {
+        XfCount mine = {0, 0, 0};
+        xf_rows_queued(n - 1, n, &mine);
+        WaitForSingleObject(s_pool.done, INFINITE);
+        total->depth_fail += mine.depth_fail;
+        total->pixels += mine.pixels;
+        total->zpass += mine.zpass;
+    }
+    for (k = 0; k < n - 1; k++) {
+        total->depth_fail += s_pool.cnt[k].depth_fail;
+        total->pixels += s_pool.cnt[k].pixels;
+        total->zpass += s_pool.cnt[k].zpass;
+    }
+}
 #else
 static void xf_rows_parallel(const XfTri *T, XfCount *total)
 {
     xf_rows(T, T->miny, 1, total);
 }
+
+static void xf_queue_run(XfCount *total)
+{
+    xf_rows_queued(0, 1, total);
+}
 #endif
+
+static int xf_batching(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_RASTER_BATCH");
+        on = !(e && *e == '0');
+        if (on && !s_xfq) {
+            s_xfq = (XfQueued *)malloc(sizeof(XfQueued) * NV_XFQ_MAX);
+            if (!s_xfq)
+                on = 0;
+        }
+    }
+    return on;
+}
+
+static void xf_flush(void)
+{
+    XfCount cnt = {0, 0, 0};
+
+    if (!s_xfq_n)
+        return;
+    xf_queue_run(&cnt);
+    s_xfq_n = 0;
+    s_xfq_px = 0;
+    s_gpu.xf_depth_fail += cnt.depth_fail;
+    s_gpu.xf_pixels += cnt.pixels;
+    s_gpu.zpass_count += cnt.zpass;
+}
 
 static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
                                const Nv2aVshOutput *vc)
@@ -2147,6 +2241,20 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     s_gpu.xf_drawn++;
     T.inv_area = 1.0f / area;
 
+    if (xf_batching()) {
+        XfQueued *q;
+        if (s_xfq_n == NV_XFQ_MAX)
+            xf_flush();
+        q = &s_xfq[s_xfq_n++];
+        q->v[0] = *va; q->v[1] = *vb; q->v[2] = *vc;
+        q->T = T;
+        q->T.va = &q->v[0]; q->T.vb = &q->v[1]; q->T.vc = &q->v[2];
+        q->T.a = q->v[0].pos; q->T.b = q->v[1].pos; q->T.c = q->v[2].pos;
+        s_xfq_px += (long)(T.maxx - T.minx) * (T.maxy - T.miny);
+        s_gpu.tris_drawn++;
+        note_drawn();
+        return;
+    }
     xf_rows_parallel(&T, &cnt);
     /* RECOMP_PB_ZERO_DIAG: a triangle that covered pixels and wrote none was
      * cut by state, not geometry -- colour mask, alpha test, a CLIPPLANE
@@ -2371,6 +2479,7 @@ static void raster_batch_program(void)
     default:
         break;
     }
+    xf_flush();
 }
 
 static void raster_batch(void)
