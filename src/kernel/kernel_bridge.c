@@ -2328,6 +2328,93 @@ static void kernel_vblank_tick(void)
 #define NV2A_PGRAPH_TRAPPED_DATA_LOW   0x00400708u
 #define NV2A_PGRAPH_FIFO               0x00400720u
 
+/* PGRAPH_INTR's write-one-to-clear, emulated while a trap is outstanding.
+ *
+ * The aperture is plain memory, so a handler's acknowledgement -- writing back
+ * the status bits it read -- leaves them set, and PMC_INTR_0's PGRAPH bit,
+ * which on hardware only summarises PGRAPH_INTR, stays up with them. XDK D3D's
+ * DPC loops while PMC_INTR_0 has bits set: Alter Echo's ran its PGRAPH handler
+ * dozens of times for one trap, each pass setting BlockOnTime's event again.
+ * A pass that landed after D3D had reset that event for its next BlockOnTime
+ * woke the wait before the GPU had reached the fence it was waiting for, and
+ * D3D reused pushbuffer space the executor had not read yet.
+ *
+ * So for the life of a trap the PGRAPH register page is read-only: a write to
+ * it faults, is single-stepped, and a write to PGRAPH_INTR then becomes
+ * `old & ~written`, dropping PMC's bit once nothing is left -- the first pass's
+ * acknowledgement retires the trap, as on hardware. Armed only around a trap
+ * because the page holds PGRAPH_FIFO, which the handler writes on every pass,
+ * and a fault per write is not worth paying the rest of the time. */
+#define NV2A_PGRAPH_PAGE 0x00400000u
+static void *s_pgraph_page;
+static void *s_pgraph_veh;
+static volatile LONG s_pgraph_armed;
+static CRITICAL_SECTION s_pgraph_cs;
+static RECOMP_TLS int s_pgraph_stepping;
+static RECOMP_TLS uint32_t s_pgraph_off, s_pgraph_old;
+
+static LONG CALLBACK pgraph_w1c_veh(PEXCEPTION_POINTERS ep)
+{
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    DWORD old;
+
+    if (!s_pgraph_page)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    if (code == EXCEPTION_SINGLE_STEP && s_pgraph_stepping) {
+        s_pgraph_stepping = 0;
+        EnterCriticalSection(&s_pgraph_cs);
+        if (s_pgraph_off == (NV2A_PGRAPH_INTR & 0xFFFu)) {
+            volatile uint32_t *r =
+                (volatile uint32_t *)((char *)s_pgraph_page + s_pgraph_off);
+            uint32_t now = s_pgraph_old & ~*r;
+            *r = now;
+            if (!now)
+                BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0) &= ~NV2A_PMC_INTR_PGRAPH;
+        }
+        if (s_pgraph_armed)
+            VirtualProtect(s_pgraph_page, 4096, PAGE_READONLY, &old);
+        LeaveCriticalSection(&s_pgraph_cs);
+        ep->ContextRecord->EFlags &= ~0x100u;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    if (code == EXCEPTION_ACCESS_VIOLATION
+            && ep->ExceptionRecord->ExceptionInformation[0] == 1) {
+        uintptr_t fault = ep->ExceptionRecord->ExceptionInformation[1];
+        if (fault >= (uintptr_t)s_pgraph_page
+                && fault < (uintptr_t)s_pgraph_page + 4096) {
+            s_pgraph_off = (uint32_t)(fault - (uintptr_t)s_pgraph_page) & ~3u;
+            s_pgraph_old = *(volatile uint32_t *)((char *)s_pgraph_page + s_pgraph_off);
+            if (!VirtualProtect(s_pgraph_page, 4096, PAGE_READWRITE, &old))
+                return EXCEPTION_CONTINUE_SEARCH;
+            s_pgraph_stepping = 1;
+            ep->ContextRecord->EFlags |= 0x100u;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void pgraph_w1c_arm(int on)
+{
+    DWORD old;
+
+    if (!s_pgraph_page) {
+        if (!on)
+            return;
+        InitializeCriticalSection(&s_pgraph_cs);
+        s_pgraph_veh = AddVectoredExceptionHandler(1, pgraph_w1c_veh);
+        if (!s_pgraph_veh)
+            return;
+        s_pgraph_page = XBOX_TO_NATIVE(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_PAGE);
+    }
+    EnterCriticalSection(&s_pgraph_cs);
+    InterlockedExchange(&s_pgraph_armed, on);
+    VirtualProtect(s_pgraph_page, 4096, on ? PAGE_READONLY : PAGE_READWRITE, &old);
+    LeaveCriticalSection(&s_pgraph_cs);
+}
+
 static volatile LONG s_swmethod_pending;
 /* Wakes the timer thread early, so a software method is delivered now rather
  * than at the next 10 ms tick -- each one stalls the pushbuffer until handled. */
@@ -2348,6 +2435,7 @@ void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t method, uint32_t param)
         NV2A_PGRAPH_NSOURCE_NOTIFY;
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_INTR) |= NV2A_PGRAPH_INTR_ERROR;
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)  |= NV2A_PMC_INTR_PGRAPH;
+    pgraph_w1c_arm(1);
     InterlockedExchange(&s_swmethod_pending, 1);
     if (s_timer_wake)
         SetEvent(s_timer_wake);
@@ -2373,6 +2461,7 @@ void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t method, uint32_t param)
         }
         Sleep(1);
     }
+    pgraph_w1c_arm(0);
     InterlockedExchange(&s_swmethod_pending, 0);
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_INTR)    &= ~NV2A_PGRAPH_INTR_ERROR;
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_NSOURCE) = 0;
@@ -2386,10 +2475,12 @@ void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t method, uint32_t param)
     }
 }
 
-/* Keep the line up while a software method is waiting (see above). */
+/* Keep the line up while a software method is waiting (see above) -- but only
+ * until it has been handled. */
 static void kernel_swmethod_tick(void)
 {
-    if (InterlockedCompareExchange(&s_swmethod_pending, 0, 0))
+    if (InterlockedCompareExchange(&s_swmethod_pending, 0, 0)
+            && !(BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_FIFO) & 1u))
         kernel_raise_interrupt(NV2A_VECTOR);
 }
 
