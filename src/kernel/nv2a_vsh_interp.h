@@ -58,4 +58,17 @@ const float *nv2a_vsh_constant(uint32_t index);   /* for traces */
 void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word);
 void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4]);
 
+/* For translating programs to the host GPU (nv2a_gpu_d3d11.c). The counters
+ * move whenever program or constant memory changes. program_copy gives the
+ * program from its start slot through its FINAL instruction and returns the
+ * count; input_mask has bit n set when it reads v<n>. A program that writes
+ * constant memory (CXT_WRITE_EN) makes vertices depend on each other's order
+ * and has to stay on the interpreter. */
+uint32_t nv2a_vsh_program_gen(void);
+uint32_t nv2a_vsh_constants_gen(void);
+const float (*nv2a_vsh_constants(void))[4];
+uint32_t nv2a_vsh_program_copy(uint32_t out[][4], uint32_t max);
+int nv2a_vsh_program_writes_constants(void);
+uint32_t nv2a_vsh_input_mask(void);
+
 #endif

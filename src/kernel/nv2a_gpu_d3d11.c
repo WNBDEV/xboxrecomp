@@ -12,6 +12,7 @@
  * only in its factors reuses the shader.
  */
 #include "nv2a_gpu.h"
+#include "nv2a_vsh_interp.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,12 +38,16 @@ static ID3D11VertexShader *s_vs, *s_clear_vs;
 static ID3D11PixelShader *s_clear_ps;
 static ID3D11InputLayout *s_layout;
 static ID3D11Buffer *s_vb, *s_vs_cb, *s_ps_cb, *s_clear_cb;
+static ID3D11Buffer *s_ib, *s_const_cb, *s_prog_cb;
+static ID3D11InputLayout *s_attr_layout;
+static uint32_t s_ib_pos, s_const_gen_up;
 static ID3D11RasterizerState *s_rs;
 static ID3D11ShaderResourceView *s_white2d, *s_whitecube;
 static uint32_t s_vb_pos;
 static uint32_t s_frame = 1;
 
 #define GPU_VB_BYTES (16u << 20)
+#define GPU_IB_BYTES (4u << 20)
 
 static void gpu_log(const char *fmt, ...)
 {
@@ -389,6 +394,235 @@ static ID3D11PixelShader *get_ps(const PsKey *k)
         s_ps_count++;
     }
     return ps;
+}
+
+/* ---- generated vertex shaders ------------------------------------------- */
+
+/* The title's vertex program, statement for statement as nv2a_vsh_interp.c
+ * runs it: sources read before either unit writes, the ILU's temp write
+ * going to R1 when it shares the instruction with a MAC op, a0-relative
+ * constants clamped into range, unwritten outputs at their defaults. Then the
+ * same step back from screen space to clip space as the fixed shader above,
+ * and the fixed-function fog factor from oFog.x. */
+
+static uint32_t vfield(const uint32_t *ins, int dw, int lo, int width)
+{
+    return (ins[dw] >> lo) & ((1u << width) - 1u);
+}
+
+static void vs_src(Str *s, const char *name, const uint32_t *ins, int which)
+{
+    static const char sw[] = "xyzw";
+    uint32_t neg, swz, mux, reg;
+    char base[48];
+
+    if (which == 0) {
+        neg = vfield(ins, 1, 8, 1); swz = vfield(ins, 1, 0, 8);
+        mux = vfield(ins, 2, 26, 2); reg = vfield(ins, 2, 28, 4);
+    } else if (which == 1) {
+        neg = vfield(ins, 2, 25, 1); swz = vfield(ins, 2, 17, 8);
+        mux = vfield(ins, 2, 11, 2); reg = vfield(ins, 2, 13, 4);
+    } else {
+        neg = vfield(ins, 2, 10, 1); swz = vfield(ins, 2, 2, 8);
+        mux = vfield(ins, 3, 28, 2);
+        reg = (vfield(ins, 2, 0, 2) << 2) | vfield(ins, 3, 30, 2);
+    }
+    if (mux == 1)
+        snprintf(base, sizeof base, "%s", reg == 12 ? "P" : "");
+    if (mux == 1 && reg != 12)
+        snprintf(base, sizeof base, "R[%u]", reg < 12 ? reg : 0);
+    else if (mux == 2)
+        snprintf(base, sizeof base, "v[%u]", vfield(ins, 1, 9, 4));
+    else if (mux != 1) {
+        uint32_t ci = vfield(ins, 1, 13, 8);
+        if (vfield(ins, 3, 1, 1))
+            snprintf(base, sizeof base, "C[cidx(%u + a0)]", ci);
+        else
+            snprintf(base, sizeof base, "C[%u]", ci < 192 ? ci : 0);
+    }
+    sb(s, "    float4 %s = %s%s.%c%c%c%c;\n", name, neg ? "-" : "", base,
+       sw[(swz >> 6) & 3], sw[(swz >> 4) & 3], sw[(swz >> 2) & 3], sw[swz & 3]);
+}
+
+static void vs_write(Str *s, const char *dst, const char *src, uint32_t mask)
+{
+    if (mask & 8) sb(s, "    %s.x = %s.x;\n", dst, src);
+    if (mask & 4) sb(s, "    %s.y = %s.y;\n", dst, src);
+    if (mask & 2) sb(s, "    %s.z = %s.z;\n", dst, src);
+    if (mask & 1) sb(s, "    %s.w = %s.w;\n", dst, src);
+}
+
+static char *gen_vs(const uint32_t (*prog)[4], uint32_t n)
+{
+    Str s = { NULL, 0, 0 };
+    uint32_t i;
+
+    sb(&s,
+       "cbuffer K : register(b0) { float4 C[192]; };\n"
+       "cbuffer V : register(b1) { float4 vp; float4 fogp; };\n"
+       "struct VI {\n");
+    for (i = 0; i < 16; i++)
+        sb(&s, "  float4 v%u : ATTR%u;\n", i, i);
+    sb(&s,
+       "};\n"
+       "struct VO { float4 p : SV_Position; float4 d0 : COLOR0; float4 d1 : COLOR1;\n"
+       "  float4 f : FOG; float4 t0 : TEXCOORD0; float4 t1 : TEXCOORD1;\n"
+       "  float4 t2 : TEXCOORD2; float4 t3 : TEXCOORD3; };\n"
+       "int cidx(int i) { return (i < 0 || i >= 192) ? 0 : i; }\n"
+       "float4 splat(float f) { return float4(f, f, f, f); }\n"
+       "float fogf(float d) {\n"
+       "  if (fogp.x == 0.0) return 1.0;\n"
+       "  int mode = (int)fogp.y; float f;\n"
+       "  if (mode == 0x800 || mode == 0x802) f = fogp.z + exp2(d * fogp.w * 16.0) - 1.5;\n"
+       "  else if (mode == 0x801 || mode == 0x803) f = fogp.z + exp2(-d * d * fogp.w * fogp.w * 32.0) - 1.5;\n"
+       "  else f = fogp.z + d * fogp.w - 1.0;\n"
+       "  if (mode == 0x802 || mode == 0x803 || mode == 0x804) f = abs(f);\n"
+       "  if (f != f) f = 1.0;\n"
+       "  return saturate(f);\n"
+       "}\n"
+       "VO main(VI i) {\n"
+       "  float4 v[16];\n");
+    for (i = 0; i < 16; i++)
+        sb(&s, "  v[%u] = i.v%u;\n", i, i);
+    sb(&s,
+       "  float4 R[12]; float4 P = 0; float4 O[13]; int a0 = 0;\n");
+    for (i = 0; i < 12; i++)
+        sb(&s, "  R[%u] = 0;\n", i);
+    for (i = 0; i < 13; i++)
+        sb(&s, "  O[%u] = float4(0, 0, 0, %s);\n", i,
+           (i == 3 || i == 4 || (i >= 9 && i <= 12)) ? "1" : "0");
+
+    for (i = 0; i < n; i++) {
+        const uint32_t *ins = prog[i];
+        uint32_t mac = vfield(ins, 1, 21, 4), ilu = vfield(ins, 1, 25, 3);
+        uint32_t mmask = vfield(ins, 3, 24, 4), imask = vfield(ins, 3, 16, 4);
+        uint32_t tdst = vfield(ins, 3, 20, 4);
+        uint32_t omask = vfield(ins, 3, 12, 4), oaddr = vfield(ins, 3, 3, 8);
+
+        sb(&s, "  {\n");
+        vs_src(&s, "a", ins, 0);
+        vs_src(&s, "b", ins, 1);
+        vs_src(&s, "c", ins, 2);
+        switch (mac) {
+        case 0:  sb(&s, "    float4 m = 0;\n"); break;
+        case 2:  sb(&s, "    float4 m = a * b;\n"); break;
+        case 3:  sb(&s, "    float4 m = a + c;\n"); break;
+        case 4:  sb(&s, "    float4 m = a * b + c;\n"); break;
+        case 5:  sb(&s, "    float4 m = splat(dot(a.xyz, b.xyz));\n"); break;
+        case 6:  sb(&s, "    float4 m = splat(dot(a.xyz, b.xyz) + b.w);\n"); break;
+        case 7:  sb(&s, "    float4 m = splat(dot(a, b));\n"); break;
+        case 8:  sb(&s, "    float4 m = float4(1.0, a.y * b.y, a.z, b.w);\n"); break;
+        case 9:  sb(&s, "    float4 m = (a < b) ? a : b;\n"); break;
+        case 10: sb(&s, "    float4 m = (a >= b) ? a : b;\n"); break;
+        case 11: sb(&s, "    float4 m = (a < b) ? 1.0 : 0.0;\n"); break;
+        case 12: sb(&s, "    float4 m = (a >= b) ? 1.0 : 0.0;\n"); break;
+        default: sb(&s, "    float4 m = a;\n"); break;   /* mov, arl, 14, 15 */
+        }
+        switch (ilu) {
+        case 0: sb(&s, "    float4 l = 0;\n"); break;
+        case 2: sb(&s, "    float4 l = splat(c.x == 0.0 ? asfloat(0x7f800000) : 1.0 / c.x);\n"); break;
+        case 3: sb(&s, "    float rf = 1.0 / c.x;\n"
+                       "    if (abs(rf) < 5.42101e-20) rf = rf < 0.0 ? -5.42101e-20 : 5.42101e-20;\n"
+                       "    if (abs(rf) > 1.884467e19) rf = rf < 0.0 ? -1.884467e19 : 1.884467e19;\n"
+                       "    float4 l = splat(rf);\n"); break;
+        case 4: sb(&s, "    float4 l = splat(1.0 / sqrt(abs(c.x)));\n"); break;
+        case 5: sb(&s, "    float fl = floor(c.x);\n"
+                       "    float4 l = float4(exp2(fl), c.x - fl, exp2(c.x), 1.0);\n"); break;
+        case 6: sb(&s, "    float ax = abs(c.x); float4 l;\n"
+                       "    if (ax == 0.0) l = float4(-asfloat(0x7f800000), 1.0, -asfloat(0x7f800000), 1.0);\n"
+                       "    else { float e = floor(log2(ax)); l = float4(e, ax / exp2(e), log2(ax), 1.0); }\n"); break;
+        case 7: sb(&s, "    float nl = max(c.x, 0.0), nh = max(c.y, 0.0);\n"
+                       "    float pe = clamp(c.w, -127.9961, 127.9961);\n"
+                       "    float pw = nh > 0.0 ? pow(nh, pe) : (pe == 0.0 ? 1.0 : (pe > 0.0 ? 0.0 : asfloat(0x7f800000)));\n"
+                       "    float4 l = float4(1.0, nl, c.x > 0.0 ? pw : 0.0, 1.0);\n"); break;
+        default: sb(&s, "    float4 l = c;\n"); break;   /* mov */
+        }
+        if (mac == 13)
+            sb(&s, "    a0 = (int)floor(a.x + 0.001);\n");
+        if (mac && mac != 13 && mmask && tdst <= 12) {
+            char d[8];
+            snprintf(d, sizeof d, tdst == 12 ? "P" : "R[%u]", tdst);
+            vs_write(&s, d, "m", mmask);
+        }
+        if (ilu && imask) {
+            uint32_t it = mac ? 1u : tdst;
+            if (it <= 12) {
+                char d[8];
+                snprintf(d, sizeof d, it == 12 ? "P" : "R[%u]", it);
+                vs_write(&s, d, "l", imask);
+            }
+        }
+        if (omask && vfield(ins, 3, 11, 1)) {
+            const char *src = vfield(ins, 3, 2, 1) ? "l" : "m";
+            if (oaddr == 0)
+                vs_write(&s, "P", src, omask);
+            else if (oaddr < 13) {
+                char d[8];
+                snprintf(d, sizeof d, "O[%u]", oaddr);
+                vs_write(&s, d, src, omask);
+            }
+        }
+        sb(&s, "  }\n");
+        if (vfield(ins, 3, 0, 1))
+            break;
+    }
+    sb(&s,
+       "  VO o; float w = P.w;\n"
+       "  if (w == 0.0 || w != w || abs(w) > 3.0e38) w = 1.0;\n"
+       "  o.p = float4((P.x * vp.x - 1.0) * w, (1.0 - P.y * vp.y) * w, P.z * vp.z * w, w);\n"
+       "  o.d0 = saturate(O[3]); o.d1 = saturate(O[4]);\n"
+       "  o.f = float4(fogf(O[5].x), 0.0, 0.0, 1.0);\n"
+       "  o.t0 = O[9]; o.t1 = O[10]; o.t2 = O[11]; o.t3 = O[12];\n"
+       "  return o;\n"
+       "}\n");
+    return s.p;
+}
+
+typedef struct { uint64_t hash; uint32_t n; ID3D11VertexShader *vs; } VsEntry;
+#define VS_CACHE 1024
+static VsEntry s_vsc[VS_CACHE];
+static int s_vsc_count;
+
+static ID3D11VertexShader *get_program_vs(void)
+{
+    static uint32_t gen_seen;
+    static ID3D11VertexShader *cur;
+    static uint32_t prog[NV2A_VSH_SLOTS][4];
+    uint32_t gen = nv2a_vsh_program_gen(), n, i;
+    uint64_t h;
+    char *src;
+    ID3DBlob *code;
+    ID3D11VertexShader *vs = NULL;
+
+    if (gen == gen_seen && cur)
+        return cur;
+    n = nv2a_vsh_program_copy(prog, NV2A_VSH_SLOTS);
+    if (!n)
+        return NULL;
+    h = hash_bytes(0xCBF29CE484222325ull, (const uint8_t *)prog, (size_t)n * 16);
+    gen_seen = gen;
+    for (i = 0; i < (uint32_t)s_vsc_count; i++)
+        if (s_vsc[i].hash == h && s_vsc[i].n == n)
+            return cur = s_vsc[i].vs;
+    src = gen_vs((const uint32_t (*)[4])prog, n);
+    code = compile(src, "vs_4_0", "vertex program");
+    if (!code && getenv("RECOMP_GPU_TRACE"))
+        fprintf(stderr, "%s\n", src);
+    free(src);
+    cur = NULL;
+    if (!code)
+        return NULL;
+    if (FAILED(ID3D11Device_CreateVertexShader(s_dev, ID3D10Blob_GetBufferPointer(code),
+                                               ID3D10Blob_GetBufferSize(code), NULL, &vs)))
+        vs = NULL;
+    ID3D10Blob_Release(code);
+    if (vs && s_vsc_count < VS_CACHE) {
+        s_vsc[s_vsc_count].hash = h;
+        s_vsc[s_vsc_count].n = n;
+        s_vsc[s_vsc_count].vs = vs;
+        s_vsc_count++;
+    }
+    return cur = vs;
 }
 
 /* ---- render targets and depth buffers ---------------------------------- */
@@ -1044,6 +1278,47 @@ static int gpu_init(void)
     bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_vb)))
         return 0;
+    {
+        /* One input layout serves every generated program: v0..v15 as
+         * float4, made against a shader that reads all sixteen (a program's
+         * own signature is a subset, which a layout may exceed). */
+        D3D11_INPUT_ELEMENT_DESC al[16];
+        Str src = { NULL, 0, 0 };
+        int k;
+        sb(&src, "struct VI {");
+        for (k = 0; k < 16; k++)
+            sb(&src, " float4 v%d : ATTR%d;", k, k);
+        sb(&src, " };\nfloat4 main(VI i) : SV_Position { return 0");
+        for (k = 0; k < 16; k++)
+            sb(&src, " + i.v%d", k);
+        sb(&src, "; }\n");
+        code = compile(src.p, "vs_4_0", "attribute layout");
+        free(src.p);
+        if (!code)
+            return 0;
+        for (k = 0; k < 16; k++) {
+            al[k].SemanticName = "ATTR";
+            al[k].SemanticIndex = (UINT)k;
+            al[k].Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+            al[k].InputSlot = 0;
+            al[k].AlignedByteOffset = (UINT)(16 * k);
+            al[k].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+            al[k].InstanceDataStepRate = 0;
+        }
+        hr = ID3D11Device_CreateInputLayout(s_dev, al, 16, ID3D10Blob_GetBufferPointer(code),
+                                            ID3D10Blob_GetBufferSize(code), &s_attr_layout);
+        ID3D10Blob_Release(code);
+        if (FAILED(hr))
+            return 0;
+    }
+    bd.ByteWidth = GPU_IB_BYTES;
+    bd.BindFlags = D3D11_BIND_INDEX_BUFFER;
+    if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_ib)))
+        return 0;
+    s_const_cb = make_cb(16 * 192);
+    s_prog_cb = make_cb(32);
+    if (!s_const_cb || !s_prog_cb)
+        return 0;
     s_vs_cb = make_cb(16);
     s_ps_cb = make_cb(sizeof(float) * 4 * (8 + 8 + 3 + 4 + 1));
     s_clear_cb = make_cb(32);
@@ -1062,7 +1337,7 @@ static int gpu_init(void)
         return 0;
     s_white2d = make_white(0);
     s_whitecube = make_white(1);
-    gpu_log("ready: rasterisation and combiners on the GPU, vertex programs on the CPU");
+    gpu_log("ready: vertex programs, rasterisation and combiners on the GPU");
     return 1;
 }
 
@@ -1161,7 +1436,9 @@ static int surface_targets(const Nv2aGpuState *st, GpuRt **rp, GpuDs **zp)
     return 1;
 }
 
-void nv2a_gpu_draw(const Nv2aGpuState *st, const Nv2aGpuVertex *v, uint32_t n)
+/* Everything about a draw but its vertices: targets, textures, the
+ * combiner shader and its constants, blend, depth and stencil. */
+static GpuRt *pixel_pipeline(const Nv2aGpuState *st)
 {
     GpuRt *r;
     GpuDs *z;
@@ -1171,15 +1448,12 @@ void nv2a_gpu_draw(const Nv2aGpuState *st, const Nv2aGpuVertex *v, uint32_t n)
     ID3D11SamplerState *smp[4];
     ID3D11BlendState *bs;
     ID3D11DepthStencilState *ds;
-    D3D11_MAPPED_SUBRESOURCE m;
-    float pcb[4 * (8 + 8 + 3 + 4 + 1)], vcb[4], bf[4];
-    uint32_t bytes = n * (uint32_t)sizeof(Nv2aGpuVertex), i, stride, offset;
+    float pcb[4 * (8 + 8 + 3 + 4 + 1)], bf[4];
+    uint32_t i;
     int ca;
 
-    if (s_state != 1 || n < 3 || bytes > GPU_VB_BYTES)
-        return;
     if (!surface_targets(st, &r, &z))
-        return;
+        return NULL;
 
     /* Textures first: fetching one may read back a surface, and that must
      * happen before this draw's own target is marked as the GPU's. */
@@ -1209,9 +1483,8 @@ void nv2a_gpu_draw(const Nv2aGpuState *st, const Nv2aGpuVertex *v, uint32_t n)
     }
     ps = get_ps(&key);
     if (!ps)
-        return;
+        return NULL;
 
-    /* Constants. */
     memset(pcb, 0, sizeof pcb);
     for (i = 0; i < 8; i++) {
         unpack_argb(st->rc.factor0[i], &pcb[4 * i]);
@@ -1234,25 +1507,7 @@ void nv2a_gpu_draw(const Nv2aGpuState *st, const Nv2aGpuVertex *v, uint32_t n)
     pcb[4 * 23 + 1] = (float)st->alpha_func;
     pcb[4 * 23 + 2] = st->alpha_test ? 1.0f : 0.0f;
     cb_write(s_ps_cb, pcb, sizeof pcb);
-    vcb[0] = 2.0f / (float)r->w;
-    vcb[1] = 2.0f / (float)r->h;
-    vcb[2] = st->zeta_z16 ? 1.0f / 65535.0f : 1.0f / 16777215.0f;
-    vcb[3] = 0.0f;
-    cb_write(s_vs_cb, vcb, sizeof vcb);
 
-    /* Vertices: appended to a ring, discarded and restarted when it fills. */
-    if (s_vb_pos + bytes > GPU_VB_BYTES)
-        s_vb_pos = 0;
-    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_vb, 0,
-                                       s_vb_pos ? D3D11_MAP_WRITE_NO_OVERWRITE
-                                                : D3D11_MAP_WRITE_DISCARD, 0, &m)))
-        return;
-    memcpy((uint8_t *)m.pData + s_vb_pos, v, bytes);
-    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_vb, 0);
-    offset = s_vb_pos;
-    s_vb_pos += bytes;
-
-    /* State. */
     bs = get_blend(st->blend_enable, st->blend_src, st->blend_dst, st->blend_eq,
                    write_mask(st->color_mask), &ca);
     unpack_argb(st->blend_color, bf);
@@ -1260,22 +1515,110 @@ void nv2a_gpu_draw(const Nv2aGpuState *st, const Nv2aGpuVertex *v, uint32_t n)
         bf[0] = bf[1] = bf[2] = bf[3];
     ds = get_dss(st, z != NULL);
     if (!bs || !ds)
-        return;
+        return NULL;
 
     set_target(r, z, st->clip);
     ID3D11DeviceContext_OMSetBlendState(s_ctx, bs, bf, 0xFFFFFFFFu);
     ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, ds, st->stencil_ref & 0xFF);
-    stride = sizeof(Nv2aGpuVertex);
+    ID3D11DeviceContext_PSSetShader(s_ctx, ps, NULL, 0);
+    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_ps_cb);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 8, srv);
+    ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 4, smp);
+    return r;
+}
+
+/* Append to a dynamic ring buffer; discard and restart when it fills. */
+static int ring_put(ID3D11Buffer *b, uint32_t *pos, uint32_t cap, const void *data,
+                    uint32_t bytes, uint32_t *offset)
+{
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (bytes > cap)
+        return 0;
+    if (*pos + bytes > cap)
+        *pos = 0;
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)b, 0,
+                                       *pos ? D3D11_MAP_WRITE_NO_OVERWRITE
+                                            : D3D11_MAP_WRITE_DISCARD, 0, &m)))
+        return 0;
+    memcpy((uint8_t *)m.pData + *pos, data, bytes);
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)b, 0);
+    *offset = *pos;
+    *pos += bytes;
+    return 1;
+}
+
+void nv2a_gpu_draw(const Nv2aGpuState *st, const Nv2aGpuVertex *v, uint32_t n)
+{
+    GpuRt *r;
+    float vcb[4];
+    uint32_t offset, stride = sizeof(Nv2aGpuVertex);
+
+    if (s_state != 1 || n < 3)
+        return;
+    r = pixel_pipeline(st);
+    if (!r)
+        return;
+    vcb[0] = 2.0f / (float)r->w;
+    vcb[1] = 2.0f / (float)r->h;
+    vcb[2] = st->zeta_z16 ? 1.0f / 65535.0f : 1.0f / 16777215.0f;
+    vcb[3] = 0.0f;
+    cb_write(s_vs_cb, vcb, sizeof vcb);
+    if (!ring_put(s_vb, &s_vb_pos, GPU_VB_BYTES, v, n * stride, &offset))
+        return;
     ID3D11DeviceContext_IASetInputLayout(s_ctx, s_layout);
     ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, 1, &s_vb, &stride, &offset);
     ID3D11DeviceContext_VSSetShader(s_ctx, s_vs, NULL, 0);
     ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_vs_cb);
-    ID3D11DeviceContext_PSSetShader(s_ctx, ps, NULL, 0);
-    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_ps_cb);
-    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 8, srv);
-    ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 4, smp);
     ID3D11DeviceContext_Draw(s_ctx, n, 0);
+}
+
+int nv2a_gpu_draw_program(const Nv2aGpuState *st, const float (*attr)[16][4],
+                          uint32_t nverts, const uint32_t *idx, uint32_t nidx)
+{
+    ID3D11VertexShader *vs;
+    ID3D11Buffer *cbs[2];
+    GpuRt *r;
+    float pcb[8];
+    uint32_t voff, ioff, stride = 16 * 16;
+
+    if (s_state != 1)
+        return 0;
+    if (nidx < 3)
+        return 1;
+    vs = get_program_vs();
+    if (!vs)
+        return 0;
+    r = pixel_pipeline(st);
+    if (!r)
+        return 1;
+    /* Constant memory, when it has changed since it was last sent. */
+    if (nv2a_vsh_constants_gen() != s_const_gen_up) {
+        cb_write(s_const_cb, nv2a_vsh_constants(), 16 * 192);
+        s_const_gen_up = nv2a_vsh_constants_gen();
+    }
+    pcb[0] = 2.0f / (float)r->w;
+    pcb[1] = 2.0f / (float)r->h;
+    pcb[2] = st->zeta_z16 ? 1.0f / 65535.0f : 1.0f / 16777215.0f;
+    pcb[3] = 0.0f;
+    pcb[4] = st->fog_enable ? 1.0f : 0.0f;
+    pcb[5] = (float)st->fog_mode;
+    pcb[6] = st->fog_param[0];
+    pcb[7] = st->fog_param[1];
+    cb_write(s_prog_cb, pcb, sizeof pcb);
+    if (!ring_put(s_vb, &s_vb_pos, GPU_VB_BYTES, attr, nverts * stride, &voff)
+        || !ring_put(s_ib, &s_ib_pos, GPU_IB_BYTES, idx, nidx * 4, &ioff))
+        return 1;
+    cbs[0] = s_const_cb;
+    cbs[1] = s_prog_cb;
+    ID3D11DeviceContext_IASetInputLayout(s_ctx, s_attr_layout);
+    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, 1, &s_vb, &stride, &voff);
+    ID3D11DeviceContext_IASetIndexBuffer(s_ctx, s_ib, DXGI_FORMAT_R32_UINT, ioff);
+    ID3D11DeviceContext_VSSetShader(s_ctx, vs, NULL, 0);
+    ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 2, cbs);
+    ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);
+    return 1;
 }
 
 void nv2a_gpu_clear(const Nv2aGpuState *st, uint32_t flags, uint32_t color,
@@ -1343,6 +1686,9 @@ void nv2a_gpu_clear(const Nv2aGpuState *st, uint32_t flags, uint32_t color,
 int  nv2a_gpu_enabled(void) { return 0; }
 void nv2a_gpu_draw(const Nv2aGpuState *st, const Nv2aGpuVertex *v, uint32_t n)
 { (void)st; (void)v; (void)n; }
+int nv2a_gpu_draw_program(const Nv2aGpuState *st, const float (*attr)[16][4],
+                          uint32_t nverts, const uint32_t *idx, uint32_t nidx)
+{ (void)st; (void)attr; (void)nverts; (void)idx; (void)nidx; return 0; }
 void nv2a_gpu_clear(const Nv2aGpuState *st, uint32_t flags, uint32_t color,
                     uint32_t zstencil)
 { (void)st; (void)flags; (void)color; (void)zstencil; }

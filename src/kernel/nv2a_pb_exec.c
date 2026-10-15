@@ -2800,6 +2800,10 @@ static void gpu_state(Nv2aGpuState *g)
     g->alpha_func = s_gpu.alpha_func;
     g->alpha_ref = s_gpu.alpha_ref;
     g->fog_color = s_gpu.fog_color;
+    g->fog_enable = s_gpu.fog_enable;
+    g->fog_mode = s_gpu.fog_mode;
+    g->fog_param[0] = s_gpu.fog_param[0];
+    g->fog_param[1] = s_gpu.fog_param[1];
 }
 
 static void gpu_vertex(const Nv2aVshOutput *v, Nv2aGpuVertex *o)
@@ -2867,6 +2871,91 @@ static void gpu_draw_batch(uint32_t n)
     note_drawn();
 }
 
+/* Vertex programs on the GPU too (RECOMP_GPU_VS, on unless 0): each distinct
+ * index's attributes fetched once, only those the program reads, and an
+ * index list in the batch's primitive order. 0 when the program has to stay
+ * on the interpreter -- one that writes constant memory -- or the backend
+ * could not translate it; the caller then transforms on the CPU. */
+static int gpu_draw_batch_program(uint32_t n)
+{
+    static float attr[NV_MAX_INDICES][16][4];
+    static uint32_t local[NV_MAX_INDICES], tri[NV_MAX_INDICES * 3];
+    static struct { uint32_t index, gen, slot; } map[1u << 13];
+    static uint32_t gen;
+    static int on = -1;
+    Nv2aGpuState g;
+    uint32_t i, a, k = 0, nv = 0, mask;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_GPU_VS");
+        on = !(e && *e == '0');
+    }
+    if (!on || nv2a_vsh_program_writes_constants())
+        return 0;
+    mask = nv2a_vsh_input_mask();
+    if (++gen == 0) {
+        memset(map, 0, sizeof map);
+        gen = 1;
+    }
+    for (i = 0; i < n; i++) {
+        uint32_t idx = s_gpu.idx[i], h = (idx * 2654435761u) >> 19;
+        for (;;) {
+            if (map[h].gen != gen) {
+                map[h].gen = gen;
+                map[h].index = idx;
+                map[h].slot = nv;
+                for (a = 0; a < 16; a++)
+                    if (mask & (1u << a))
+                        fetch_attr(&s_gpu.attr[a], idx, attr[nv][a]);
+                nv++;
+                break;
+            }
+            if (map[h].index == idx)
+                break;
+            h = (h + 1) & ((1u << 13) - 1);
+        }
+        local[i] = map[h].slot;
+    }
+#define GPU_IDX(p, q, r) do { tri[k++] = local[p]; tri[k++] = local[q]; \
+        tri[k++] = local[r]; } while (0)
+    switch (s_gpu.prim) {
+    case NV_PRIM_TRIANGLES:
+        for (i = 0; i + 2 < n; i += 3) GPU_IDX(i, i + 1, i + 2);
+        break;
+    case NV_PRIM_TRIANGLE_STRIP:
+        for (i = 0; i + 2 < n; i++) GPU_IDX(i, i + 1, i + 2);
+        break;
+    case NV_PRIM_TRIANGLE_FAN:
+    case NV_PRIM_POLYGON:
+        for (i = 1; i + 1 < n; i++) GPU_IDX(0, i, i + 1);
+        break;
+    case NV_PRIM_QUADS:
+        for (i = 0; i + 3 < n; i += 4) {
+            GPU_IDX(i, i + 1, i + 2);
+            GPU_IDX(i, i + 2, i + 3);
+        }
+        break;
+    case NV_PRIM_QUAD_STRIP:
+        for (i = 0; i + 3 < n; i += 2) {
+            GPU_IDX(i, i + 1, i + 3);
+            GPU_IDX(i, i + 3, i + 2);
+        }
+        break;
+    default:
+        break;
+    }
+#undef GPU_IDX
+    if (surface_hits_image(dma_resolve(s_gpu.color_offset),
+                           (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch))
+        return 1;
+    gpu_state(&g);
+    if (!nv2a_gpu_draw_program(&g, (const float (*)[16][4])attr, nv, tri, k))
+        return 0;
+    s_gpu.tris_drawn += k / 3;
+    note_drawn();
+    return 1;
+}
+
 static void prof_report(void)
 {
     static DWORD last;
@@ -2929,6 +3018,15 @@ static void raster_batch_program(void)
         }
         s_prof.verts += n;
         s_prof.uniq += u;
+    }
+    if (nv2a_gpu_enabled() && gpu_draw_batch_program(n)) {
+        s_gpu.batches_program++;
+        s_gpu.verts_program += n;
+        if (s_prof.on) {
+            s_prof.asm_ += prof_lap();
+            prof_report();
+        }
+        return;
     }
     if (!transform_indices(n))
         return;                                        /* no program loaded */

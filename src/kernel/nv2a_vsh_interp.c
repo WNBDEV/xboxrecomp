@@ -39,6 +39,9 @@ static float    s_const[NV2A_VSH_CONSTANTS][4];
 static uint32_t s_load_slot, s_load_word, s_start_slot;
 static uint32_t s_const_load, s_const_word;
 static uint32_t s_cxt_write;
+/* Bumped whenever program memory or constant memory changes, so a consumer
+ * that translated or uploaded them knows when to do it again. */
+static uint32_t s_prog_gen = 1, s_const_gen = 1;
 
 static uint32_t field(const uint32_t *ins, int dw, int lo, int width)
 {
@@ -57,13 +60,14 @@ void nv2a_vsh_program_word(uint32_t word)
 {
     if (s_load_slot < NV2A_VSH_SLOTS)
         s_program[s_load_slot][s_load_word] = word;
+    s_prog_gen++;
     if (++s_load_word == 4) {
         s_load_word = 0;
         s_load_slot++;
     }
 }
 
-void nv2a_vsh_set_start_slot(uint32_t slot) { s_start_slot = slot; }
+void nv2a_vsh_set_start_slot(uint32_t slot) { s_start_slot = slot; s_prog_gen++; }
 void nv2a_vsh_set_cxt_write(uint32_t enable) { s_cxt_write = enable; }
 
 void nv2a_vsh_set_constant_load(uint32_t index)
@@ -76,6 +80,7 @@ void nv2a_vsh_constant_word(uint32_t word)
 {
     if (s_const_load < NV2A_VSH_CONSTANTS)
         memcpy(&s_const[s_const_load][s_const_word], &word, 4);
+    s_const_gen++;
     if (++s_const_word == 4) {
         s_const_word = 0;
         s_const_load++;
@@ -86,12 +91,14 @@ void nv2a_vsh_set_constant(uint32_t index, const float v[4])
 {
     if (index < NV2A_VSH_CONSTANTS)
         memcpy(s_const[index], v, sizeof s_const[index]);
+    s_const_gen++;
 }
 
 void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4])
 {
     if (slot < NV2A_VSH_SLOTS)
         memcpy(s_program[slot], words, sizeof s_program[slot]);
+    s_prog_gen++;
 }
 
 /* ---- disassembly (RECOMP_VSH_DUMP) --------------------------------------- */
@@ -168,6 +175,7 @@ void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word)
 {
     if (index < NV2A_VSH_CONSTANTS && comp < 4)
         memcpy(&s_const[index][comp], &word, 4);
+    s_const_gen++;
 }
 
 /* ---- execution ----------------------------------------------------------- */
@@ -377,8 +385,10 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
         if (omask) {
             const vec4 *src = field(ins, 3, 2, 1) ? &ires : &mres;
             if (!field(ins, 3, 11, 1)) {                  /* to c[] */
-                if (s_cxt_write && oaddr < NV2A_VSH_CONSTANTS)
+                if (s_cxt_write && oaddr < NV2A_VSH_CONSTANTS) {
                     write_masked(s_const[oaddr], src, omask);
+                    s_const_gen++;
+                }
             } else if (oaddr == 0) {
                 write_masked(opos.v, src, omask);
             } else if (oaddr < 13) {
@@ -398,4 +408,49 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
         }
     }
     return 0;
+}
+
+/* ---- for translators (nv2a_gpu_d3d11.c) ---------------------------------- */
+
+uint32_t nv2a_vsh_program_gen(void) { return s_prog_gen; }
+uint32_t nv2a_vsh_constants_gen(void) { return s_const_gen; }
+const float (*nv2a_vsh_constants(void))[4] { return (const float (*)[4])s_const; }
+
+uint32_t nv2a_vsh_program_copy(uint32_t out[][4], uint32_t max)
+{
+    uint32_t s, n = 0;
+    for (s = s_start_slot; s < NV2A_VSH_SLOTS && n < max; s++) {
+        memcpy(out[n++], s_program[s], sizeof s_program[s]);
+        if (field(s_program[s], 3, 0, 1))
+            break;
+    }
+    return n;
+}
+
+int nv2a_vsh_program_writes_constants(void)
+{
+    uint32_t s;
+    if (!s_cxt_write)
+        return 0;
+    for (s = s_start_slot; s < NV2A_VSH_SLOTS; s++) {
+        if (field(s_program[s], 3, 12, 4) && !field(s_program[s], 3, 11, 1))
+            return 1;
+        if (field(s_program[s], 3, 0, 1))
+            break;
+    }
+    return 0;
+}
+
+uint32_t nv2a_vsh_input_mask(void)
+{
+    uint32_t s, m = 0;
+    for (s = s_start_slot; s < NV2A_VSH_SLOTS; s++) {
+        const uint32_t *ins = s_program[s];
+        if (field(ins, 2, 26, 2) == 2 || field(ins, 2, 11, 2) == 2
+            || field(ins, 3, 28, 2) == 2)
+            m |= 1u << field(ins, 1, 9, 4);
+        if (field(ins, 3, 0, 1))
+            break;
+    }
+    return m;
 }

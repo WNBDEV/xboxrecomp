@@ -2,12 +2,14 @@
  * NV2A on the host GPU (RECOMP_GPU=1): rasterisation and pixel shading on
  * Direct3D 11, everything else as before.
  *
- * The executor (nv2a_pb_exec.c) still parses the pushbuffer, keeps the GPU
- * state and runs the title's vertex programs on the CPU. What it hands over
- * here is a triangle list of transformed vertices and the state to draw them
- * with: render target and depth buffer, the four texture stages, the register
- * combiner program, blend, depth, stencil and alpha test. The software
- * rasteriser was ~85% of the executor's time; this is that part.
+ * The executor (nv2a_pb_exec.c) still parses the pushbuffer and keeps the
+ * GPU state. What it hands over is a batch -- the untransformed vertex
+ * attributes and an index list, run through the title's vertex program
+ * translated to HLSL (nv2a_gpu_draw_program), or, when a program has to stay
+ * on the CPU interpreter, a triangle list it transformed itself
+ * (nv2a_gpu_draw) -- and the state to draw it with: render target and depth
+ * buffer, the four texture stages, the register combiner program, blend,
+ * depth, stencil and alpha test.
  *
  * Guest memory stays the truth everything else reads. A surface the GPU has
  * drawn into is copied back (nv2a_gpu_sync) before anything reads those
@@ -65,12 +67,19 @@ typedef struct {
              stencil_wmask, stencil_op_fail, stencil_op_zfail, stencil_op_zpass;
     uint32_t alpha_test, alpha_func, alpha_ref;
     uint32_t fog_color;                 /* R in bits 0-7, as NV097 has it */
+    uint32_t fog_enable, fog_mode;      /* for the per-vertex fog factor */
+    float fog_param[2];
 } Nv2aGpuState;
 
 /* RECOMP_GPU=1 and a device could be made. */
 int  nv2a_gpu_enabled(void);
-/* A triangle list. */
+/* A triangle list of vertices the CPU transformed. */
 void nv2a_gpu_draw(const Nv2aGpuState *st, const Nv2aGpuVertex *v, uint32_t n);
+/* An indexed triangle list of untransformed vertices: v0..v15 per vertex, run
+ * through the current vertex program (nv2a_vsh_interp's) on the GPU. Returns
+ * 0 if that program cannot run there, and the caller transforms on the CPU. */
+int  nv2a_gpu_draw_program(const Nv2aGpuState *st, const float (*attr)[16][4],
+                           uint32_t nverts, const uint32_t *idx, uint32_t nidx);
 /* NV097 CLEAR_SURFACE: flags bit 0 Z, bit 1 stencil, 0xF0 colour (R G B A). */
 void nv2a_gpu_clear(const Nv2aGpuState *st, uint32_t flags, uint32_t color,
                     uint32_t zstencil);
