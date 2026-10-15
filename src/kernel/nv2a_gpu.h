@@ -63,6 +63,7 @@ typedef struct {
     uint32_t blend_enable, blend_src, blend_dst, blend_eq, blend_color;
     uint32_t color_mask;                /* A<<24 R<<16 G<<8 B, a byte each */
     uint32_t depth_test, depth_func, depth_mask;
+    int cull;                           /* 0 none, 1 CW, 2 CCW (on screen), 3 all */
     uint32_t stencil_test, stencil_func, stencil_ref, stencil_fmask,
              stencil_wmask, stencil_op_fail, stencil_op_zfail, stencil_op_zpass;
     uint32_t alpha_test, alpha_func, alpha_ref;

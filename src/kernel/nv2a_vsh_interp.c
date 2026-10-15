@@ -313,6 +313,68 @@ static vec4 run_ilu(uint32_t op, vec4 c)
     return r;
 }
 
+/* RECOMP_VSH_NAN=1: where a program first turns finite numbers into NaN or
+ * infinity, and how many vertices leave it with a non-finite position or
+ * colour. Both renderers saturate a NaN colour to black, so this is the
+ * first thing to rule out for black triangles; it runs only where the
+ * interpreter does (RECOMP_GPU_VS=0, or the software renderer). */
+static int nan_probe = -1;
+
+static int finite4(const vec4 *v, uint32_t mask)
+{
+    int i;
+    for (i = 0; i < 4; i++)
+        if ((mask & (8u >> i)) && !isfinite(v->v[i]))
+            return 0;
+    return 1;
+}
+
+static void nan_check(uint32_t slot, uint32_t mac, uint32_t ilu, uint32_t mmask,
+                      uint32_t imask, const vec4 *a, const vec4 *b,
+                      const vec4 *c, const vec4 *m, const vec4 *l)
+{
+    static int shown;
+    int bad_m = mac && mac != 13 && mmask && !finite4(m, mmask);
+    int bad_l = ilu && imask && !finite4(l, imask);
+
+    if ((!bad_m && !bad_l) || shown >= 40)
+        return;
+    /* Only where it starts: an instruction fed a non-finite value is just
+     * passing it on. */
+    if (!finite4(a, 0xF) || !finite4(b, 0xF) || !finite4(c, 0xF))
+        return;
+    shown++;
+    fprintf(stderr, "[VSH-NAN] slot %u (start %u) mac %u ilu %u: a %g %g %g %g"
+            "  b %g %g %g %g  c %g %g %g %g -> %s %g %g %g %g\n",
+            slot, s_start_slot, mac, ilu, a->v[0], a->v[1], a->v[2], a->v[3],
+            b->v[0], b->v[1], b->v[2], b->v[3], c->v[0], c->v[1], c->v[2],
+            c->v[3], bad_m ? "mac" : "ilu",
+            (bad_m ? m : l)->v[0], (bad_m ? m : l)->v[1],
+            (bad_m ? m : l)->v[2], (bad_m ? m : l)->v[3]);
+}
+
+static void nan_count(const float in[NV2A_VSH_INPUTS][4], const vec4 *opos,
+                      float outregs[13][4])
+{
+    static unsigned long verts, bad_in, bad_pos, bad_col;
+    int i, j, in_bad = 0, col_bad = 0;
+
+    for (i = 0; i < NV2A_VSH_INPUTS; i++)
+        for (j = 0; j < 4; j++)
+            if (!isfinite(in[i][j]))
+                in_bad = 1;
+    for (j = 0; j < 4; j++)
+        if (!isfinite(outregs[3][j]) || !isfinite(outregs[4][j]))
+            col_bad = 1;
+    verts++;
+    bad_in += in_bad;
+    bad_pos += !finite4(opos, 0xF);
+    bad_col += col_bad;
+    if ((verts & 0xFFFFF) == 0 || ((bad_pos || bad_col) && (bad_pos + bad_col) % 5000 == 1))
+        fprintf(stderr, "[VSH-NAN] %lu vertices: %lu non-finite inputs, %lu"
+                " positions, %lu colours\n", verts, bad_in, bad_pos, bad_col);
+}
+
 int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
 {
     static int dump = -1;
@@ -325,6 +387,8 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
 
     if (dump < 0)
         dump = getenv("RECOMP_VSH_DUMP") != NULL;
+    if (nan_probe < 0)
+        nan_probe = getenv("RECOMP_VSH_NAN") != NULL;
     if (dump && ndumped < 16) {
         /* By content: titles reload different programs into the same slot. */
         uint32_t h = 2166136261u, t;
@@ -367,6 +431,10 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
             mres = run_mac(mac, a, b, c, &a0);
         if (ilu)
             ires = run_ilu(ilu, c);
+        if (nan_probe)
+            nan_check(s, mac, ilu, mac_mask | (omask && !field(ins, 3, 2, 1) ? omask : 0),
+                      ilu_mask | (omask && field(ins, 3, 2, 1) ? omask : 0),
+                      &a, &b, &c, &mres, &ires);
 
         if (mac && mac != 13 && mac_mask) {
             float *d = tdst == 12 ? opos.v : (tdst < 12 ? temp[tdst].v : NULL);
@@ -396,6 +464,8 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
             }
         }
         if (field(ins, 3, 0, 1)) {
+            if (nan_probe)
+                nan_count(in, &opos, outregs);
             memcpy(out->pos, opos.v, sizeof out->pos);
             memcpy(out->d0, outregs[3], sizeof out->d0);
             memcpy(out->d1, outregs[4], sizeof out->d1);

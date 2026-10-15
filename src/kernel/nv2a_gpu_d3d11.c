@@ -41,7 +41,7 @@ static ID3D11Buffer *s_vb, *s_vs_cb, *s_ps_cb, *s_clear_cb;
 static ID3D11Buffer *s_ib, *s_const_cb, *s_prog_cb;
 static ID3D11InputLayout *s_attr_layout;
 static uint32_t s_ib_pos, s_const_gen_up;
-static ID3D11RasterizerState *s_rs;
+static ID3D11RasterizerState *s_rs, *s_rs_cull[2];   /* none; CW, CCW culled */
 static ID3D11ShaderResourceView *s_white2d, *s_whitecube;
 static uint32_t s_vb_pos;
 static uint32_t s_frame = 1;
@@ -1325,15 +1325,23 @@ static int gpu_init(void)
     if (!s_vs_cb || !s_ps_cb || !s_clear_cb)
         return 0;
 
-    /* No culling (the software rasteriser draws both faces), scissor for the
-     * clip rectangle, and depth clamped rather than clipped: it clipped only
-     * at the near plane, at w just above 0. */
+    /* Scissor for the clip rectangle, and depth clamped rather than clipped:
+     * it clipped only at the near plane, at w just above 0. s_rs culls
+     * nothing (clears use it); the other two cull clockwise and
+     * counter-clockwise triangles, as they appear on the target. */
     memset(&rd, 0, sizeof rd);
     rd.FillMode = D3D11_FILL_SOLID;
     rd.CullMode = D3D11_CULL_NONE;
     rd.DepthClipEnable = FALSE;
     rd.ScissorEnable = TRUE;
     if (FAILED(ID3D11Device_CreateRasterizerState(s_dev, &rd, &s_rs)))
+        return 0;
+    rd.CullMode = D3D11_CULL_BACK;
+    rd.FrontCounterClockwise = TRUE;
+    if (FAILED(ID3D11Device_CreateRasterizerState(s_dev, &rd, &s_rs_cull[0])))
+        return 0;
+    rd.FrontCounterClockwise = FALSE;
+    if (FAILED(ID3D11Device_CreateRasterizerState(s_dev, &rd, &s_rs_cull[1])))
         return 0;
     s_white2d = make_white(0);
     s_whitecube = make_white(1);
@@ -1518,6 +1526,8 @@ static GpuRt *pixel_pipeline(const Nv2aGpuState *st)
         return NULL;
 
     set_target(r, z, st->clip);
+    if (st->cull == 1 || st->cull == 2)
+        ID3D11DeviceContext_RSSetState(s_ctx, s_rs_cull[st->cull - 1]);
     ID3D11DeviceContext_OMSetBlendState(s_ctx, bs, bf, 0xFFFFFFFFu);
     ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, ds, st->stencil_ref & 0xFF);
     ID3D11DeviceContext_PSSetShader(s_ctx, ps, NULL, 0);
@@ -1553,7 +1563,7 @@ void nv2a_gpu_draw(const Nv2aGpuState *st, const Nv2aGpuVertex *v, uint32_t n)
     float vcb[4];
     uint32_t offset, stride = sizeof(Nv2aGpuVertex);
 
-    if (s_state != 1 || n < 3)
+    if (s_state != 1 || n < 3 || st->cull == 3)
         return;
     r = pixel_pipeline(st);
     if (!r)
@@ -1584,7 +1594,7 @@ int nv2a_gpu_draw_program(const Nv2aGpuState *st, const float (*attr)[16][4],
 
     if (s_state != 1)
         return 0;
-    if (nidx < 3)
+    if (nidx < 3 || st->cull == 3)
         return 1;
     vs = get_program_vs();
     if (!vs)

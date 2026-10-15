@@ -382,7 +382,7 @@ static struct {
     /* Vertex programs (nv2a_vsh_interp.c) and the depth buffer, which
      * together are what a 3D scene needs and a 2D one never used. */
     uint32_t xf_mode;                   /* TRANSFORM_EXECUTION_MODE: 2 = program */
-    uint32_t batches_program, verts_program, tris_behind;
+    uint32_t batches_program, verts_program, tris_behind, tris_culled;
     /* Where program-path triangles go, so "nothing drew" has a reason. */
     uint32_t xf_degenerate, xf_offscreen, xf_drawn;
     uint64_t xf_depth_fail, xf_pixels;
@@ -395,6 +395,9 @@ static struct {
      * stencil fail, depth fail and depth pass. */
     uint32_t stencil_test, stencil_wmask, stencil_func, stencil_ref,
              stencil_fmask, stencil_op_fail, stencil_op_zfail, stencil_op_zpass;
+    /* SET_CULL_FACE_ENABLE, SET_CULL_FACE (0x404 front, 0x405 back, 0x408
+     * both) and SET_FRONT_FACE (0x900 CW, 0x901 CCW, as seen on screen). */
+    uint32_t cull_enable, cull_face, front_face;
     /* SET_CONTEXT_DMA_SEMAPHORE handle and SET_SEMAPHORE_OFFSET, for
      * BACK_END_WRITE_SEMAPHORE_RELEASE -- D3D's GPU clock. */
     uint32_t semaphore_dma, semaphore_offset, semaphore_releases;
@@ -2427,6 +2430,35 @@ static void xf_flush(void)
     s_gpu.zpass_count += cnt.zpass;
 }
 
+/* Which triangles SET_CULL_FACE* removes, by their winding as seen on screen:
+ * 0 none, 1 clockwise, 2 counter-clockwise, 3 all. Never culling drew the
+ * back faces of every model, and where a mesh folds tightly -- an eyelid, a
+ * mouth -- those came through the skin in front of them as dark triangles:
+ * lit from behind, at almost the same depth.
+ *
+ * RECOMP_CULL=0 turns it off, =2 culls the opposite winding (to check the
+ * convention: the wrong one strips the front faces off everything). */
+static int cull_winding(void)
+{
+    static int mode = -1;
+    int front_cw;
+
+    if (mode < 0) {
+        const char *e = getenv("RECOMP_CULL");
+        mode = e ? atoi(e) : 1;
+    }
+    if (!mode || !s_gpu.cull_enable)
+        return 0;
+    front_cw = s_gpu.front_face == 0x900;          /* GL_CW; GL_CCW otherwise */
+    if (mode == 2)
+        front_cw = !front_cw;
+    switch (s_gpu.cull_face) {
+    case 0x404: return front_cw ? 1 : 2;           /* GL_FRONT */
+    case 0x408: return 3;                          /* GL_FRONT_AND_BACK */
+    default:    return front_cw ? 2 : 1;           /* GL_BACK */
+    }
+}
+
 static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
                                const Nv2aVshOutput *vc)
 {
@@ -2460,6 +2492,13 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     if (area == 0.0f || area != area) {
         s_gpu.xf_degenerate++;
         return;
+    }
+    {   /* y grows downwards, so a positive area is clockwise on screen. */
+        int cull = cull_winding();
+        if (cull == 3 || (cull == 1 && area > 0.0f) || (cull == 2 && area < 0.0f)) {
+            s_gpu.tris_culled++;
+            return;
+        }
     }
     for (k = 0; k < 3; k++) {
         if (!s_gpu.xf_seeded)
@@ -2788,6 +2827,7 @@ static void gpu_state(Nv2aGpuState *g)
     g->depth_test = s_gpu.depth_test;
     g->depth_func = s_gpu.depth_func;
     g->depth_mask = s_gpu.depth_mask;
+    g->cull = cull_winding();
     g->stencil_test = s_gpu.stencil_test;
     g->stencil_func = s_gpu.stencil_func;
     g->stencil_ref = s_gpu.stencil_ref;
@@ -2838,7 +2878,11 @@ static void gpu_draw_batch(uint32_t n)
         for (i = 0; i + 2 < n; i += 3) GPU_TRI(i, i + 1, i + 2);
         break;
     case NV_PRIM_TRIANGLE_STRIP:
-        for (i = 0; i + 2 < n; i++) GPU_TRI(i, i + 1, i + 2);
+        /* Every other triangle of a strip runs the other way round; it is
+         * reordered so all of them share the strip's winding, which culling
+         * depends on. */
+        for (i = 0; i + 2 < n; i++)
+            if (i & 1) GPU_TRI(i + 1, i, i + 2); else GPU_TRI(i, i + 1, i + 2);
         break;
     case NV_PRIM_TRIANGLE_FAN:
     case NV_PRIM_POLYGON:
@@ -2923,7 +2967,8 @@ static int gpu_draw_batch_program(uint32_t n)
         for (i = 0; i + 2 < n; i += 3) GPU_IDX(i, i + 1, i + 2);
         break;
     case NV_PRIM_TRIANGLE_STRIP:
-        for (i = 0; i + 2 < n; i++) GPU_IDX(i, i + 1, i + 2);
+        for (i = 0; i + 2 < n; i++)       /* odd ones reordered, as above */
+            if (i & 1) GPU_IDX(i + 1, i, i + 2); else GPU_IDX(i, i + 1, i + 2);
         break;
     case NV_PRIM_TRIANGLE_FAN:
     case NV_PRIM_POLYGON:
@@ -3108,8 +3153,11 @@ static void raster_batch_program(void)
             raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
         break;
     case NV_PRIM_TRIANGLE_STRIP:
-        for (i = 0; i + 2 < n; i++)
-            raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
+        for (i = 0; i + 2 < n; i++)       /* odd ones reordered: same winding */
+            if (i & 1)
+                raster_xf_clipped(&s_xf[i+1], &s_xf[i], &s_xf[i+2]);
+            else
+                raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
         break;
     case NV_PRIM_TRIANGLE_FAN:
     case NV_PRIM_POLYGON:
@@ -4204,6 +4252,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x0370: s_gpu.stencil_op_fail = param; break;  /* STENCIL_OP_FAIL */
     case 0x0374: s_gpu.stencil_op_zfail = param; break; /* STENCIL_OP_ZFAIL */
     case 0x0378: s_gpu.stencil_op_zpass = param; break; /* STENCIL_OP_ZPASS */
+    case 0x0308: s_gpu.cull_enable = param; break;      /* CULL_FACE_ENABLE */
+    case 0x039C: s_gpu.cull_face = param; break;        /* CULL_FACE */
+    case 0x03A0: s_gpu.front_face = param; break;       /* FRONT_FACE */
     case 0x0354: s_gpu.depth_func = param; break; /* DEPTH_FUNC */
     case 0x035C: s_gpu.depth_mask = param; break; /* DEPTH_MASK */
     case 0x0214: s_gpu.zeta_offset = param; break;/* SURFACE_ZETA_OFFSET */
@@ -4487,8 +4538,9 @@ void nv2a_pb_exec_report(void)
             s_gpu.tris_drawn, s_gpu.batches_untransformed,
             s_gpu.tris_skipped_offscreen);
     fprintf(stderr, "[GPU] vertex programs: %u batches, %u vertices;"
-                    " %u triangles dropped behind the eye\n",
-            s_gpu.batches_program, s_gpu.verts_program, s_gpu.tris_behind);
+                    " %u triangles dropped behind the eye, %u culled\n",
+            s_gpu.batches_program, s_gpu.verts_program, s_gpu.tris_behind,
+            s_gpu.tris_culled);
     fprintf(stderr, "[GPU]   of the rest: %u degenerate/NaN, %u off-surface,"
                     " %u drawn; pixels %llu written, %llu depth-failed;"
                     " x %.0f..%.0f y %.0f..%.0f z %g..%g\n",
