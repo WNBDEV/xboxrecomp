@@ -29,6 +29,9 @@
 #ifndef XBOX_CONTIG_BASE
 #define XBOX_CONTIG_BASE 0x80000000u   /* physical P is at this + P */
 #endif
+#ifndef XBOX_CONTIG_SIZE
+#define XBOX_CONTIG_SIZE (64u * 1024u * 1024u)
+#endif
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -170,7 +173,10 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
     uint32_t words = 0;
 
     while (va < end_va && words < 0x100000u) {
-        uint32_t w = *(const uint32_t *)(mem + va);
+        uint32_t w;
+        if (va - XBOX_CONTIG_BASE >= XBOX_CONTIG_SIZE - 4u)
+            break;                            /* a wild CALL or JUMP target */
+        w = *(const uint32_t *)(mem + va);
         va += 4;
         words++;
 
@@ -242,4 +248,107 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
     s_tot_unknown += unknown;
     s_tot_jumps += jumps;
     s_tot_segments++;
+}
+
+/* Consume the ring from GET to PUT the way the GPU's puller does: in order,
+ * taking the main ring's JUMPs (D3D ends each lap with one back to the start)
+ * rather than stopping at them. Returns the new GET.
+ *
+ * This replaced scanning [last PUT, PUT) and treating PUT going down as a wrap
+ * whose seam was guessed from the highest PUT seen. The guess is only right
+ * while every PUT is observed, which the PFB flush handshake used to guarantee
+ * by holding D3D's KickOff until the poll loop came round; acknowledged
+ * promptly, a lap's last submission need never be seen as a PUT, and the
+ * commands between it and the JUMP would be skipped. Following the JUMP needs
+ * no guess.
+ *
+ * Addresses in and out are physical, like the registers. */
+uint32_t nv2a_pb_run(uint32_t get, uint32_t put, volatile uint32_t *get_reg)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    uint32_t va = XBOX_CONTIG_BASE | (get & 0x0FFFFFFFu);
+    uint32_t put_va = XBOX_CONTIG_BASE | (put & 0x0FFFFFFFu);
+    uint32_t words = 0, jumps = 0, unknown = 0, laps = 0;
+
+    if (s_exec_enabled < 0)
+        s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
+    static int scan = -1;
+    if (scan < 0)
+        scan = getenv("RECOMP_PB_SCAN") != NULL;
+    if (!(scan || s_exec_enabled))
+        return put;
+
+    while (va != put_va) {
+        uint32_t w;
+        /* GET moves as the stream is consumed, as the GPU's does. D3D's
+         * MakeSpace reads it to decide how much of the ring it may reuse, and
+         * a pass can take a frame of rasterising; published only at the end,
+         * it held the title back for all of that. Everything before va has
+         * been executed, so this is exact. */
+        if (get_reg)
+            *get_reg = va & 0x0FFFFFFFu;
+        /* A stream that never reaches PUT has lost step; give up on it
+         * rather than spin here, where nothing else in the poll loop runs. */
+        if (words >= 0x400000u || laps > 2 ||
+            va - XBOX_CONTIG_BASE >= XBOX_CONTIG_SIZE - 4u) {
+            static unsigned n;
+            if (n++ < 4)
+                fprintf(stderr, "  [PB] lost the stream between GET 0x%08X "
+                        "and PUT 0x%08X at 0x%08X; resynchronising at PUT\n",
+                        get, put, va);
+            break;
+        }
+        w = *(const uint32_t *)(mem + va);
+        if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {
+            uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu)
+                                             : (w & 0x1FFFFFFCu);
+            uint32_t to = XBOX_CONTIG_BASE | (target & 0x0FFFFFFFu);
+            jumps++;
+            words++;
+            if (to <= va)
+                laps++;
+            va = to;
+            continue;
+        }
+        if ((w & 0xFFFF0003u) == 0x00020000u) {  /* RETURN outside a call */
+            va += 4;
+            words++;
+            continue;
+        }
+        if ((w & 3u) == 2u) {                    /* CALL */
+            uint32_t sub = XBOX_CONTIG_BASE | ((w & 0xFFFFFFFCu) & 0x0FFFFFFFu);
+            s_tot_calls++;
+            words += 1 + pb_walk(sub, sub + 0x400000u, 1, &jumps, &unknown);
+            va += 4;
+            continue;
+        }
+        if ((w & 0x00030003u) == 0u) {
+            uint32_t count  = (w >> 18) & 0x7FFu;
+            uint32_t subch  = (w >> 13) & 7u;
+            uint32_t method =  w & 0x1FFCu;
+            int noninc = (w & 0xE0000000u) == 0x40000000u;
+
+            va += 4;
+            words++;
+            for (uint32_t i = 0; i < count && va != put_va; i++) {
+                uint32_t m = noninc ? method : method + i * 4;
+                note(subch, m);
+                if (s_exec_enabled)
+                    nv2a_pb_exec_method(subch, m,
+                                        *(const uint32_t *)(mem + va));
+                va += 4;
+                words++;
+            }
+            continue;
+        }
+        unknown++;
+        va += 4;
+        words++;
+    }
+
+    s_tot_words += words;
+    s_tot_unknown += unknown;
+    s_tot_jumps += jumps;
+    s_tot_segments++;
+    return put;
 }

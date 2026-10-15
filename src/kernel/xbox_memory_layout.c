@@ -873,6 +873,47 @@ static void framebuffer_probe_tick(void)
     fflush(stderr);
 }
 
+/* The two busy bits a title spins on, cleared on a thread of their own
+ * (RECOMP_BUSY_ACK=1, off by default).
+ *
+ * Otherwise both are cleared only by the loop below, between pushbuffer passes,
+ * and with RECOMP_PB_EXEC a pass rasterises, which can take a whole frame. So
+ * D3D's KickOff (set the PFB flush bit, spin until it reads clear) waits on the
+ * software rasteriser each time, as does its vblank handler's acknowledgement
+ * loop (write PCRTC_INTR, spin until PMC's PCRTC bit drops) on the timer
+ * thread. Neither waits for rendering on hardware: the flush drains the CPU's
+ * write buffers, the acknowledgement clears a latch.
+ *
+ * Off by default because it did not pay. In Alter Echo's first level the
+ * rasteriser is the bottleneck either way, and a thread spinning on two
+ * registers takes a core from it: 3.5 fps with this, 4.6 without. A title
+ * whose CPU side is the slower one may see the opposite.
+ *
+ * Only these two: everything else in NV2A_ACK stays with the pass loop, whose
+ * ordering the software-method stall depends on (kernel_bridge.c). */
+static DWORD WINAPI nv2a_busy_ack_thread(LPVOID param)
+{
+    volatile uint32_t *regs = (volatile uint32_t *)param;
+    while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        uint32_t pcrtc = regs[0x600100 / 4];
+        if (regs[0x100410 / 4] & 0x00010000u)          /* PFB flush kick */
+            regs[0x100410 / 4] &= ~0x00010000u;
+        /* Atomically, both: the timer thread raises the next vblank into
+         * these same two registers, and a plain store here could wipe it. */
+        if (pcrtc && !(pcrtc & XBOX_NV2A_VBLANK_UNACKED)
+                && InterlockedCompareExchange((volatile LONG *)&regs[0x600100 / 4],
+                                              0, (LONG)pcrtc) == (LONG)pcrtc) {
+            volatile LONG *pmc = (volatile LONG *)&regs[0x000100 / 4];
+            LONG v;
+            do
+                v = *pmc;
+            while (InterlockedCompareExchange(pmc, v & ~(LONG)(1u << 24), v) != v);
+        }
+        Sleep(0);
+    }
+    return 0;
+}
+
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
@@ -967,37 +1008,26 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                      * OR-ing its base is the documented round trip, not a
                      * guess. */
                     /* The pushbuffer is a ring, so PUT coming back below
-                     * where it was is a wrap, not a rewind. Scanning only
-                     * forward segments dropped everything written across
-                     * the seam -- one whole submission each time round.
-                     *
-                     * The ring's bounds are not published anywhere this
-                     * code can read, so they are learned: the lowest and
-                     * highest PUT seen bracket it. That is approximate on
-                     * the first lap and exact afterwards, and scanning a
-                     * little short of the true end costs the same commands
-                     * that were being lost anyway. */
-                    static uint32_t put_lo, put_hi;
-                    if (!put_lo || put < put_lo) put_lo = put;
-                    if (put > put_hi) put_hi = put;
-                    if (last_put && put > last_put) {
-                        nv2a_pb_scan(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
-                                     XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
-                    } else if (last_put && put < last_put) {
-                        if (put_hi > last_put)
-                            nv2a_pb_scan(
-                                XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
-                                XBOX_CONTIG_BASE | (put_hi   & 0x0FFFFFFFu));
-                        if (put > put_lo)
-                            nv2a_pb_scan(
-                                XBOX_CONTIG_BASE | (put_lo & 0x0FFFFFFFu),
-                                XBOX_CONTIG_BASE | (put    & 0x0FFFFFFFu));
-                        if (getenv("RECOMP_PB_WRAP_TRACE")) {
-                            static unsigned wraps;
-                            if (wraps++ < 8)
-                                fprintf(stderr, "  [NV2A] pushbuffer wrapped "
-                                        "(0x%08X -> 0x%08X)\n", last_put, put);
-                        }
+                     * where it was is a wrap, not a rewind: it is executed
+                     * in ring order from where the last pass stopped,
+                     * following the JUMP that ends each lap
+                     * (nv2a_pb_run). The first PUT seen is taken as the
+                     * starting GET, as before: what preceded it is the
+                     * title's initialisation, written before anything was
+                     * watching. */
+                    extern uint32_t nv2a_pb_run(uint32_t get, uint32_t put,
+                                                volatile uint32_t *get_reg);
+                    static uint32_t gpu_get;
+                    static int have_get;
+                    if (!have_get) {
+                        /* Zero is the register before D3D has set up its
+                         * ring, not a position in it: starting there walked
+                         * physical 0..0x3000, the fake TIB, as commands. */
+                        gpu_get = put;
+                        have_get = put != 0;
+                    } else if (put != gpu_get) {
+                        gpu_get = nv2a_pb_run(gpu_get, put,
+                            (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET));
                     }
                     /* Periodic, because what the title submits at init is not
                      * what it submits once it is drawing a menu, and the
@@ -1083,6 +1113,12 @@ static void xbox_Nv2aAckStart(void)
     g_nv2a_ack_stop = 0;
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);
+    if (getenv("RECOMP_BUSY_ACK") && *getenv("RECOMP_BUSY_ACK") == '1') {
+        HANDLE busy = CreateThread(NULL, 0, nv2a_busy_ack_thread,
+                                   g_nv2a_memory, 0, NULL);
+        if (busy)
+            CloseHandle(busy);
+    }
     if (g_nv2a_ack_thread) {
         fprintf(stderr, "  NV2A busy-bit ack: %zu register(s) acknowledged\n",
                 sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]));
