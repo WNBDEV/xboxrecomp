@@ -115,6 +115,8 @@ extern int g_force_return;
 
 extern uint32_t g_xbox_code_lo;
 extern uint32_t g_xbox_code_hi;
+extern uint32_t g_xbox_code2_lo;  /* xbox_AddCodeRange: run-time-loaded code */
+extern uint32_t g_xbox_code2_hi;
 
 /* Is this indirect-call target plausibly code?
  *
@@ -125,7 +127,8 @@ extern uint32_t g_xbox_code_hi;
  * than dropping it. */
 #define RECOMP_ICALL_IS_CODE(_va) \
     ((_va) >= 0xFE000000u || g_xbox_code_hi == 0u || \
-     ((_va) >= g_xbox_code_lo && (_va) < g_xbox_code_hi))
+     ((_va) >= g_xbox_code_lo && (_va) < g_xbox_code_hi) || \
+     ((_va) >= g_xbox_code2_lo && (_va) < g_xbox_code2_hi))
 
 /* ================================================================
  * Global registers

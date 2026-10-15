@@ -1113,6 +1113,17 @@ uint32_t g_xbox_image_lo = 0;
 uint32_t g_xbox_image_hi = 0;
 uint32_t g_xbox_code_lo = 0;
 uint32_t g_xbox_code_hi = 0;
+/* A second code range, for code that is not in the XBE: modules a title loads
+ * at run time and the project translated at fixed addresses (Alter Echo's
+ * object scripts). Empty unless a project calls xbox_AddCodeRange. */
+uint32_t g_xbox_code2_lo = 0;
+uint32_t g_xbox_code2_hi = 0;
+
+void xbox_AddCodeRange(uint32_t lo, uint32_t hi)
+{
+    g_xbox_code2_lo = lo;
+    g_xbox_code2_hi = hi;
+}
 
 /* Global registers for recompiled code (via recomp_types.h) */
 /* Each guest thread's TIB. The first thread uses the one the loader built;

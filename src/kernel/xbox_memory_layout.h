@@ -99,6 +99,12 @@ extern uint32_t g_xbox_image_hi;
 
 extern uint32_t g_xbox_code_lo;
 extern uint32_t g_xbox_code_hi;
+/* One more executable range outside the XBE -- run-time-loaded code that the
+ * project translated at fixed addresses. RECOMP_ICALL accepts targets in
+ * either range. One extra range; a second call replaces the first. */
+extern uint32_t g_xbox_code2_lo;
+extern uint32_t g_xbox_code2_hi;
+void xbox_AddCodeRange(uint32_t lo, uint32_t hi);
 void xbox_SetTotalRam(size_t bytes);
 
 /* NOTE: Section addresses (.text, .rdata, .data, etc.) are NOT hardcoded.
