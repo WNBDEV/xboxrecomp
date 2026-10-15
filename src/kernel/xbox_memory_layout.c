@@ -1137,6 +1137,41 @@ RECOMP_TLS uint32_t g_fs_base = XBOX_TIB_MAIN;
 static uint32_t g_tls_template_va, g_tls_total, g_tls_thread_size = 64;
 
 RECOMP_TLS uint32_t g_eax = 0, g_ecx = 0, g_edx = 0, g_esp = 0;
+/* EFLAGS as pushfd/popfd see it (the lifter's flags are lazy, so this is a
+ * stored word, not the live flags). IF and the always-one bit 1 set. */
+RECOMP_TLS uint32_t g_eflags_shadow = 0x00000202u;
+
+/* cpuid, answered as the console's CPU: a 733 MHz Pentium III (Coppermine,
+ * family 6 model 8), GenuineIntel, with FPU..CX8, SEP, MTRR, PGE, MCA, CMOV,
+ * PAT, PSE36, MMX, FXSR and SSE. Titles and their middleware pick code paths
+ * from these bits, so they have to describe the machine the code was built
+ * for, not the host. */
+void xbox_Cpuid(uint32_t *a, uint32_t *b, uint32_t *c, uint32_t *d)
+{
+    switch (*a) {
+    case 0:
+        *a = 2;
+        *b = 0x756E6547u;   /* "Genu" */
+        *d = 0x49656E69u;   /* "ineI" */
+        *c = 0x6C65746Eu;   /* "ntel" */
+        break;
+    case 1:
+        *a = 0x0000068Au;   /* family 6, model 8, stepping 10 */
+        *b = 0;
+        *c = 0;
+        *d = 0x0383F9FFu;
+        break;
+    case 2:                 /* cache and TLB descriptors */
+        *a = 0x03020101u;
+        *b = 0;
+        *c = 0;
+        *d = 0x0C040882u;
+        break;
+    default:
+        *a = *b = *c = *d = 0;
+        break;
+    }
+}
 RECOMP_TLS uint32_t g_ebx = 0, g_esi = 0, g_edi = 0;
 
 #ifdef RECOMP_ABI_CHECK

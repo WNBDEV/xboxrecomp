@@ -168,6 +168,8 @@ extern uint32_t g_xbox_code2_hi;
 #endif
 
 extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
+extern RECOMP_TLS uint32_t g_eflags_shadow;   /* pushfd/popfd */
+void xbox_Cpuid(uint32_t *a, uint32_t *b, uint32_t *c, uint32_t *d);
 extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
 
 /* x87 stack. Per-thread for the same reason the integer registers are:

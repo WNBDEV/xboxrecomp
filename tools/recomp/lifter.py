@@ -1684,6 +1684,27 @@ class Lifter:
                 "  /* rdtsc */",
             ]
 
+        # ── cpuid ──
+        # Answered as the console's CPU, a 733 MHz Pentium III (xbox_Cpuid).
+        # As a no-op the registers kept whatever they held, so feature checks
+        # read garbage: RAD's MMX probe (Alter Echo's sub_00011160) decided
+        # there was no MMX, and Bink took a C fallback no console ever runs --
+        # one that calls a function pointer only its MMX path initialises.
+        if m == "cpuid":
+            return ["xbox_Cpuid(&eax, &ebx, &ecx, &edx); /* cpuid */"]
+
+        # ── pushfd / popfd ──
+        # The arithmetic flags here are computed lazily, per jcc, so there is
+        # no EFLAGS word to push. What code does with pushfd/popfd in practice
+        # is save and restore it, or toggle the ID bit to see whether cpuid
+        # exists; both work against a stored word (g_eflags_shadow). As no-ops
+        # they also unbalanced the stack: pushfd; pop eax popped the caller's
+        # data.
+        if m == "pushfd":
+            return ["PUSH32(esp, g_eflags_shadow); /* pushfd */"]
+        if m == "popfd":
+            return ["POP32(esp, g_eflags_shadow); /* popfd */"]
+
         # ── Bit scan ──
         # Index of the lowest (bsf) or highest (bsr) set bit. When the source
         # is zero the destination is left untouched and ZF is set; that is the
