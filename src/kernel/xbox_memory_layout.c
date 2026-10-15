@@ -874,7 +874,7 @@ static void framebuffer_probe_tick(void)
 }
 
 /* The two busy bits a title spins on, cleared on a thread of their own
- * (RECOMP_BUSY_ACK=1, off by default).
+ * (RECOMP_BUSY_ACK=0 turns it off).
  *
  * Otherwise both are cleared only by the loop below, between pushbuffer passes,
  * and with RECOMP_PB_EXEC a pass rasterises, which can take a whole frame. So
@@ -884,10 +884,11 @@ static void framebuffer_probe_tick(void)
  * thread. Neither waits for rendering on hardware: the flush drains the CPU's
  * write buffers, the acknowledgement clears a latch.
  *
- * Off by default because it did not pay. In Alter Echo's first level the
- * rasteriser is the bottleneck either way, and a thread spinning on two
- * registers takes a core from it: 3.5 fps with this, 4.6 without. A title
- * whose CPU side is the slower one may see the opposite.
+ * Polled once a millisecond. Spinning with Sleep(0) took a core from the
+ * rasteriser and lost more than it won (3.5 fps against 4.6 in Alter Echo's
+ * loading screen); at 1 ms the cost is nothing and a spin ends within a
+ * millisecond instead of a pass: 6.6 fps against 5.2, and the level's loader,
+ * which runs on the main thread between those spins, reads 60% more.
  *
  * Only these two: everything else in NV2A_ACK stays with the pass loop, whose
  * ordering the software-method stall depends on (kernel_bridge.c). */
@@ -909,7 +910,7 @@ static DWORD WINAPI nv2a_busy_ack_thread(LPVOID param)
                 v = *pmc;
             while (InterlockedCompareExchange(pmc, v & ~(LONG)(1u << 24), v) != v);
         }
-        Sleep(0);
+        Sleep(1);
     }
     return 0;
 }
@@ -1113,7 +1114,7 @@ static void xbox_Nv2aAckStart(void)
     g_nv2a_ack_stop = 0;
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);
-    if (getenv("RECOMP_BUSY_ACK") && *getenv("RECOMP_BUSY_ACK") == '1') {
+    if (!(getenv("RECOMP_BUSY_ACK") && *getenv("RECOMP_BUSY_ACK") == '0')) {
         HANDLE busy = CreateThread(NULL, 0, nv2a_busy_ack_thread,
                                    g_nv2a_memory, 0, NULL);
         if (busy)
