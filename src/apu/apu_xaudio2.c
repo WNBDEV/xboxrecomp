@@ -9,6 +9,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <math.h>
 #include "apu_xaudio2.h"
 
 /* The XAudio2 backend is Windows-only. On Linux all xa2_* functions are
@@ -125,6 +127,52 @@ int xa2_is_active(void)
     return g_xa2_initialized;
 }
 
+/* RECOMP_AUDIO_STATS=1: is anything audible coming out? Every ten seconds,
+ * how many mix buffers reached XAudio2, how many were dropped for a full
+ * queue, and the peak and RMS of what was offered. Silence and sound look the
+ * same in every other log line, and nobody running a bring-up headless can
+ * listen. */
+static void xa2_stats(const int16_t *samples, int n, int dropped)
+{
+    static int on = -1;
+    static unsigned submitted, drops;
+    static double sumsq;
+    static uint64_t count;
+    static int peak;
+    static DWORD last;
+    DWORD now;
+    int i;
+
+    if (on < 0)
+        on = getenv("RECOMP_AUDIO_STATS") != NULL;
+    if (!on)
+        return;
+    if (dropped)
+        drops++;
+    else
+        submitted++;
+    for (i = 0; i < n * XA2_CHANNELS; i++) {
+        int v = samples[i] < 0 ? -samples[i] : samples[i];
+        if (v > peak)
+            peak = v;
+        sumsq += (double)samples[i] * samples[i];
+    }
+    count += (uint64_t)n * XA2_CHANNELS;
+    now = GetTickCount();
+    if (!last)
+        last = now;
+    if (now - last >= 10000) {
+        fprintf(stderr, "[XA2] %.1f s: %u buffers submitted, %u dropped; peak %d, rms %.1f\n",
+                (now - last) / 1000.0, submitted, drops, peak,
+                count ? sqrt(sumsq / (double)count) : 0.0);
+        submitted = drops = 0;
+        sumsq = 0;
+        count = 0;
+        peak = 0;
+        last = now;
+    }
+}
+
 /* Submit a buffer of mixed samples to XAudio2.
  * Called from APU frame thread. Returns 1 if buffer was submitted. */
 int xa2_submit_samples(const int16_t *samples, int num_samples)
@@ -138,7 +186,11 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     if (!g_xa2_initialized || !g_xa2_source) return 0;
 
     IXAudio2SourceVoice_GetState(g_xa2_source, &state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
-    if ((int)state.BuffersQueued >= XA2_NUM_BUFS) return 0;
+    if ((int)state.BuffersQueued >= XA2_NUM_BUFS) {
+        xa2_stats(samples, num_samples, 1);
+        return 0;
+    }
+    xa2_stats(samples, num_samples, 0);
 
     idx = g_xa2_next_buf;
     copy_samples = (num_samples > XA2_BUF_SAMPLES) ? XA2_BUF_SAMPLES : num_samples;
