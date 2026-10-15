@@ -904,8 +904,11 @@ static uint32_t wrap_coord(uint32_t c, uint32_t size, uint32_t mode)
     int32_t sc = (int32_t)c, n = (int32_t)size;
     if (!size)
         return 0;
-    if (mode == 1)                         /* wrap */
+    if (mode == 1) {                       /* wrap */
+        if (!(size & (size - 1)))
+            return c & (size - 1);         /* two's complement: -1 -> size-1 */
         return (uint32_t)(((sc % n) + n) % n);
+    }
     return sc < 0 ? 0u : (sc >= n ? size - 1 : c);   /* clamp, and the rest */
 }
 
@@ -1989,6 +1992,34 @@ static void xf_rows_queued(int k, int n, XfCount *cnt)
     }
 }
 
+/* RECOMP_GPU_PROFILE=1: where the executor's time goes, every ten seconds.
+ *
+ * Program batches are split into vertex transform, primitive assembly with
+ * triangle setup, and rasterisation, the last into draws small enough to stay
+ * on the executor thread and draws spread over the raster pool -- with how
+ * busy the pool's threads were while it ran and how long they took to wake.
+ * It answered "why is the pool idle?" (it was not: 85% busy) and showed
+ * vertices transformed three times over for indexed meshes. */
+static struct {
+    int on;
+    double xf, asm_, ser_ms, par_ms;
+    uint64_t verts, uniq;
+    unsigned serial, parallel, last_parallel;
+    volatile LONG64 busy_ticks, wake_ticks;
+    LARGE_INTEGER kick, t;
+} s_prof;
+
+static double prof_lap(void)
+{
+    LARGE_INTEGER t, f;
+    double ms;
+    QueryPerformanceCounter(&t);
+    QueryPerformanceFrequency(&f);
+    ms = (double)(t.QuadPart - s_prof.t.QuadPart) * 1000.0 / (double)f.QuadPart;
+    s_prof.t = t;
+    return ms;
+}
+
 /* Worker threads for big triangles.
  *
  * The rasteriser is a software GPU, and a Burnout 3 frame is dominated by a
@@ -1997,8 +2028,11 @@ static void xf_rows_queued(int k, int n, XfCount *cnt)
  * split cleanly by row: every pixel reads only its own depth and colour, so
  * interleaved rows on N threads need no locking. Small triangles stay on the
  * executor thread, where waking workers would cost more than it saves.
- * RECOMP_RASTER_THREADS=<n> sets the count (1 = off); the default leaves a
- * few cores for the title and the host.
+ * RECOMP_RASTER_THREADS=<n> sets the count (1 = off); the default leaves one
+ * core for the title. It used to leave four, back when the title's main thread
+ * spun on the GPU's busy bits; now that those clear within a millisecond it
+ * mostly sleeps in BlockOnTime, and Alter Echo went from 6.3 to 6.8 fps with
+ * seven threads on eight cores instead of four.
  * ponytail: s_gpu.pixels/pixel_max in put_pixel are unsynchronised stats and
  * may undercount; nothing depends on them. */
 #define NV_RASTER_MAX_THREADS 16
@@ -2021,8 +2055,16 @@ static DWORD WINAPI raster_worker(LPVOID arg)
         memset(&s_pool.cnt[k], 0, sizeof s_pool.cnt[k]);
         if (s_pool.tri)
             xf_rows(s_pool.tri, s_pool.tri->miny + k, s_pool.n, &s_pool.cnt[k]);
-        else
+        else if (s_prof.on) {
+            LARGE_INTEGER a, b;
+            QueryPerformanceCounter(&a);
+            InterlockedAdd64(&s_prof.wake_ticks, a.QuadPart - s_prof.kick.QuadPart);
             xf_rows_queued(k, s_pool.n, &s_pool.cnt[k]);
+            QueryPerformanceCounter(&b);
+            InterlockedAdd64(&s_prof.busy_ticks, b.QuadPart - a.QuadPart);
+        } else {
+            xf_rows_queued(k, s_pool.n, &s_pool.cnt[k]);
+        }
         if (InterlockedDecrement(&s_pool.pending) == 0)
             SetEvent(s_pool.done);
     }
@@ -2038,7 +2080,7 @@ static int raster_pool_size(void)
         int n, k;
         init = 1;
         GetSystemInfo(&si);
-        n = e ? atoi(e) : (int)si.dwNumberOfProcessors - 4;
+        n = e ? atoi(e) : (int)si.dwNumberOfProcessors - 1;
         if (n < 1) n = 1;
         if (n > NV_RASTER_MAX_THREADS) n = NV_RASTER_MAX_THREADS;
         s_pool.n = n;
@@ -2088,16 +2130,29 @@ static void xf_queue_run(XfCount *total)
     int n = raster_pool_size(), k;
 
     if (n <= 1 || s_xfq_px < NV_RASTER_MT_MIN_PIXELS) {
+        s_prof.serial++;
+        s_prof.last_parallel = 0;
         xf_rows_queued(0, 1, total);
         return;
     }
+    s_prof.parallel++;
+    s_prof.last_parallel = 1;
     s_pool.tri = NULL;
     s_pool.pending = n - 1;
+    if (s_prof.on)
+        QueryPerformanceCounter(&s_prof.kick);
     for (k = 0; k < n - 1; k++)
         SetEvent(s_pool.start[k]);
     {
         XfCount mine = {0, 0, 0};
+        LARGE_INTEGER a, b;
+        if (s_prof.on)
+            QueryPerformanceCounter(&a);
         xf_rows_queued(n - 1, n, &mine);
+        if (s_prof.on) {
+            QueryPerformanceCounter(&b);
+            InterlockedAdd64(&s_prof.busy_ticks, b.QuadPart - a.QuadPart);
+        }
         WaitForSingleObject(s_pool.done, INFINITE);
         total->depth_fail += mine.depth_fail;
         total->pixels += mine.pixels;
@@ -2110,6 +2165,11 @@ static void xf_queue_run(XfCount *total)
     }
 }
 #else
+static int raster_pool_size(void)
+{
+    return 1;
+}
+
 static void xf_rows_parallel(const XfTri *T, XfCount *total)
 {
     xf_rows(T, T->miny, 1, total);
@@ -2382,13 +2442,65 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
     return nv2a_vsh_run((const float (*)[4])in, out);
 }
 
+static void prof_report(void)
+{
+    static DWORD last;
+    DWORD now = GetTickCount();
+    LARGE_INTEGER f;
+    int n = raster_pool_size();
+
+    if (!last)
+        last = now;
+    if (now - last < 10000)
+        return;
+    QueryPerformanceFrequency(&f);
+    fprintf(stderr, "[GPUPROF] %.1f s: transform %.0f ms (%llu vertices, %llu distinct), "
+            "assembly+setup %.0f ms, raster %u serial draws %.0f ms + %u parallel %.0f ms; "
+            "pool of %d busy %.0f%%, wake %.3f ms\n",
+            (now - last) / 1000.0, s_prof.xf, (unsigned long long)s_prof.verts,
+            (unsigned long long)s_prof.uniq, s_prof.asm_, s_prof.serial, s_prof.ser_ms,
+            s_prof.parallel, s_prof.par_ms, n,
+            s_prof.par_ms > 0 ? 100.0 * ((double)s_prof.busy_ticks * 1000.0 / f.QuadPart)
+                                / (s_prof.par_ms * n) : 0.0,
+            s_prof.parallel && n > 1 ? (double)s_prof.wake_ticks * 1000.0 / f.QuadPart
+                                       / ((double)s_prof.parallel * (n - 1)) : 0.0);
+    s_prof.xf = s_prof.asm_ = s_prof.ser_ms = s_prof.par_ms = 0;
+    s_prof.verts = s_prof.uniq = 0;
+    s_prof.serial = s_prof.parallel = 0;
+    s_prof.busy_ticks = s_prof.wake_ticks = 0;
+    last = now;
+}
+
 static void raster_batch_program(void)
 {
     uint32_t i, n = s_gpu.idx_count;
+    static int prof_init;
 
+    if (!prof_init) {
+        prof_init = 1;
+        s_prof.on = getenv("RECOMP_GPU_PROFILE") != NULL;
+    }
+
+    if (s_prof.on) {
+        static uint32_t seen[65536 / 32];
+        uint32_t u = 0;
+        prof_lap();
+        memset(seen, 0, sizeof seen);
+        for (i = 0; i < n; i++) {
+            uint32_t x = s_gpu.idx[i] & 0xFFFF;
+            if (!(seen[x >> 5] & (1u << (x & 31)))) {
+                seen[x >> 5] |= 1u << (x & 31);
+                u++;
+            }
+        }
+        s_prof.verts += n;
+        s_prof.uniq += u;
+    }
     for (i = 0; i < n; i++)
         if (!transform_vertex(s_gpu.idx[i], &s_xf[i]))
             return;                                    /* no program loaded */
+    if (s_prof.on)
+        s_prof.xf += prof_lap();
     s_gpu.batches_program++;
     s_gpu.verts_program += n;
     if (s_gpu.blend_enable) {
@@ -2479,7 +2591,18 @@ static void raster_batch_program(void)
     default:
         break;
     }
+    if (s_prof.on)
+        s_prof.asm_ += prof_lap();
+    s_prof.last_parallel = 0;
     xf_flush();
+    if (s_prof.on) {
+        double ms = prof_lap();
+        if (s_prof.last_parallel)
+            s_prof.par_ms += ms;
+        else
+            s_prof.ser_ms += ms;
+        prof_report();
+    }
 }
 
 static void raster_batch(void)

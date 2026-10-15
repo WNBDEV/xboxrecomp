@@ -126,6 +126,35 @@ static inline uint32_t swizzle_offset(uint32_t x, uint32_t y,
 {
     uint32_t mask_x, mask_y;
 
+    /* Power-of-two sizes, which every swizzled texture has, without the bit
+     * loops: the masks alternate X and Y until the smaller dimension runs out
+     * and the larger one takes the remaining bits in order, so the offset is
+     * the two low parts interleaved with the rest of the larger coordinate
+     * above them. The software sampler calls this for every texel it reads --
+     * four per bilinear tap, per stage -- and the loops below were the
+     * largest single cost in it. Same result as the general form; the d3d8
+     * smoke test compares both against xbox_swizzle_rect. */
+    if (width && height && !(width & (width - 1)) && !(height & (height - 1))
+            && width <= 65536 && height <= 65536) {
+        uint32_t lw = 0, lh = 0, m, off;
+#if defined(__GNUC__) || defined(__clang__)
+        lw = (uint32_t)__builtin_ctz(width);
+        lh = (uint32_t)__builtin_ctz(height);
+#else
+        while ((1u << lw) < width)  lw++;
+        while ((1u << lh) < height) lh++;
+#endif
+        m = lw < lh ? lw : lh;
+        x &= width - 1;
+        y &= height - 1;
+        off = swizzle_spread(x & ((1u << m) - 1u))
+            | (swizzle_spread(y & ((1u << m) - 1u)) << 1);
+        if (lw > lh)
+            off |= (x >> m) << (2u * m);
+        else if (lh > lw)
+            off |= (y >> m) << (2u * m);
+        return off;
+    }
     xbox_swizzle_masks(width, height, &mask_x, &mask_y);
     return swizzle_deposit(x, mask_x) | swizzle_deposit(y, mask_y);
 }
