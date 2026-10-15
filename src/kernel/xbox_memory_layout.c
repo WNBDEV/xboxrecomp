@@ -893,11 +893,40 @@ static void framebuffer_probe_tick(void)
  *
  * Only these two: everything else in NV2A_ACK stays with the pass loop, whose
  * ordering the software-method stall depends on (kernel_bridge.c). */
+/* NV_PCRTC_RASTER (0x600808): the scanline the CRTC is on, 0..524 for a
+ * 480-line NTSC frame. D3D's GetRasterStatus reads it -- line 0, or any at or
+ * past the display height, is vertical blank -- and Alter Echo's frame
+ * limiter waits for a vblank to begin and then to end. Plain memory held it at
+ * 0, "in vblank" forever, and the moment frames came fast enough to reach the
+ * limiter (the GPU path) the game hung on its first in-engine cutscene.
+ *
+ * Derived from the clock at 60 Hz. The blanking lines are stretched over the
+ * last 18% of the frame (~3 ms rather than the real ~1.4 ms) because this is
+ * written once a millisecond or so: what a title waits for is the edges, and
+ * a window shorter than the update interval could be stepped over.
+ * ponytail: not phase-locked to the vblank interrupt (kernel_vblank_tick). */
+static void crtc_raster_tick(volatile uint32_t *regs)
+{
+    static LARGE_INTEGER freq;
+    LARGE_INTEGER now;
+    double phase;
+    uint32_t line;
+
+    if (!freq.QuadPart)
+        QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&now);
+    phase = (double)(now.QuadPart % (freq.QuadPart / 60)) / (double)(freq.QuadPart / 60);
+    line = phase < 0.82 ? 1u + (uint32_t)(phase / 0.82 * 478.0)
+                        : 480u + (uint32_t)((phase - 0.82) / 0.18 * 44.0);
+    regs[0x600808 / 4] = (regs[0x600808 / 4] & ~0x7FFu) | line;
+}
+
 static DWORD WINAPI nv2a_busy_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
         uint32_t pcrtc = regs[0x600100 / 4];
+        crtc_raster_tick(regs);
         if (regs[0x100410 / 4] & 0x00010000u)          /* PFB flush kick */
             regs[0x100410 / 4] &= ~0x00010000u;
         /* Atomically, both: the timer thread raises the next vblank into
@@ -962,6 +991,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          * The advance now happens after the scan, further down, which is
          * also the only ordering that gives the title real back-pressure. */
         fence_mirrors_tick();
+        crtc_raster_tick(regs);
         dsp_ack_tick();
         poke_tick();
         counter_mirrors_tick();
