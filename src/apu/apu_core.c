@@ -377,47 +377,75 @@ void mcpx_apu_monitor_finalize(MCPXAPUState *d)
             g_waveout.frames_written);
 }
 
+/* The final 256 samples of this delivery, in d->monitor.frame_buf.
+ *
+ * The DSP stage has just written its mixdown of the voice processor's
+ * mixbins there, 32 samples per sub-frame, eight sub-frames. This used to
+ * clear the buffer first and fill it from the test tone and the software
+ * mixer alone -- so a title that drives the APU itself, as XDK DirectSound
+ * does, produced voices, mixbins and a mixdown, and then silence: Alter
+ * Echo's level had up to nine voices playing and a peak of 0 at XAudio2.
+ * The tone and the software voices are now mixed on top instead. */
+static void monitor_render(MCPXAPUState *d)
+{
+    int16_t (*buf)[2] = d->monitor.frame_buf;
+
+    if (g_audio_muted) {
+        memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+        return;
+    }
+    if (g_test_tone.active) {
+        for (int i = 0; i < MIXER_FRAME_SAMPLES; i++) {
+            int32_t s = (int32_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
+            for (int c = 0; c < 2; c++) {
+                int32_t m = buf[i][c] + s;
+                buf[i][c] = (int16_t)(m > 32767 ? 32767 : (m < -32768 ? -32768 : m));
+            }
+            g_test_tone.phase += g_test_tone.phase_inc;
+            if (g_test_tone.phase >= 2.0 * M_PI)
+                g_test_tone.phase -= 2.0 * M_PI;
+        }
+    }
+    mixer_render(buf, MIXER_FRAME_SAMPLES);
+}
+
 void mcpx_apu_monitor_frame(MCPXAPUState *d)
 {
+    /* Gathered into whole device buffers. Each delivery is 256 samples, and
+     * the XAudio2 path used to submit a full 1024-sample buffer for every one
+     * -- four times real time, so three quarters were dropped for a full
+     * queue and what played was stretched out of whatever was rendered. */
+    static int16_t acc[2048][2];
+    static int acc_n;
+
     if ((d->ep_frame_div + 1) % 8) {
         return;
     }
+    monitor_render(d);
 
-    /* XAudio2 path: render and submit a buffer */
+    /* XAudio2 path */
     if (xa2_is_active()) {
         int buf_size = xa2_get_buffer_size();
-        int16_t xa2_tmp[1024][2];  /* matches XA2_BUF_SAMPLES max */
-        int remaining = buf_size;
-        int out_offset = 0;
-
-        while (remaining > 0) {
-            int chunk = (remaining < MIXER_FRAME_SAMPLES) ? remaining : MIXER_FRAME_SAMPLES;
-            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
-
-            if (g_test_tone.active && !g_audio_muted) {
-                for (int i = 0; i < chunk; i++) {
-                    int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
-                    d->monitor.frame_buf[i][0] = s;
-                    d->monitor.frame_buf[i][1] = s;
-                    g_test_tone.phase += g_test_tone.phase_inc;
-                    if (g_test_tone.phase >= 2.0 * M_PI)
-                        g_test_tone.phase -= 2.0 * M_PI;
-                }
-            }
-
-            if (!g_audio_muted)
-                mixer_render(d->monitor.frame_buf, chunk);
-
-            memcpy(xa2_tmp + out_offset, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
-            out_offset += chunk;
-            remaining -= chunk;
+        if (buf_size > 1024)
+            buf_size = 1024;
+        memcpy(acc + acc_n, d->monitor.frame_buf, sizeof(d->monitor.frame_buf));
+        memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+        acc_n += MIXER_FRAME_SAMPLES;
+        if (acc_n >= buf_size) {
+            xa2_submit_samples((const int16_t *)acc, buf_size);
+            acc_n = 0;
         }
-
-        xa2_submit_samples((const int16_t *)xa2_tmp, buf_size);
         return;
     }
 
     if (!g_waveout.initialized) return;
+
+    memcpy(acc + acc_n, d->monitor.frame_buf, sizeof(d->monitor.frame_buf));
+    memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+    acc_n += MIXER_FRAME_SAMPLES;
+    if (acc_n < WAVEOUT_BUF_SAMPLES)
+        return;
+    acc_n = 0;
 
     int idx = g_waveout.next_buf;
     WAVEHDR *hdr = &g_waveout.hdrs[idx];
@@ -431,37 +459,7 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         if (++wait_loops > 50) break;
     }
 
-    /* Fill the large waveOut buffer by rendering multiple 256-sample frames */
-    int16_t *out = (int16_t *)g_waveout.bufs[idx];
-    int remaining = WAVEOUT_BUF_SAMPLES;
-    int out_offset = 0;
-
-    while (remaining > 0) {
-        int chunk = (remaining < MIXER_FRAME_SAMPLES) ? remaining : MIXER_FRAME_SAMPLES;
-
-        memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
-
-        /* Test tone (skip if muted) */
-        if (g_test_tone.active && !g_audio_muted) {
-            for (int i = 0; i < chunk; i++) {
-                int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
-                d->monitor.frame_buf[i][0] = s;
-                d->monitor.frame_buf[i][1] = s;
-                g_test_tone.phase += g_test_tone.phase_inc;
-                if (g_test_tone.phase >= 2.0 * M_PI)
-                    g_test_tone.phase -= 2.0 * M_PI;
-            }
-        }
-
-        /* Mix software voices (skip if muted) */
-        if (!g_audio_muted)
-            mixer_render(d->monitor.frame_buf, chunk);
-
-        /* Copy to waveOut buffer */
-        memcpy(out + out_offset * 2, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
-        out_offset += chunk;
-        remaining -= chunk;
-    }
+    memcpy(g_waveout.bufs[idx], acc, sizeof(g_waveout.bufs[idx]));
 
     /* Submit to waveOut */
     hdr->dwFlags &= ~WHDR_DONE;
@@ -506,6 +504,56 @@ static void throttle(MCPXAPUState *d)
  * se_frame - Process one audio frame (VP -> GP -> EP pipeline)
  * ============================================================ */
 
+/* RECOMP_AUDIO_STATS=1, the voice-processor end: every ten seconds, the most
+ * voices active in one frame, the loudest mixbin sample, and which mixbins
+ * carried anything. With the XAudio2 end of the same switch it splits "no
+ * sound" into the VP producing nothing and the mixdown losing it. */
+static void apu_stats_frame(float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
+{
+    static int on = -1, max_voices;
+    static float peak;
+    static uint32_t bins;
+    static unsigned frames;
+    static int64_t last;
+    int64_t now;
+    int b, i, voices = 0;
+
+    if (on < 0)
+        on = getenv("RECOMP_AUDIO_STATS") != NULL;
+    if (!on)
+        return;
+    /* voice_process sets these and nothing clears them (xemu's debug UI
+     * does, per frame), so count and clear. */
+    for (i = 0; i < 256; i++) {
+        voices += g_dbg.vp.v[i].active;
+        g_dbg.vp.v[i].active = false;
+    }
+    if (voices > max_voices)
+        max_voices = voices;
+    for (b = 0; b < NUM_MIXBINS; b++)
+        for (i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+            float a = mixbins[b][i] < 0 ? -mixbins[b][i] : mixbins[b][i];
+            if (a > 0.0f && b < 32)
+                bins |= 1u << b;
+            if (a > peak)
+                peak = a;
+        }
+    frames++;
+    now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    if (!last)
+        last = now;
+    if (now - last >= 10000) {
+        fprintf(stderr, "[APU] %.1f s: %u frames, up to %d voices active, "
+                "mixbin peak %g, bins with signal %08X\n",
+                (now - last) / 1000.0, frames, max_voices, peak, bins);
+        frames = 0;
+        max_voices = 0;
+        peak = 0.0f;
+        bins = 0;
+        last = now;
+    }
+}
+
 static void se_frame(MCPXAPUState *d)
 {
     mcpx_apu_update_dsp_preference(d);
@@ -529,6 +577,7 @@ static void se_frame(MCPXAPUState *d)
     memset(mixbins, 0, sizeof(mixbins));
 
     mcpx_apu_vp_frame(d, mixbins);
+    apu_stats_frame(mixbins);
     mcpx_apu_dsp_frame(d, mixbins);
     mcpx_apu_monitor_frame(d);
 

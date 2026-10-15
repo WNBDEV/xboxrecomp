@@ -143,6 +143,19 @@ static void xa2_stats(const int16_t *samples, int n, int dropped)
     DWORD now;
     int i;
 
+    /* RECOMP_AUDIO_DUMP=<file>: the samples offered, appended as raw 48 kHz
+     * stereo s16le (ffmpeg -f s16le -ar 48000 -ac 2 -i <file> out.wav). */
+    {
+        static FILE *dump = (FILE *)-1;
+        if (dump == (FILE *)-1) {
+            const char *e = getenv("RECOMP_AUDIO_DUMP");
+            dump = e ? fopen(e, "ab") : NULL;
+        }
+        if (dump && !dropped) {
+            fwrite(samples, sizeof(int16_t) * XA2_CHANNELS, (size_t)n, dump);
+            fflush(dump);
+        }
+    }
     if (on < 0)
         on = getenv("RECOMP_AUDIO_STATS") != NULL;
     if (!on)
