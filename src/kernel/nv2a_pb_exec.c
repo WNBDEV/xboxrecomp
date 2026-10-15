@@ -390,6 +390,10 @@ static struct {
     int xf_nfmt, xf_seeded;
     uint32_t depth_test, depth_func, depth_mask;
     uint32_t zeta_offset, zstencil_clear;
+    /* SET_STENCIL_*: enable, write mask, func/ref/func mask, and the ops for
+     * stencil fail, depth fail and depth pass. */
+    uint32_t stencil_test, stencil_wmask, stencil_func, stencil_ref,
+             stencil_fmask, stencil_op_fail, stencil_op_zfail, stencil_op_zpass;
     /* SET_CONTEXT_DMA_SEMAPHORE handle and SET_SEMAPHORE_OFFSET, for
      * BACK_END_WRITE_SEMAPHORE_RELEASE -- D3D's GPU clock. */
     uint32_t semaphore_dma, semaphore_offset, semaphore_releases;
@@ -1640,7 +1644,7 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
  * the title does reads it back, so a float buffer per zeta offset is enough. */
 #define NV_ZBUF_W 1024
 #define NV_ZBUF_H 1024
-static struct { uint32_t offset; float *z; } s_zbufs[4];
+static struct { uint32_t offset; float *z; uint8_t *s; } s_zbufs[4];
 static int s_ftrace;            /* frame trace: 0 idle, 2 tracing, 3 done */
 static int s_zbuf_next;
 
@@ -1665,12 +1669,27 @@ static float *zbuf_current(int create)
     i = s_zbuf_next++ & 3;
     if (!s_zbufs[i].z)
         s_zbufs[i].z = (float *)malloc(sizeof(float) * NV_ZBUF_W * NV_ZBUF_H);
-    if (!s_zbufs[i].z)
+    if (!s_zbufs[i].s)
+        s_zbufs[i].s = (uint8_t *)malloc((size_t)NV_ZBUF_W * NV_ZBUF_H);
+    if (!s_zbufs[i].z || !s_zbufs[i].s)
         return NULL;
     s_zbufs[i].offset = s_gpu.zeta_offset;
     for (k = 0; k < (size_t)NV_ZBUF_W * NV_ZBUF_H; k++)
         s_zbufs[i].z[k] = 3.4e38f;
+    memset(s_zbufs[i].s, 0, (size_t)NV_ZBUF_W * NV_ZBUF_H);
     return s_zbufs[i].z;
+}
+
+/* The stencil half of the current zeta surface, beside its depth. */
+static uint8_t *sbuf_current(void)
+{
+    int i;
+    if (!zbuf_current(1))
+        return NULL;
+    for (i = 0; i < 4; i++)
+        if (s_zbufs[i].z && s_zbufs[i].offset == s_gpu.zeta_offset)
+            return s_zbufs[i].s;
+    return NULL;
 }
 
 static void zbuf_clear(void)
@@ -1680,6 +1699,48 @@ static void zbuf_clear(void)
     if (z)
         for (k = 0; k < (size_t)NV_ZBUF_W * NV_ZBUF_H; k++)
             z[k] = v;
+}
+
+/* CLEAR_SURFACE's stencil bit: the low byte of ZSTENCIL_CLEAR_VALUE, which
+ * is where Z24S8 keeps it. */
+static void sbuf_clear(void)
+{
+    uint8_t *sb = sbuf_current();
+    if (sb)
+        memset(sb, (int)(s_gpu.zstencil_clear & 0xFF), (size_t)NV_ZBUF_W * NV_ZBUF_H);
+}
+
+/* The stencil test and its update, GL semantics as the NV2A takes them. */
+static int stencil_pass(uint8_t stored)
+{
+    uint32_t m = s_gpu.stencil_fmask & 0xFF;
+    uint32_t r = s_gpu.stencil_ref & m, v = stored & m;
+    switch (s_gpu.stencil_func) {
+    case 0x200: return 0;                         /* NEVER    */
+    case 0x201: return r <  v;                    /* LESS     */
+    case 0x202: return r == v;                    /* EQUAL    */
+    case 0x203: return r <= v;                    /* LEQUAL   */
+    case 0x204: return r >  v;                    /* GREATER  */
+    case 0x205: return r != v;                    /* NOTEQUAL */
+    case 0x206: return r >= v;                    /* GEQUAL   */
+    default:    return 1;                         /* ALWAYS   */
+    }
+}
+
+static void stencil_update(uint8_t *sp, uint32_t op)
+{
+    uint32_t old = *sp, v;
+    switch (op) {
+    case 0x0000: v = 0; break;                                  /* ZERO      */
+    case 0x1E01: v = s_gpu.stencil_ref & 0xFF; break;           /* REPLACE   */
+    case 0x1E02: v = old < 0xFF ? old + 1 : 0xFF; break;        /* INCR      */
+    case 0x1E03: v = old > 0 ? old - 1 : 0; break;              /* DECR      */
+    case 0x150A: v = ~old & 0xFF; break;                        /* INVERT    */
+    case 0x8507: v = (old + 1) & 0xFF; break;                   /* INCR_WRAP */
+    case 0x8508: v = (old - 1) & 0xFF; break;                   /* DECR_WRAP */
+    default:     return;                                        /* KEEP      */
+    }
+    *sp = (uint8_t)((old & ~s_gpu.stencil_wmask) | (v & s_gpu.stencil_wmask));
 }
 
 static int depth_pass(float z, float stored)
@@ -1896,6 +1957,7 @@ typedef struct {
     const float *a, *b, *c;
     float iw[3], uv[3][2], stc[3][4][4], vfog[3], fogc[4], inv_area;
     float *zb;
+    uint8_t *sb;                         /* stencil, when the test is on */
     int minx, maxx, miny, maxy, use_rc, textured;
 } XfTri;
 
@@ -1924,11 +1986,28 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
             z = l0 * a[2] + l1 * b[2] + l2 * c[2];
             {
                 float *zp = T->zb ? &T->zb[(size_t)y * NV_ZBUF_W + x] : NULL;
+                uint8_t *sp = T->sb ? &T->sb[(size_t)y * NV_ZBUF_W + x] : NULL;
                 int shade = (s_gpu.color_mask & 0x01010101u) || s_gpu.alpha_test;
-                /* Depth test, then shade, then alpha test, and only then the
-                 * depth write: an alpha-tested texel that is cut away must
-                 * not leave its depth behind (foliage, fences). */
+                /* Stencil test, then depth test, then shade, then alpha
+                 * test, and only then the depth write: an alpha-tested texel
+                 * that is cut away must not leave its depth behind (foliage,
+                 * fences).
+                 * Stencil was ignored, and Alter Echo's tutorial popups stamp
+                 * the stencil buffer with a safe-area quad drawn with the
+                 * stencil func set to NEVER -- no colour at all, on hardware
+                 * -- which came out as a white box over the whole view.
+                 * ponytail: GL runs the alpha test before the stencil test,
+                 * so a fragment the alpha test kills should update neither;
+                 * here the fail and depth-fail ops have already run by then.
+                 * Matters only for alpha-tested geometry that writes
+                 * stencil. */
+                if (sp && !stencil_pass(*sp)) {
+                    stencil_update(sp, s_gpu.stencil_op_fail);
+                    continue;
+                }
                 if (zp && s_gpu.depth_test && !depth_pass(z, *zp)) {
+                    if (sp)
+                        stencil_update(sp, s_gpu.stencil_op_zfail);
                     cnt->depth_fail++;
                     continue;
                 }
@@ -1980,6 +2059,8 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
                 }
                 if (zp && s_gpu.depth_mask)
                     *zp = z;
+                if (sp)
+                    stencil_update(sp, s_gpu.stencil_op_zpass);
                 if (s_gpu.zpass_enable)
                     cnt->zpass++;
                 if (!(s_gpu.color_mask & 0x01010101u))
@@ -2283,6 +2364,8 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
         return;
     if (s_gpu.depth_test || s_gpu.depth_mask)
         T.zb = zbuf_current(1);
+    if (s_gpu.stencil_test)
+        T.sb = sbuf_current();
     if (tex_size_from_format(s_gpu.texs[0].color)) {
         su = (float)s_gpu.texs[0].width;
         sv = (float)s_gpu.texs[0].height;
@@ -2460,6 +2543,56 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
 
 static Nv2aVshOutput s_xf[NV_MAX_INDICES];
 
+/* Transformed vertices, by index, for the length of one draw.
+ *
+ * An indexed mesh names most vertices several times -- Alter Echo's level
+ * transforms three vertices for every distinct one -- and the program runs
+ * on the executor thread while the raster pool waits for it. Within a draw
+ * the attributes an index fetches and the program's constants cannot change,
+ * so the second run of a vertex is the first one's result; it is copied
+ * instead. RECOMP_VC_VERIFY=1 runs the program anyway and compares, as a
+ * check that this holds for a title. */
+#define NV_VC_BITS 12
+static struct { uint32_t index, gen; } s_vc_tag[1u << NV_VC_BITS];
+static Nv2aVshOutput s_vc_out[1u << NV_VC_BITS];
+static uint32_t s_vc_gen;
+
+static int transform_vertex(uint32_t index, Nv2aVshOutput *out);
+
+static int transform_indices(uint32_t n)
+{
+    static int verify = -1;
+    uint32_t i;
+
+    if (verify < 0)
+        verify = getenv("RECOMP_VC_VERIFY") != NULL;
+    if (++s_vc_gen == 0) {                    /* wrapped: forget everything */
+        memset(s_vc_tag, 0, sizeof s_vc_tag);
+        s_vc_gen = 1;
+    }
+    for (i = 0; i < n; i++) {
+        uint32_t idx = s_gpu.idx[i];
+        uint32_t slot = (idx * 2654435761u) >> (32 - NV_VC_BITS);
+        if (s_vc_tag[slot].gen == s_vc_gen && s_vc_tag[slot].index == idx) {
+            s_xf[i] = s_vc_out[slot];
+            if (verify) {
+                Nv2aVshOutput fresh;
+                static unsigned bad;
+                transform_vertex(idx, &fresh);
+                if (memcmp(&fresh, &s_xf[i], sizeof fresh) && bad++ < 5)
+                    fprintf(stderr, "[VC] index %u: cached vertex differs from a fresh run\n", idx);
+            }
+            continue;
+        }
+        if (!transform_vertex(idx, &s_xf[i]))
+            return 0;
+        s_vc_tag[slot].index = idx;
+        s_vc_tag[slot].gen = s_vc_gen;
+        s_vc_out[slot] = s_xf[i];
+    }
+    return 1;
+}
+
 static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
 {
     float in[NV2A_VSH_INPUTS][4];
@@ -2524,9 +2657,8 @@ static void raster_batch_program(void)
         s_prof.verts += n;
         s_prof.uniq += u;
     }
-    for (i = 0; i < n; i++)
-        if (!transform_vertex(s_gpu.idx[i], &s_xf[i]))
-            return;                                    /* no program loaded */
+    if (!transform_indices(n))
+        return;                                        /* no program loaded */
     if (s_prof.on)
         s_prof.xf += prof_lap();
     s_gpu.batches_program++;
@@ -3320,6 +3452,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     if (!inited) {
         inited = 1;
         s_gpu.color_mask = 0x01010101u;           /* all channels, as reset */
+        s_gpu.stencil_func = 0x207;               /* ALWAYS */
+        s_gpu.stencil_wmask = s_gpu.stencil_fmask = 0xFF;
+        s_gpu.stencil_op_fail = s_gpu.stencil_op_zfail
+                              = s_gpu.stencil_op_zpass = 0x1E00;   /* KEEP */
         {
             int i;
             for (i = 0; i < NV_VERTEX_ATTRS; i++)
@@ -3501,6 +3637,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         clear_surface(param);
         if (param & 0x01)                         /* Z */
             zbuf_clear();
+        if (param & 0x02)                         /* stencil */
+            sbuf_clear();
         break;
 
     case NV097_SET_BEGIN_END:
@@ -3672,6 +3810,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 
     /* Depth. */
     case 0x030C: s_gpu.depth_test = param; break; /* DEPTH_TEST_ENABLE */
+    case 0x032C: s_gpu.stencil_test = param; break;     /* STENCIL_TEST_ENABLE */
+    case 0x0360: s_gpu.stencil_wmask = param; break;    /* STENCIL_MASK */
+    case 0x0364: s_gpu.stencil_func = param; break;     /* STENCIL_FUNC */
+    case 0x0368: s_gpu.stencil_ref = param; break;      /* STENCIL_FUNC_REF */
+    case 0x036C: s_gpu.stencil_fmask = param; break;    /* STENCIL_FUNC_MASK */
+    case 0x0370: s_gpu.stencil_op_fail = param; break;  /* STENCIL_OP_FAIL */
+    case 0x0374: s_gpu.stencil_op_zfail = param; break; /* STENCIL_OP_ZFAIL */
+    case 0x0378: s_gpu.stencil_op_zpass = param; break; /* STENCIL_OP_ZPASS */
     case 0x0354: s_gpu.depth_func = param; break; /* DEPTH_FUNC */
     case 0x035C: s_gpu.depth_mask = param; break; /* DEPTH_MASK */
     case 0x0214: s_gpu.zeta_offset = param; break;/* SURFACE_ZETA_OFFSET */
