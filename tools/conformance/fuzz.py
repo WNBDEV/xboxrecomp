@@ -194,7 +194,152 @@ def _zeroing_case(rng: random.Random, index: int):
     )
 
 
-_FAMILIES = (_cmp_case, _arith_case, _incdec_case, _neg_case, _shift_case, _zeroing_case)
+# ---------------------------------------------------------------------------
+# Wider families. The originals cover flags from one producer to one SETcc;
+# the bugs a real title hit were elsewhere: a sign-extend from bp lifted as a
+# zero-extend (Bink's IDCT), signed conditions after an overflowing add. These
+# reach the register forms, multiply/divide, carry chains, partial registers
+# and multi-instruction flag tracking. eax is compared, so every body leaves
+# its answer there. ebp and esp stay out: the native side is a gcc frame.
+
+_BYTE_REGS = ("al", "cl", "dl", "bl", "ah", "ch", "dh", "bh")
+_WORD_REGS = ("ax", "cx", "dx", "bx", "si", "di")
+_PREFILL = ["mov ebx, ecx", "mov esi, eax", "mov edi, ecx", "xor edi, 0x5A5A5A5A"]
+# Conditions that are defined after a multiply (CF/OF only) or a bit test
+# (CF only): anything else reads an undefined flag, which the CPU does settle
+# but the lifter is free to settle differently.
+_CF_CONDS = ("b", "ae")
+
+
+def _movx_case(rng, index):
+    op = rng.choice(("movsx", "movzx"))
+    src = rng.choice(_BYTE_REGS + _WORD_REGS)
+    dst = rng.choice(("eax", "ecx", "edx", "ebx", "esi", "edi"))
+    body = _PREFILL + [f"{op} {dst}, {src}"]
+    if dst != "eax":
+        body.append(f"mov eax, {dst}")
+    return Case(f"fuzz_{index:04d}_{op}_{dst}_{src}",
+                f"fuzz: {op} {dst}, {src} (every register form)", body, _inputs(rng))
+
+
+def _mul_case(rng, index):
+    form = rng.choice(("imul eax, ecx", "imul ecx", "imul cx", "imul cl", "mul ecx",
+                       "mul cx", "mul cl", "imul3"))
+    if form == "imul3":
+        imm = rng.choice((-128, -7, -1, 3, 127, 2896, -5352, 0x12345))
+        form = f"imul eax, ecx, {imm}"
+    want = rng.choice(("lo", "hi", "cf"))
+    body = [form]
+    if want == "hi":
+        body.append("mov eax, edx")
+    elif want == "cf":
+        body += [f"set{rng.choice(_CF_CONDS)} dl", "movzx eax, dl"]
+    return Case(f"fuzz_{index:04d}_mul_{want}", f"fuzz: {form}, {want}", body, _inputs(rng))
+
+
+def _carry_chain_case(rng, index):
+    width = rng.choice(tuple(_WIDTHS))
+    a, b = _WIDTHS[width]
+    first = rng.choice(("add", "sub", "cmp", "neg", "stc", "clc"))
+    body = [f"{first} {a}, {b}" if first in ("add", "sub", "cmp") else
+            (f"neg {a}" if first == "neg" else first)]
+    for _ in range(rng.randint(1, 3)):
+        body.append(f"{rng.choice(('adc', 'sbb'))} {a}, {b}")
+    if rng.random() < 0.5:
+        body += [f"set{rng.choice(('b', 'ae', 'z', 'nz', 's'))} dl", "movzx eax, dl"]
+    return Case(f"fuzz_{index:04d}_carry_chain_i{width}",
+                f"fuzz: {first} then adc/sbb chain, i{width}", body, _inputs(rng))
+
+
+_PARTIAL_OPS = ("mov ah, cl", "mov al, ch", "add al, cl", "sub ah, ch", "xor ah, al",
+                "and al, ch", "or ah, cl", "inc ah", "dec al", "neg ah", "not al",
+                "mov ax, cx", "add ax, cx", "xchg al, ah", "mov dh, al", "add dl, ah",
+                "shl ah, 1", "sar al, 1", "rol ax, 3", "movzx eax, ax", "movsx eax, ah",
+                "mov dx, ax", "sub dh, cl", "adc al, cl", "sbb ah, ch")
+
+
+def _partial_case(rng, index):
+    body = rng.sample(_PARTIAL_OPS, rng.randint(2, 5))
+    if rng.random() < 0.5:
+        body.append("mov eax, edx" if rng.random() < 0.3 else "add eax, edx")
+    return Case(f"fuzz_{index:04d}_partial", "fuzz: partial-register writes and reads",
+                body, _inputs(rng))
+
+
+def _bt_case(rng, index):
+    op = rng.choice(("bt", "bts", "btr", "btc"))
+    src = rng.choice(("ecx", str(rng.choice((0, 1, 7, 15, 16, 31)))))
+    want = rng.choice(("cf", "val"))
+    body = [f"{op} eax, {src}"]
+    if want == "cf":
+        body += [f"set{rng.choice(_CF_CONDS)} dl", "movzx eax, dl"]
+    return Case(f"fuzz_{index:04d}_{op}_{want}", f"fuzz: {op} eax, {src}", body, _inputs(rng))
+
+
+def _cmov_case(rng, index):
+    width = rng.choice(tuple(_WIDTHS))
+    a, b = _WIDTHS[width]
+    op = rng.choice(("cmp", "test", "sub", "add", "and", "xor"))
+    conds = _CONDS if op in ("cmp", "test") else _NON_CARRY_CONDS + ("b", "ae")
+    cond = rng.choice(conds)
+    body = ["mov edx, eax", f"{op} {a}, {b}", f"cmov{cond} edx, ecx", "mov eax, edx"]
+    return Case(f"fuzz_{index:04d}_{op}_cmov{cond}_i{width}",
+                f"fuzz: {op} i{width} then CMOV{cond.upper()}", body, _inputs(rng))
+
+
+def _shift_flags_case(rng, index):
+    width = rng.choice(tuple(_WIDTHS))
+    a, _ = _WIDTHS[width]
+    op = rng.choice(("shl", "shr", "sar"))
+    cnt = rng.choice([c for c in (1, 2, 3, 5, 7, 8, 15, 16, 31) if c < width] or [1])
+    cond = rng.choice(("b", "ae", "z", "nz", "s", "ns"))
+    body = [f"{op} {a}, {cnt}", f"set{cond} dl", "movzx eax, dl"]
+    return Case(f"fuzz_{index:04d}_{op}{cnt}_set{cond}_i{width}",
+                f"fuzz: flags after {op} i{width} by {cnt}", body, _inputs(rng))
+
+
+def _ext_case(rng, index):
+    body = [rng.choice(("cwde", "cbw", "cdq", "cwd", "bswap eax", "xchg al, ah",
+                        "xchg eax, ecx", "xadd eax, ecx", "not eax", "neg ax"))]
+    if body[0] in ("cdq", "cwd") and rng.random() < 0.5:
+        body.append("mov eax, edx")
+    return Case(f"fuzz_{index:04d}_{body[0].split()[0]}", f"fuzz: {body[0]}", body,
+                _inputs(rng))
+
+
+_CHAIN_OPS = ("add eax, ecx", "sub eax, ecx", "and eax, ecx", "or eax, ecx",
+              "xor eax, ecx", "add ecx, eax", "sub ecx, eax", "imul eax, ecx",
+              "shl eax, 3", "shr eax, 5", "sar eax, 7", "neg eax", "not ecx", "inc eax",
+              "dec ecx", "lea eax, [eax+ecx*2+5]", "lea ecx, [ecx*8-3]", "mov edx, eax",
+              "add edx, ecx", "sub eax, edx", "xor ecx, edx", "sar ecx, 31",
+              "and eax, 0xFFFF00FF", "add al, cl", "sub cx, ax")
+_CHAIN_SETTERS = ("add eax, ecx", "sub eax, ecx", "cmp eax, ecx", "test eax, ecx",
+                  "and eax, ecx", "xor ecx, eax", "add ecx, edx", "sub edx, eax",
+                  "cmp cx, ax", "sub al, cl", "inc eax", "dec ecx", "neg eax")
+
+
+def _chain_case(rng, index):
+    body = [rng.choice(_CHAIN_OPS) for _ in range(rng.randint(2, 6))]
+    setter = rng.choice(_CHAIN_SETTERS)
+    m = setter.split()[0]
+    if m in ("inc", "dec"):
+        conds = tuple(c for c in _CONDS if c not in ("b", "ae", "be", "a"))
+    elif m in ("and", "test", "xor"):
+        conds = _CONDS
+    else:
+        conds = _CONDS
+    cond = rng.choice(conds)
+    body += [setter, f"set{cond} dl", "movzx eax, dl"]
+    if rng.random() < 0.4:
+        body.insert(-2, rng.choice(_FLAG_PRESERVING_NOISE))
+    return Case(f"fuzz_{index:04d}_chain_{m}_set{cond}",
+                f"fuzz: random chain then {setter} feeding SET{cond.upper()}", body,
+                _inputs(rng))
+
+
+_FAMILIES = (_cmp_case, _arith_case, _incdec_case, _neg_case, _shift_case, _zeroing_case,
+             _movx_case, _mul_case, _carry_chain_case, _partial_case, _bt_case,
+             _cmov_case, _shift_flags_case, _ext_case, _chain_case)
 
 
 def generate_cases(count: int, seed: int) -> list[dict]:

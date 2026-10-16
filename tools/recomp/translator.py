@@ -1384,6 +1384,10 @@ class FunctionTranslator:
                 cc = m[3:]
             elif m.startswith("cmov") and len(m) > 4:
                 cc = m[4:]
+            if (cc in ("o", "no") and last_setter in ("mul", "imul")):
+                return True             # OF is CF after a multiply
+            if cc in ("b", "nae", "c", "ae", "nb", "nc") and last_setter in ("rol", "ror"):
+                return True             # the bit a rotate wrapped round
             if (cc in FunctionTranslator._CARRY_CC
                     and (last_setter in CF_TRACKED
                          or last_setter in ("inc", "dec")

@@ -337,7 +337,7 @@ COND_MAP = {
 # Instructions that set arithmetic flags (primary set, fully handled)
 FLAG_SETTERS = frozenset({
     "cmp", "test", "sub", "add", "and", "or", "xor",
-    "inc", "dec", "neg", "shl", "shr", "sar", "imul", "adc", "sbb",
+    "inc", "dec", "neg", "shl", "shr", "sar", "imul", "mul", "adc", "sbb",
     "comiss", "comisd", "ucomiss", "ucomisd",  # SSE float compare
 })
 
@@ -364,7 +364,7 @@ _RESULT_SNAPSHOT_SETTERS = frozenset({
 _RESULT_SRC_SETTERS = frozenset({"add", "sub"})
 
 CF_TRACKED = frozenset({
-    "add", "sub", "adc", "sbb", "shl", "shr", "sar",
+    "add", "sub", "adc", "sbb", "shl", "shr", "sar", "mul", "imul",
 })
 
 # bt reports CF without touching the operand, so its CF can be rebuilt at the
@@ -395,7 +395,7 @@ _EFLAGS_SETTERS = frozenset({
 
 # Instructions with undefined/unpredictable flags (clear tracking)
 _FLAGS_UNDEFINED = frozenset({
-    "mul", "div", "idiv",  # Flags partially undefined
+    "div", "idiv",  # Flags undefined
     "rdtsc", "cpuid",      # Special instructions
     "lock xadd",           # Lock prefix - complex flag behavior
     # popfd REPLACES every flag with whatever was pushed. Its flags are not
@@ -728,6 +728,16 @@ def _make_condition(jcc, flag_setter, flag_ops):
     # "edx < edx", always false. _cf is computed before the write, so it holds
     # for every operand shape, and the translator declares it exactly when a
     # branch like this one is going to read it.
+    # After a multiply CF and OF are the same bit -- the product overflowed
+    # its width -- and SF/ZF are undefined, so only the carry and overflow
+    # conditions have an answer.
+    if flag_setter in ("mul", "imul"):
+        if jcc in ("jb", "jnae", "jc", "jo"):
+            return "_cf", desc
+        if jcc in ("jae", "jnb", "jnc", "jno"):
+            return "!_cf", desc
+        return None
+
     if flag_setter in CF_TRACKED:
         if jcc in ("jb", "jnae", "jc"):
             return "_cf", desc
@@ -903,6 +913,27 @@ def _make_condition(jcc, flag_setter, flag_ops):
         return None
 
     # ── neg: flags from (0 - a_orig), result is -a ──
+    #
+    # Signed conditions compare 0 with a: less (SF != OF) holds exactly when
+    # a > 0. Reading the result's sign gets the one overflowing case wrong --
+    # neg of the most negative value, which stays negative with OF set -- and
+    # jbe/ja were not handled at all: CF is set unless a was zero, which is
+    # exactly when ZF is, so jbe always holds and ja never does. The fuzzer
+    # found both.
+    if flag_setter == "neg" and lhs == "_fa" and flag_ops:
+        width = _operand_width(flag_ops[0]) or 4
+        if width not in (1, 2, 4):
+            width = 4
+        mask = {1: "0xFFu", 2: "0xFFFFu", 4: "0xFFFFFFFFu"}[width]
+        sx = {1: "(int8_t)", 2: "(int16_t)", 4: "(int32_t)"}[width]
+        a_s = f"((int32_t){sx}((0u - _fa) & {mask}))"
+        signed = {"jl": f"({a_s} > 0)", "jnge": f"({a_s} > 0)",
+                  "jge": f"({a_s} <= 0)", "jnl": f"({a_s} <= 0)",
+                  "jle": f"({a_s} >= 0)", "jng": f"({a_s} >= 0)",
+                  "jg": f"({a_s} < 0)", "jnle": f"({a_s} < 0)",
+                  "jbe": "1", "jna": "1", "ja": "0", "jnbe": "0"}
+        if jcc in signed:
+            return signed[jcc], desc
     if flag_setter == "neg":
         if jcc in ("je", "jz"):
             return f"({lhs} == 0)", desc
@@ -955,7 +986,7 @@ def _make_condition(jcc, flag_setter, flag_ops):
     if flag_setter in ("rol", "ror", "rcl", "rcr"):
         # rcl/rcr leave their carry-out in _cf (RC_ROT writes it back), and
         # _function_needs_cf declares _cf for any function containing them.
-        if flag_setter in ("rcl", "rcr"):
+        if flag_setter in ("rcl", "rcr", "rol", "ror"):
             if jcc in ("jb", "jnae", "jc"):
                 return "_cf", desc
             if jcc in ("jae", "jnb", "jnc"):
@@ -1520,6 +1551,11 @@ class Lifter:
         # ── Misc ──
         if m == "cdq":
             return ["edx = ((int32_t)eax < 0) ? 0xFFFFFFFF : 0; /* cdq */"]
+        if m == "cwd":
+            # dx:ax = ax sign-extended; the top half of edx is untouched.
+            # Missing until the conformance fuzzer reached it: it lifted to
+            # recomp_unimpl, a silent no-op in a title.
+            return ["SET_LO16(edx, (LO16(eax) & 0x8000u) ? 0xFFFFu : 0u); /* cwd */"]
         if m == "cwde":
             return ["eax = SX16(eax); /* cwde */"]
         if m == "cbw":
@@ -1826,6 +1862,20 @@ class Lifter:
                     f"  /* {m} */",
                 ]
 
+        # xadd with a register destination, or a narrower memory one: not
+        # shared between threads the way the 32-bit memory form above is, so
+        # a plain sequence. Intel's order -- TEMP = SRC + DEST; SRC = DEST;
+        # DEST = TEMP -- so `xadd eax, eax` ends with the sum. These lifted
+        # to recomp_unimpl until the fuzzer reached them.
+        if atomic_m == "xadd" and len(ops) >= 2:
+            dst = _fmt_operand_read(ops[0])
+            src = _fmt_operand_read(ops[1])
+            return [
+                f"{{ uint32_t _xd = {dst}, _xs = {src};",
+                "  " + _fmt_operand_write(ops[1], "_xd"),
+                "  " + _fmt_operand_write(ops[0], "_xd + _xs") + " }" f"  /* {m} */",
+            ]
+
         # ── Unhandled ──
         #
         # Recorded, not merely commented -- see self.unimplemented.
@@ -2112,43 +2162,87 @@ class Lifter:
     def _lift_shrd(self, insn, ops):
         return self._lift_double_shift(insn, ops, "shrd")
 
+    # Multiply and divide at their operand's width.
+    #
+    # The one-operand forms used to be 32-bit whatever the operand: `mul cl`
+    # computed eax * cl into edx:eax where x86 computes al * cl into ax, and
+    # `mul cx` wrote edx:eax instead of dx:ax. And no multiply produced CF/OF,
+    # which x86 sets exactly when the product does not fit the destination's
+    # width -- so a jc/jo after one read whatever the previous instruction left.
+    # The conformance fuzzer found both (127 of 3,000 generated cases).
+    _MUL_SX = {1: "(int8_t)", 2: "(int16_t)", 4: "(int32_t)"}
+
     def _lift_imul(self, insn, ops):
         nops = len(ops)
+        cf = self.needs_cf
         if nops == 1:
-            # One operand: edx:eax = eax * ops[0]
+            w = _operand_width(ops[0]) or 4
             src = _fmt_operand_read(ops[0])
+            if w == 1:
+                return [f"{{ int32_t _r = (int32_t)(int8_t)LO8(eax) * (int32_t)(int8_t)({src});",
+                        "  SET_LO16(eax, (uint32_t)_r);"
+                        + (" _cf = (_r != (int32_t)(int8_t)_r);" if cf else "") + " } /* imul r/m8 */"]
+            if w == 2:
+                return [f"{{ int32_t _r = (int32_t)(int16_t)LO16(eax) * (int32_t)(int16_t)({src});",
+                        "  SET_LO16(eax, (uint32_t)_r); SET_LO16(edx, (uint32_t)_r >> 16);"
+                        + (" _cf = (_r != (int32_t)(int16_t)_r);" if cf else "") + " } /* imul r/m16 */"]
             return [
                 f"{{ int64_t _r = (int64_t)(int32_t)eax * (int64_t)(int32_t){src};",
-                f"  eax = (uint32_t)_r; edx = (uint32_t)(_r >> 32); }}"
+                f"  eax = (uint32_t)_r; edx = (uint32_t)(_r >> 32);"
+                + (" _cf = (_r != (int64_t)(int32_t)_r);" if cf else "") + " }"
             ]
-        elif nops == 2:
-            # Two operand: dst = dst * src
-            dst = _fmt_operand_read(ops[0])
-            src = _fmt_operand_read(ops[1])
-            return [_fmt_operand_write(ops[0], f"(uint32_t)((int32_t){dst} * (int32_t){src})")]
-        elif nops == 3:
-            # Three operand: dst = src1 * imm
-            src = _fmt_operand_read(ops[1])
-            imm = _fmt_operand_read(ops[2])
-            return [_fmt_operand_write(ops[0], f"(uint32_t)((int32_t){src} * (int32_t){imm})")]
+        if nops in (2, 3):
+            # dst = dst * src, or dst = src * imm, truncated to dst's width.
+            w = _operand_width(ops[0]) or 4
+            sx = self._MUL_SX.get(w, "(int32_t)")
+            a = _fmt_operand_read(ops[0] if nops == 2 else ops[1])
+            b = _fmt_operand_read(ops[1] if nops == 2 else ops[2])
+            if not cf:
+                return [_fmt_operand_write(ops[0], f"(uint32_t)((int32_t){sx}({a}) * (int32_t){sx}({b}))")]
+            return [f"{{ int64_t _r = (int64_t){sx}({a}) * (int64_t){sx}({b});",
+                    "  " + _fmt_operand_write(ops[0], "(uint32_t)_r"),
+                    f"  _cf = (_r != (int64_t){sx}_r); }} /* imul: CF=OF on overflow */"]
         return ["/* imul: unexpected form */"]
 
     def _lift_muldiv(self, insn, ops, m):
         if len(ops) < 1:
             return [f"/* {m}: no operand */"]
         src = _fmt_operand_read(ops[0])
+        w = _operand_width(ops[0]) or 4
+        cf = self.needs_cf
         if m == "mul":
+            if w == 1:
+                return [f"{{ uint32_t _r = (uint32_t)LO8(eax) * (uint32_t)(uint8_t)({src});",
+                        "  SET_LO16(eax, _r);" + (" _cf = (_r > 0xFFu);" if cf else "")
+                        + " } /* mul r/m8 */"]
+            if w == 2:
+                return [f"{{ uint32_t _r = (uint32_t)LO16(eax) * (uint32_t)(uint16_t)({src});",
+                        "  SET_LO16(eax, _r); SET_LO16(edx, _r >> 16);"
+                        + (" _cf = (_r > 0xFFFFu);" if cf else "") + " } /* mul r/m16 */"]
             return [
                 f"{{ uint64_t _r = (uint64_t)eax * (uint64_t){src};",
-                f"  eax = (uint32_t)_r; edx = (uint32_t)(_r >> 32); }}"
+                f"  eax = (uint32_t)_r; edx = (uint32_t)(_r >> 32);"
+                + (" _cf = (edx != 0);" if cf else "") + " }"
             ]
         elif m == "div":
+            if w == 1:
+                return [f"{{ uint32_t _n = LO16(eax), _d = (uint8_t)({src});",
+                        "  SET_LO8(eax, _n / _d); SET_HI8(eax, _n % _d); } /* div r/m8 */"]
+            if w == 2:
+                return [f"{{ uint32_t _n = ((uint32_t)LO16(edx) << 16) | LO16(eax), _d = (uint16_t)({src});",
+                        "  SET_LO16(eax, _n / _d); SET_LO16(edx, _n % _d); } /* div r/m16 */"]
             return [
                 f"{{ uint64_t _dividend = ((uint64_t)edx << 32) | eax;",
                 f"  eax = (uint32_t)(_dividend / (uint32_t){src});",
                 f"  edx = (uint32_t)(_dividend % (uint32_t){src}); }}"
             ]
         elif m == "idiv":
+            if w == 1:
+                return [f"{{ int32_t _n = (int16_t)LO16(eax), _d = (int8_t)({src});",
+                        "  SET_LO8(eax, (uint32_t)(_n / _d)); SET_HI8(eax, (uint32_t)(_n % _d)); } /* idiv r/m8 */"]
+            if w == 2:
+                return [f"{{ int32_t _n = (int32_t)(((uint32_t)LO16(edx) << 16) | LO16(eax)), _d = (int16_t)({src});",
+                        "  SET_LO16(eax, (uint32_t)(_n / _d)); SET_LO16(edx, (uint32_t)(_n % _d)); } /* idiv r/m16 */"]
             return [
                 f"{{ int64_t _dividend = ((int64_t)(int32_t)edx << 32) | eax;",
                 f"  eax = (uint32_t)((int32_t)(_dividend / (int32_t){src}));",
@@ -2266,7 +2360,17 @@ class Lifter:
         bits = (_operand_width(ops[0]) or 4) * 8
         suffix = {8: "8", 16: "16"}.get(bits, "32")
         func = ("ROL" if m == "rol" else "ROR") + suffix
-        return [_fmt_operand_write(ops[0], f"{func}({dst}, {cnt})")]
+        out = [_fmt_operand_write(ops[0], f"{func}({dst}, {cnt})")]
+        if self.needs_cf:
+            # CF is the bit that wrapped round -- bit 0 of the result after
+            # rol, the top bit after ror -- unless the masked count is zero,
+            # which leaves every flag alone. Not written before, so an adc
+            # after a rotate added the carry of whatever preceded it (fuzz).
+            res = _fmt_operand_read(ops[0])
+            bit = "1u" if m == "rol" else f"{bits - 1}"
+            take = f"(({res}) & 1u)" if m == "rol" else f"((({res}) >> {bit}) & 1u)"
+            out.append(f"if (({cnt}) & 31u) _cf = (int){take};")
+        return out
 
     # ── Compare / Test (standalone) ──
 

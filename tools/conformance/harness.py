@@ -85,7 +85,7 @@ _GLOBALS = ("g_scratch_ptr", "g_out_eax", "g_out_xmm", "g_out_st",
             "g_out_sw", "g_fp_cw", "g_in_a", "g_in_b")
 
 _CLOBBER = {
-    "gpr": '"eax","ecx","edx","cc","memory"',
+    "gpr": '"eax","ecx","edx","ebx","esi","edi","cc","memory"',
     "fpu": '"eax","ecx","edx","cc","memory",'
            '"st","st(1)","st(2)","st(3)","st(4)","st(5)","st(6)","st(7)"',
     "sse": '"eax","ecx","edx","cc","memory",'
@@ -158,6 +158,10 @@ volatile uint32_t g_icall_trace[16]; volatile uint32_t g_icall_trace_idx;
 volatile uint64_t g_icall_count;
 ptrdiff_t g_xbox_mem_offset;
 void recomp_icall_fail_log(uint32_t va) { (void)va; }
+/* An instruction the lifter has no translation for runs as a no-op in a
+   title. Here it is a link error that hides every other result, so define it
+   and let the comparison report the case as wrong. */
+void recomp_unimpl(const char *text, uint32_t va) { (void)text; (void)va; }
 
 extern unsigned int g_in_a, g_in_b;
 extern unsigned int g_out_eax;

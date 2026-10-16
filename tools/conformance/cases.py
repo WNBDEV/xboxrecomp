@@ -569,3 +569,28 @@ CASES.extend([
     Case("mmx_por", "packed or",
          _MMX_PAIR + ['por mm0, mm1'] + _MMX_OUT, _PAIRS),
 ])
+
+# Found by the widened fuzzer (fuzz.py families _mul_case, _ext_case,
+# _partial_case, _chain_case) and fixed in the lifter: narrow one-operand
+# multiplies were evaluated at 32 bits, no multiply produced CF/OF, neg's
+# signed and jbe/ja conditions were wrong, rotates left CF stale, and cwd and
+# register-form xadd lifted to nothing.
+CASES.extend([
+    Case("mul_r8", "mul cl: ax = al * cl, upper eax kept", ["mul cl"], _PAIRS),
+    Case("imul_r16_hi", "imul cx: dx:ax, high half", ["imul cx", "mov eax, edx"], _PAIRS),
+    Case("mul_cf", "CF after mul: the product needs edx",
+         ["mul ecx", "setc dl", "movzx eax, dl"], _PAIRS),
+    Case("imul_cf", "CF after two-operand imul: signed overflow",
+         ["imul eax, ecx", "setc dl", "movzx eax, dl"], _PAIRS),
+    Case("div_r8", "div cl: al quotient, ah remainder of ax",
+         ["and eax, 0x3FFF", "or ecx, 0x40", "div cl"], _PAIRS),
+    Case("neg_setl", "neg of the most negative value: SF and OF both set",
+         ["neg eax", "setl dl", "movzx eax, dl"], _PAIRS),
+    Case("neg_setbe", "neg then jbe/setbe always holds",
+         ["neg eax", "setbe dl", "movzx eax, dl"], _PAIRS),
+    Case("rol_adc", "the bit a rotate wrapped round, read by adc",
+         ["rol ax, 3", "mov ax, cx", "adc al, cl"], _PAIRS),
+    Case("cwd", "dx:ax = sign-extended ax", ["cwd", "mov eax, edx"], _PAIRS),
+    Case("xadd_reg", "xadd eax, ecx: eax = sum, ecx = old eax",
+         ["xadd eax, ecx", "sub eax, ecx"], _PAIRS),
+])
