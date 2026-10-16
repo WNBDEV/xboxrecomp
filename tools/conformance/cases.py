@@ -513,3 +513,59 @@ for _name, _setup, _count, _copy, _result in (
         ("rep_copy_zero", ["mov esi, eax", "lea edi, [eax+16]"], 0, "rep movsd", "mov eax, [edi]")):
     CASES.append(Case(_name, "REP copy preserves element order, direction and count",
         ["cld"] + _setup + ["mov ecx, %d" % _count, _copy, "cld", _result], _SSE, "sse"))
+
+# Multiply, divide and double shifts in the forms a video decoder's
+# dequantiser, IDCT and bit reader use. Bink's block decode is plain integer
+# code (imul/sar/shr/shl/shrd/mul/div/sbb), and none of shrd, one-operand
+# mul/imul, imul with an immediate or div had a case of its own.
+_MMX_PAIR = ['push eax', 'push ecx', 'push eax', 'push ecx', 'movq mm0, qword ptr [esp]',
+             'push eax', 'push eax', 'push ecx', 'push ecx', 'movq mm1, qword ptr [esp]',
+             'add esp, 32']
+_MMX_OUT = ['push 0', 'push 0', 'movq qword ptr [esp], mm0', 'mov eax, dword ptr [esp+0]',
+            'add esp, 8', 'emms']
+CASES.extend([
+    Case("shrd_imm", "double-precision shift right by an immediate",
+         ["shrd eax, ecx, 5"], _PAIRS),
+    Case("shrd_imm_31", "shrd at the top of its range",
+         ["shrd eax, ecx, 31"], _PAIRS),
+    Case("shrd_cl", "shrd by CL, count masked to five bits",
+         ["mov edx, ecx", "shrd eax, edx, cl"], _PAIRS),
+    Case("shld_cl", "shld by CL, count masked to five bits",
+         ["mov edx, ecx", "shld eax, edx, cl"], _PAIRS),
+    Case("mul_hi", "unsigned 32x32 -> 64, high half",
+         ["mul ecx", "mov eax, edx"], _PAIRS),
+    Case("mul_lo", "unsigned 32x32 -> 64, low half",
+         ["mul ecx"], _PAIRS),
+    Case("imul1_hi", "signed one-operand multiply, high half",
+         ["imul ecx", "mov eax, edx"], _PAIRS),
+    Case("imul3_imm16", "three-operand imul with a 32-bit immediate",
+         ["imul eax, ecx, 2896"], _PAIRS),
+    Case("imul3_imm8_neg", "three-operand imul with a sign-extended imm8",
+         ["imul eax, ecx, -7"], _PAIRS),
+    Case("imul_sar11", "fixed-point multiply then arithmetic shift (an IDCT step)",
+         ["imul eax, ecx", "sar eax, 11"], _PAIRS),
+    Case("sar_imm31", "arithmetic shift by 31: the sign mask",
+         ["sar eax, 31"], _PAIRS),
+    Case("shr_imm_flags", "CF from a shift by an immediate, read by adc",
+         ["shr eax, 3", "adc ecx, 0", "mov eax, ecx"], _PAIRS),
+    Case("div_u", "unsigned divide, quotient",
+         ["xor edx, edx", "div ecx"], _PAIRS),
+    Case("div_u_rem", "unsigned divide, remainder",
+         ["xor edx, edx", "div ecx", "mov eax, edx"], _PAIRS),
+    Case("cmp_sbb_mask", "cmp then sbb reg,reg: all ones when below",
+         ["cmp eax, ecx", "sbb eax, eax"], _PAIRS),
+    Case("cmp_adc", "cmp then adc: add the borrow",
+         ["cmp ecx, eax", "adc eax, 0"], _PAIRS),
+    Case("sub16_movzx", "16-bit subtract keeps the upper half",
+         ["sub ax, cx"], _PAIRS),
+    Case("movsx_ax", "sign-extend a word in place",
+         ["movsx eax, ax"], _PAIRS),
+    Case("mmx_psubusw", "packed word subtract, unsigned saturation",
+         _MMX_PAIR + ['psubusw mm0, mm1'] + _MMX_OUT, _PAIRS),
+    Case("mmx_psllq", "quadword shift left",
+         _MMX_PAIR + ['psllq mm0, 13'] + _MMX_OUT, _PAIRS),
+    Case("mmx_punpckhwd", "interleave high words",
+         _MMX_PAIR + ['punpckhwd mm0, mm1'] + _MMX_OUT, _PAIRS),
+    Case("mmx_por", "packed or",
+         _MMX_PAIR + ['por mm0, mm1'] + _MMX_OUT, _PAIRS),
+])
