@@ -257,6 +257,7 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_FLIP_INCREMENT_WRITE        0x012C
 #define NV097_FLIP_STALL                  0x0130
 #define NV097_ARRAY_ELEMENT16             0x1800
+#define NV097_ARRAY_ELEMENT32             0x1808
 /* Draw a run of vertices straight out of the arrays, with no index list:
  * bits 0..23 are the first vertex, bits 24..31 the count minus one. It may
  * appear several times inside one BEGIN_END to draw a longer run. */
@@ -319,7 +320,7 @@ typedef struct {
 static struct {
     VertexAttr attr[NV_VERTEX_ATTRS];
     uint32_t   prim;                    /* SET_BEGIN_END parameter, 0 = ended */
-    uint16_t   idx[NV_MAX_INDICES];
+    uint32_t   idx[NV_MAX_INDICES];
     uint32_t   idx_count;
     /* INLINE_ARRAY payload: vertices written straight into the pushbuffer
      * instead of into a buffer the title points at. Same vertex format, a
@@ -680,7 +681,9 @@ static void dump_surface_bmp(void)
     uint8_t hdr[54];
     FILE *f;
 
-    if (!prefix || !w || !h || (bpp != 2 && bpp != 4) || !offset)
+    /* Empty is off too: RECOMP_FB_DUMP= wrote numbered dumps into the
+     * working directory under no prefix at all. */
+    if (!prefix || !*prefix || !w || !h || (bpp != 2 && bpp != 4) || !offset)
         return;
 
     row_bytes = w * 3;
@@ -2005,6 +2008,34 @@ typedef struct { uint64_t depth_fail, pixels; uint32_t zpass; } XfCount;
 static int s_wprobe_on, s_wprobe[4];
 static DWORD s_wprobe_from;               /* RECOMP_WHITE_PROBE_MS: not before */
 
+/* RECOMP_WHITE_PROBE_FLAG=<file>: report only while the file exists, and
+ * start the count afresh each time it appears -- so a probe can be aimed at
+ * one shot of a cutscene whose timing drifts from run to run. Checked a few
+ * times a second, not per pixel. */
+static int white_probe_gate(volatile LONG *shown)
+{
+    static const char *flag = (const char *)-1;
+    static DWORD checked;
+    static int open_now;
+    DWORD now;
+    if (flag == (const char *)-1)
+        flag = getenv("RECOMP_WHITE_PROBE_FLAG");
+    if (!flag)
+        return 1;
+    now = GetTickCount();
+    if (now - checked > 200) {
+        FILE *f = fopen(flag, "rb");
+        int was = open_now;
+        checked = now;
+        open_now = f != NULL;
+        if (f)
+            fclose(f);
+        if (open_now && !was)
+            InterlockedExchange(shown, 0);
+    }
+    return open_now;
+}
+
 static void white_probe(const XfTri *T, int x, int y, uint32_t argb)
 {
     static uint32_t last_draw = 0xFFFFFFFFu;
@@ -2012,6 +2043,8 @@ static void white_probe(const XfTri *T, int x, int y, uint32_t argb)
     const Nv2aVshOutput *v[3] = { T->va, T->vb, T->vc };
     int k;
 
+    if (!white_probe_gate(&shown))
+        return;
     if ((s_wprobe_on == 1 && (argb & 0x00F0F0F0u) != 0x00F0F0F0u)
             || x < s_wprobe[0] || y < s_wprobe[1]
             || x >= s_wprobe[2] || y >= s_wprobe[3] || s_gpu.draws == last_draw
@@ -2865,12 +2898,69 @@ static void gpu_vertex(const Nv2aVshOutput *v, Nv2aGpuVertex *o)
 /* The batch as a triangle list for the GPU: the same assembly as the
  * software path's switch, without its per-triangle clipping, which the GPU
  * does in clip space. */
+/* RECOMP_TRI_PROBE=x,y: inside the frame RECOMP_FRAME_TRACE traces, every
+ * triangle gpu_draw_batch hands the GPU (so with RECOMP_GPU_VS=0, where the
+ * CPU transforms) that covers pixel x,y -- its vertices as transformed and
+ * the raw attributes they came from. A triangle in the wrong place or with
+ * the wrong texture coordinates says here whether the title's vertex data or
+ * the transform made it so. */
+static void tri_probe(uint32_t a, uint32_t b, uint32_t c)
+{
+    static int px = -2, py, shown;
+    const uint32_t v[3] = { a, b, c };
+    float X, Y, e0, e1, e2;
+    const float *p0, *p1, *p2;
+    int k, i;
+
+    if (px == -2) {
+        const char *e = getenv("RECOMP_TRI_PROBE");
+        px = -1;
+        if (e && sscanf(e, "%d,%d", &px, &py) != 2)
+            px = -1;
+    }
+    if (px < 0 || s_ftrace != 2 || shown >= 200)
+        return;
+    p0 = s_xf[a].pos; p1 = s_xf[b].pos; p2 = s_xf[c].pos;
+    /* A triangle reaching behind the eye has no meaningful screen-space
+     * shape; the rasteriser clips it, and a coverage test here would only
+     * report its projection. */
+    if (!(p0[3] > 0.0f && p1[3] > 0.0f && p2[3] > 0.0f))
+        return;
+    X = (float)px + 0.5f; Y = (float)py + 0.5f;
+    e0 = (p1[0] - p0[0]) * (Y - p0[1]) - (p1[1] - p0[1]) * (X - p0[0]);
+    e1 = (p2[0] - p1[0]) * (Y - p1[1]) - (p2[1] - p1[1]) * (X - p1[0]);
+    e2 = (p0[0] - p2[0]) * (Y - p2[1]) - (p0[1] - p2[1]) * (X - p2[0]);
+    if (!((e0 >= 0 && e1 >= 0 && e2 >= 0) || (e0 <= 0 && e1 <= 0 && e2 <= 0)))
+        return;
+    shown++;
+    fprintf(stderr, "[TPROBE] draw %u prim %u covers %d,%d | tex0 %s %08X %ux%u fmt %02X"
+            " | depth %u func %X | cull %u/%X/%X\n", s_gpu.draws, s_gpu.prim, px, py,
+            s_gpu.texs[0].valid ? "on" : "off", s_gpu.texs[0].offset,
+            s_gpu.texs[0].width, s_gpu.texs[0].height, s_gpu.texs[0].color,
+            s_gpu.depth_test, s_gpu.depth_func, s_gpu.cull_enable, s_gpu.cull_face,
+            s_gpu.front_face);
+    for (k = 0; k < 3; k++) {
+        const Nv2aVshOutput *o = &s_xf[v[k]];
+        fprintf(stderr, "[TPROBE]   v%d idx %u pos %.1f %.1f %.0f w %.3g d0 %.2f %.2f %.2f"
+                " t0 %.4f %.4f t1 %.4f %.4f\n", k, s_gpu.idx[v[k]], o->pos[0], o->pos[1],
+                o->pos[2], o->pos[3], o->d0[0], o->d0[1], o->d0[2], o->tex[0][0],
+                o->tex[0][1], o->tex[1][0], o->tex[1][1]);
+        for (i = 0; i < NV_VERTEX_ATTRS; i++) {
+            float in[4];
+            if (!s_gpu.attr[i].size || !fetch_attr(&s_gpu.attr[i], s_gpu.idx[v[k]], in))
+                continue;
+            fprintf(stderr, "[TPROBE]      in v%d fmt %X x%u: %g %g %g %g\n", i,
+                    s_gpu.attr[i].type, s_gpu.attr[i].size, in[0], in[1], in[2], in[3]);
+        }
+    }
+}
+
 static void gpu_draw_batch(uint32_t n)
 {
     static Nv2aGpuVertex out[NV_MAX_INDICES * 3];
     Nv2aGpuState g;
     uint32_t i, k = 0;
-#define GPU_TRI(a, b, c) do { gpu_vertex(&s_xf[a], &out[k++]); \
+#define GPU_TRI(a, b, c) do { tri_probe(a, b, c); gpu_vertex(&s_xf[a], &out[k++]); \
         gpu_vertex(&s_xf[b], &out[k++]); gpu_vertex(&s_xf[c], &out[k++]); } while (0)
 
     switch (s_gpu.prim) {
@@ -3327,9 +3417,10 @@ static void frame_trace_flip(void)
     }
 }
 
-/* Without a swap chain to wait on (RECOMP_GPU=0, or no window), nothing
- * held flips to the display's rate: light scenes ran at 66 fps and menus at
- * 100, where the console shows 60. This caps flips at RECOMP_FLIP_HZ (60;
+/* Without a swap chain to wait on (RECOMP_GPU=0, no window, or a window
+ * the compositor is not showing), nothing held flips to the display's rate:
+ * light scenes ran at 66 fps and menus at 100-150, where the console shows
+ * 60. This caps flips at RECOMP_FLIP_HZ (60;
  * 0 for none) on average. Up to two frames of slack are banked, so a frame
  * that runs late is followed by one that does not wait, and a scene at 40
  * fps stays at 40 rather than dropping to 30 as strict vsync would. */
@@ -3376,6 +3467,17 @@ static int fb_copy_due(void)
         every = e ? atoi(e) : (d && *d ? 4 : 0);
     }
     return every > 0 && (++n % (unsigned)every) == 0;
+}
+
+/* A batch with more indices than NV_MAX_INDICES loses the rest. None of
+ * Alter Echo's do (1964 at most), but losing triangles silently is how the
+ * missing ELEMENT32 went unnoticed for so long, so say so. */
+static void index_overflow(void)
+{
+    static unsigned n;
+    if (n++ < 3)
+        fprintf(stderr, "[GPU] batch over %u indices: the rest are dropped\n",
+                NV_MAX_INDICES);
 }
 
 static void draw_primitive(void)
@@ -4168,16 +4270,34 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         if (!s_gpu.prim)
             break;
         for (i = 0; i < count && s_gpu.idx_count < NV_MAX_INDICES; i++)
-            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(start + i);
+            s_gpu.idx[s_gpu.idx_count++] = start + i;
+        if (i < count)
+            index_overflow();
         break;
     }
 
     case NV097_ARRAY_ELEMENT16:
         /* Two 16-bit indices per parameter word. */
         if (s_gpu.prim && s_gpu.idx_count + 2 <= NV_MAX_INDICES) {
-            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param & 0xFFFF);
-            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param >> 16);
+            s_gpu.idx[s_gpu.idx_count++] = param & 0xFFFF;
+            s_gpu.idx[s_gpu.idx_count++] = param >> 16;
+        } else if (s_gpu.prim) {
+            index_overflow();
         }
+        break;
+
+    case NV097_ARRAY_ELEMENT32:
+        /* One 32-bit index. XDK D3D sends indices in pairs with ELEMENT16
+         * and an odd count's last one with this. Unhandled, every indexed
+         * draw with an odd count lost its final index -- the last triangle
+         * of the batch -- and Alter Echo's meshes had holes: a missing
+         * lower-eyelid triangle let Nevin's brown iris show through his
+         * cheek, and wedges went missing from cutscene scenery. 25,000 of
+         * them in a minute of play. */
+        if (s_gpu.prim && s_gpu.idx_count < NV_MAX_INDICES)
+            s_gpu.idx[s_gpu.idx_count++] = param;
+        else if (s_gpu.prim)
+            index_overflow();
         break;
 
     case NV097_SET_FLIP_READ:
@@ -4246,8 +4366,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     nv2a_gpu_sync(va, pitch * (s_gpu.drawn_y + s_gpu.drawn_h));
                     xbox_FramebufferWindowPresent(va, pitch);
                 }
-                if (!shown)
-                    flip_pace();
+                /* Also behind the swap chain: vsync stops pacing when the
+                 * window is hidden or minimised -- the compositor drops the
+                 * frames -- and menus then ran at 150 fps. At 59.96 Hz the
+                 * swap chain's own interval is longer than this cap's, so
+                 * while the window is visible this never waits. */
+                flip_pace();
             }
             nv2a_gpu_frame();
         }
