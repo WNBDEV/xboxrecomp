@@ -295,7 +295,11 @@ typedef struct {
 } VertexAttr;
 
 #define NV_VERTEX_ATTRS 16
-#define NV_MAX_INDICES  4096
+/* Indices in one BEGIN/END batch. Was 4096: Alter Echo's "Surface" level
+ * draws terrain chunks of more than that, everything past the limit was
+ * dropped, and the sky backdrop showed through the holes as large flat white
+ * areas. A D3D8 index buffer addresses at most 65,536 vertices. */
+#define NV_MAX_INDICES  65536
 #define NV_MAX_INLINE   65536           /* dwords of INLINE_ARRAY per batch */
 
 /* Texture stage 0, decoded from what the title programmed.
@@ -2980,30 +2984,71 @@ static void tri_probe(uint32_t a, uint32_t b, uint32_t c)
     if (px < 0 || s_ftrace != 2 || shown >= 200)
         return;
     p0 = s_xf[a].pos; p1 = s_xf[b].pos; p2 = s_xf[c].pos;
-    /* A triangle reaching behind the eye has no meaningful screen-space
-     * shape; the rasteriser clips it, and a coverage test here would only
-     * report its projection. */
-    if (!(p0[3] > 0.0f && p1[3] > 0.0f && p2[3] > 0.0f))
-        return;
-    X = (float)px + 0.5f; Y = (float)py + 0.5f;
-    e0 = (p1[0] - p0[0]) * (Y - p0[1]) - (p1[1] - p0[1]) * (X - p0[0]);
-    e1 = (p2[0] - p1[0]) * (Y - p1[1]) - (p2[1] - p1[1]) * (X - p1[0]);
-    e2 = (p0[0] - p2[0]) * (Y - p2[1]) - (p0[1] - p2[1]) * (X - p2[0]);
-    if (!((e0 >= 0 && e1 >= 0 && e2 >= 0) || (e0 <= 0 && e1 <= 0 && e2 <= 0)))
-        return;
+    (void)e0; (void)e1; (void)e2;
+    /* Coverage the way the GPU decides it: back to clip space (as the D3D11
+     * path does), clipped against w > 0, then projected. A triangle that
+     * reaches behind the eye still covers what its in-front part covers. */
+    {
+        float cv[3][3], poly[8][3], tmp[8][3];
+        int n = 3, m, i2, k2, inside = 1, sgn = 0;
+        const float *pp[3] = { p0, p1, p2 };
+        float sw = 640.0f, sh = 480.0f;
+        for (k2 = 0; k2 < 3; k2++) {
+            float w = pp[k2][3];
+            cv[k2][0] = (pp[k2][0] * 2.0f / sw - 1.0f) * w;
+            cv[k2][1] = (1.0f - pp[k2][1] * 2.0f / sh) * w;
+            cv[k2][2] = w;
+            memcpy(poly[k2], cv[k2], sizeof cv[k2]);
+        }
+        m = 0;
+        for (i2 = 0; i2 < n; i2++) {
+            const float *A = poly[i2], *B = poly[(i2 + 1) % n];
+            int ain = A[2] > 1e-3f, bin = B[2] > 1e-3f;
+            if (ain)
+                memcpy(tmp[m++], A, sizeof tmp[0]);
+            if (ain != bin) {
+                float t = (1e-3f - A[2]) / (B[2] - A[2]);
+                for (k2 = 0; k2 < 3; k2++)
+                    tmp[m][k2] = A[k2] + (B[k2] - A[k2]) * t;
+                m++;
+            }
+        }
+        if (m < 3)
+            return;
+        X = ((float)px + 0.5f) * 2.0f / sw - 1.0f;
+        Y = 1.0f - ((float)py + 0.5f) * 2.0f / sh;
+        for (i2 = 0; i2 < m; i2++) {
+            const float *A = tmp[i2], *B = tmp[(i2 + 1) % m];
+            float ax = A[0] / A[2], ay = A[1] / A[2], bx = B[0] / B[2], by = B[1] / B[2];
+            float e = (bx - ax) * (Y - ay) - (by - ay) * (X - ax);
+            int s2 = e > 0 ? 1 : (e < 0 ? -1 : 0);
+            if (s2 && sgn && s2 != sgn) { inside = 0; break; }
+            if (s2) sgn = s2;
+        }
+        if (!inside)
+            return;
+    }
     shown++;
     fprintf(stderr, "[TPROBE] draw %u prim %u covers %d,%d | tex0 %s %08X %ux%u fmt %02X"
-            " | depth %u func %X | cull %u/%X/%X\n", s_gpu.draws, s_gpu.prim, px, py,
+            " | depth %u func %X | cull %u/%X/%X | fog %u mode %X p %g %g colour %08X"
+            " | blend %u %X/%X\n", s_gpu.draws, s_gpu.prim, px, py,
             s_gpu.texs[0].valid ? "on" : "off", s_gpu.texs[0].offset,
             s_gpu.texs[0].width, s_gpu.texs[0].height, s_gpu.texs[0].color,
             s_gpu.depth_test, s_gpu.depth_func, s_gpu.cull_enable, s_gpu.cull_face,
-            s_gpu.front_face);
+            s_gpu.front_face, s_gpu.fog_enable, s_gpu.fog_mode, s_gpu.fog_param[0],
+            s_gpu.fog_param[1], s_gpu.fog_color, s_gpu.blend_enable,
+            s_gpu.blend_sfactor, s_gpu.blend_dfactor);
     for (k = 0; k < 3; k++) {
         const Nv2aVshOutput *o = &s_xf[v[k]];
-        fprintf(stderr, "[TPROBE]   v%d idx %u pos %.1f %.1f %.0f w %.3g d0 %.2f %.2f %.2f"
-                " t0 %.4f %.4f t1 %.4f %.4f\n", k, s_gpu.idx[v[k]], o->pos[0], o->pos[1],
-                o->pos[2], o->pos[3], o->d0[0], o->d0[1], o->d0[2], o->tex[0][0],
-                o->tex[0][1], o->tex[1][0], o->tex[1][1]);
+        fprintf(stderr, "[TPROBE]   v%d idx %u pos %.1f %.1f %.0f w %.3g d0 %.2f %.2f %.2f %.2f"
+                " d1 %.2f %.2f %.2f %.2f fog %.3f\n", k, s_gpu.idx[v[k]], o->pos[0], o->pos[1],
+                o->pos[2], o->pos[3], o->d0[0], o->d0[1], o->d0[2], o->d0[3],
+                o->d1[0], o->d1[1], o->d1[2], o->d1[3], o->fog[0]);
+        fprintf(stderr, "[TPROBE]      t0 %g %g %g %g | t1 %g %g %g %g | t2 %g %g %g %g | t3 %g %g %g %g\n",
+                o->tex[0][0], o->tex[0][1], o->tex[0][2], o->tex[0][3],
+                o->tex[1][0], o->tex[1][1], o->tex[1][2], o->tex[1][3],
+                o->tex[2][0], o->tex[2][1], o->tex[2][2], o->tex[2][3],
+                o->tex[3][0], o->tex[3][1], o->tex[3][2], o->tex[3][3]);
         for (i = 0; i < NV_VERTEX_ATTRS; i++) {
             float in[4];
             if (!s_gpu.attr[i].size || !fetch_attr(&s_gpu.attr[i], s_gpu.idx[v[k]], in))
@@ -3073,7 +3118,9 @@ static int gpu_draw_batch_program(uint32_t n)
 {
     static float attr[NV_MAX_INDICES][16][4];
     static uint32_t local[NV_MAX_INDICES], tri[NV_MAX_INDICES * 3];
-    static struct { uint32_t index, gen, slot; } map[1u << 13];
+    /* Open addressing, kept under half full: up to NV_MAX_INDICES distinct
+     * indices in 2^17 slots. */
+    static struct { uint32_t index, gen, slot; } map[1u << 17];
     static uint32_t gen;
     static int on = -1;
     Nv2aGpuState g;
@@ -3091,7 +3138,7 @@ static int gpu_draw_batch_program(uint32_t n)
         gen = 1;
     }
     for (i = 0; i < n; i++) {
-        uint32_t idx = s_gpu.idx[i], h = (idx * 2654435761u) >> 19;
+        uint32_t idx = s_gpu.idx[i], h = (idx * 2654435761u) >> 15;
         for (;;) {
             if (map[h].gen != gen) {
                 map[h].gen = gen;
@@ -3105,7 +3152,7 @@ static int gpu_draw_batch_program(uint32_t n)
             }
             if (map[h].index == idx)
                 break;
-            h = (h + 1) & ((1u << 13) - 1);
+            h = (h + 1) & ((1u << 17) - 1);
         }
         local[i] = map[h].slot;
     }
@@ -3528,9 +3575,9 @@ static int fb_copy_due(void)
     return every > 0 && (++n % (unsigned)every) == 0;
 }
 
-/* A batch with more indices than NV_MAX_INDICES loses the rest. None of
- * Alter Echo's do (1964 at most), but losing triangles silently is how the
- * missing ELEMENT32 went unnoticed for so long, so say so. */
+/* A batch with more indices than NV_MAX_INDICES loses the rest. Losing
+ * triangles silently is how the missing ELEMENT32 went unnoticed for so long,
+ * and this warning is what found the 4096 limit cutting terrain apart. */
 static void index_overflow(void)
 {
     static unsigned n;
