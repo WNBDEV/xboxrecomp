@@ -111,6 +111,41 @@ class _Container:
             self.cid = None
 
 
+class _Local:
+    """The container's job done on the host: a 64-bit Linux with 32-bit
+    multilib runs gcc -m32 output natively, which is all the snippet phase
+    asks of the container. Same interface; /rt is the runtime include dir."""
+
+    def __init__(self, workdir, runtime_inc):
+        self.workdir, self.runtime_inc = workdir, runtime_inc
+        self.cid, self.error = "local", ""
+
+    def run(self, script):
+        return subprocess.run(["sh", "-c", script.replace("/rt", self.runtime_inc)],
+                              cwd=self.workdir, capture_output=True, text=True)
+
+    def close(self):
+        pass
+
+
+def _local_gcc32_works():
+    """gcc -m32 can build and run a program here (32-bit libc installed)."""
+    import shutil
+    if not shutil.which("gcc"):
+        return False
+    d = tempfile.mkdtemp(prefix="xboxrecomp-m32-")
+    try:
+        with open(os.path.join(d, "t.c"), "w") as f:
+            f.write("int main(void){return 0;}\n")
+        r = subprocess.run(["gcc", "-m32", "t.c", "-o", "t"], cwd=d, capture_output=True)
+        return r.returncode == 0 and subprocess.run([os.path.join(d, "t")]).returncode == 0
+    except OSError:
+        return False
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 # MSVC under Wine, for the corpus phase, in two images.
 #
@@ -264,6 +299,10 @@ def main_with_args(argv, allow_container=True):
     # containers during a unit-test pass.
     if not backend and allow_container and _docker_image_present():
         backend = "docker"
+    # The host itself, when it can run 32-bit code (Linux multilib). Only for
+    # the snippet phase, which needs nothing but gcc -m32.
+    if not backend and allow_container and _local_gcc32_works():
+        backend = "local"
 
     if not backend:
         print("ERROR: no 32-bit x86 toolchain. Either a 32-bit MSVC "
@@ -284,6 +323,8 @@ def main_with_args(argv, allow_container=True):
         print(f"workdir: {workdir}")
 
     dk = None
+    if backend == "local":
+        dk = _Local(workdir, runtime_inc)
     if backend == "docker":
         dk = _Container(workdir, mounts=[(runtime_inc, "/rt")])
         if not dk.cid:
