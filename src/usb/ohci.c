@@ -640,10 +640,29 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
          * pad unresponsive. */
         moved = len;
         if (endpoint == 0) {
+            /* The data stage of a class SET_REPORT carries an output report
+             * the same as the rumble endpoint does; XAPI may use either. */
+            if (g_setup_pending && len > 0 && g_setup.bmRequestType == 0x21
+                && g_setup.bRequest == 0x09) {
+                uint8_t buf[32];
+                int n = len < (int)sizeof buf ? len : (int)sizeof buf;
+                const uint8_t *src = guest_ptr(cbp, (uint32_t)n);
+                if (src) {
+                    memcpy(buf, src, (size_t)n);
+                    usb_gamepad_rumble(pad, buf, n);
+                }
+            }
             g_setup_pending = 0;
             s_n_out_ep0++;
         } else {
+            uint8_t buf[32];
+            int n = len < (int)sizeof buf ? len : (int)sizeof buf;
+            const uint8_t *src = n > 0 ? guest_ptr(cbp, (uint32_t)n) : NULL;
             s_n_out_other++;
+            if (src) {
+                memcpy(buf, src, (size_t)n);
+                usb_gamepad_rumble(pad, buf, n);
+            }
         }
     }
 

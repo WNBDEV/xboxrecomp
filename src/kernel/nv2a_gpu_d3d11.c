@@ -765,15 +765,17 @@ static uint64_t rt_guest_hash(const GpuRt *r)
 /* Draw src over the whole of dst (dw x dh) through a linear sampler: the
  * filter between a scaled surface and its console-sized copy. Leaves no
  * target or view bound, so either can be bound the other way next. */
-static void blit(ID3D11ShaderResourceView *src, ID3D11RenderTargetView *dst,
-                 uint32_t dw, uint32_t dh)
+/* src drawn into the viewport (x, y, w, h) of dst, kept inside the scissor
+ * rectangle `clip` (left, top, right, bottom). */
+static void blit_rect(ID3D11ShaderResourceView *src, ID3D11RenderTargetView *dst,
+                      float x, float y, float w, float h, const LONG clip[4])
 {
     D3D11_VIEWPORT vp;
     D3D11_RECT sc;
     ID3D11ShaderResourceView *none = NULL;
-    vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (float)dw; vp.Height = (float)dh;
+    vp.TopLeftX = x; vp.TopLeftY = y; vp.Width = w; vp.Height = h;
     vp.MinDepth = 0.0f; vp.MaxDepth = 1.0f;
-    sc.left = 0; sc.top = 0; sc.right = (LONG)dw; sc.bottom = (LONG)dh;
+    sc.left = clip[0]; sc.top = clip[1]; sc.right = clip[2]; sc.bottom = clip[3];
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &dst, NULL);
     ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
     ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &sc);
@@ -789,6 +791,13 @@ static void blit(ID3D11ShaderResourceView *src, ID3D11RenderTargetView *dst,
     ID3D11DeviceContext_Draw(s_ctx, 3, 0);
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+}
+
+static void blit(ID3D11ShaderResourceView *src, ID3D11RenderTargetView *dst,
+                 uint32_t dw, uint32_t dh)
+{
+    const LONG all[4] = { 0, 0, (LONG)dw, (LONG)dh };
+    blit_rect(src, dst, 0.0f, 0.0f, (float)dw, (float)dh, all);
 }
 
 /* The console-sized companion of a scaled surface, made on first need. */
@@ -1820,7 +1829,7 @@ static int swap_create(HWND hwnd, uint32_t w, uint32_t h)
     }
     s_swap_w = w;
     s_swap_h = h;
-    gpu_log("presenting %ux%u straight to the window, vsync", w, h);
+    gpu_log("presenting straight to the window (%ux%u now, 4:3 letterboxed), vsync", w, h);
     return 1;
 }
 
@@ -1828,7 +1837,12 @@ int nv2a_gpu_present(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, ui
 {
     static int on = -1;
     ID3D11Texture2D *back = NULL;
-    D3D11_BOX box;
+    ID3D11RenderTargetView *rtv = NULL;
+    static const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    HWND hwnd;
+    RECT cr;
+    uint32_t cw, ch;
+    float sx, sy, k, vw, vh;
     GpuRt *r;
 
     if (on < 0) {
@@ -1838,22 +1852,28 @@ int nv2a_gpu_present(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, ui
     if (!on || s_state != 1 || s_swap_failed || !addr || !w || !h
         || (bpp != 4 && bpp != 2))
         return 0;
+    hwnd = (HWND)xbox_FramebufferWindowHwnd();
+    if (!hwnd)
+        return 0;                       /* window not open yet */
+    /* The swap chain is the window's size, whatever that is now -- resized,
+     * maximised, fullscreen -- and the frame is drawn into it at the
+     * console's 4:3, centred, with black bars on the long side. */
+    if (!GetClientRect(hwnd, &cr))
+        return 0;
+    cw = cr.right > 0 ? (uint32_t)cr.right : 1;
+    ch = cr.bottom > 0 ? (uint32_t)cr.bottom : 1;
     if (!s_swap) {
-        HWND hwnd = (HWND)xbox_FramebufferWindowHwnd();
-        if (!hwnd)
-            return 0;                   /* window not open yet */
-        if (!swap_create(hwnd, w * s_scale, h * s_scale)) {
+        if (!swap_create(hwnd, cw, ch)) {
             s_swap_failed = 1;
             return 0;
         }
         xbox_FramebufferWindowGpuOwned(1);
     }
-    if (w * s_scale != s_swap_w || h * s_scale != s_swap_h) {
-        if (FAILED(IDXGISwapChain_ResizeBuffers(s_swap, 0, w * s_scale, h * s_scale,
-                                                DXGI_FORMAT_UNKNOWN, 0)))
+    if (cw != s_swap_w || ch != s_swap_h) {
+        if (FAILED(IDXGISwapChain_ResizeBuffers(s_swap, 0, cw, ch, DXGI_FORMAT_UNKNOWN, 0)))
             return 0;
-        s_swap_w = w * s_scale;
-        s_swap_h = h * s_scale;
+        s_swap_w = cw;
+        s_swap_h = ch;
     }
     /* The surface as the GPU holds it, or as guest memory has it if the CPU
      * produced this frame. */
@@ -1861,12 +1881,31 @@ int nv2a_gpu_present(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, ui
     if (!r)
         return 0;
     rt_check(r);
+    if (!r->srv && FAILED(ID3D11Device_CreateShaderResourceView(
+            s_dev, (ID3D11Resource *)r->tex, NULL, &r->srv)))
+        return 0;
     if (FAILED(IDXGISwapChain_GetBuffer(s_swap, 0, &IID_ID3D11Texture2D, (void **)&back)))
         return 0;
-    box.left = 0; box.top = 0; box.front = 0;
-    box.right = w * s_scale; box.bottom = h * s_scale; box.back = 1;
-    ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)back, 0, 0, 0, 0,
-                                              (ID3D11Resource *)r->tex, 0, &box);
+    if (FAILED(ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)back, NULL, &rtv))) {
+        ID3D11Texture2D_Release(back);
+        return 0;
+    }
+    ID3D11DeviceContext_ClearRenderTargetView(s_ctx, rtv, black);
+    /* The surface may be larger than the frame (get_rt grows, never
+     * shrinks): draw only its w x h corner, by drawing the whole surface
+     * into a rectangle that much larger and letting the viewport crop. */
+    sx = (float)cw / (float)w;
+    sy = (float)ch / (float)h;
+    k = sx < sy ? sx : sy;
+    vw = (float)w * k;
+    vh = (float)h * k;
+    {
+        float x0 = ((float)cw - vw) * 0.5f, y0 = ((float)ch - vh) * 0.5f;
+        const LONG frame[4] = { (LONG)x0, (LONG)y0, (LONG)(x0 + vw + 0.5f),
+                                (LONG)(y0 + vh + 0.5f) };
+        blit_rect(r->srv, rtv, x0, y0, (float)r->w * k, (float)r->h * k, frame);
+    }
+    ID3D11RenderTargetView_Release(rtv);
     ID3D11Texture2D_Release(back);
     IDXGISwapChain_Present(s_swap, 1, 0);
     return 1;

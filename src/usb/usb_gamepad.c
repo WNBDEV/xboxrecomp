@@ -630,3 +630,36 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     pad_script_apply(pad, out);
     return 20;
 }
+
+/* Rumble, passed to the host pad.
+ *
+ * The Controller S's output report is six bytes -- report id 0, length 6,
+ * then the left (heavy) and right (light) motor speeds as 16-bit little
+ * endian words -- the layout Linux's xpad driver writes to the same pads.
+ * XAPI sends one whenever the title changes the vibration and again to stop
+ * it, so forwarding each one is the whole job. These packets used to be
+ * accepted and dropped, and the game's Vibration option did nothing.
+ * RECOMP_RUMBLE=0 keeps them dropped. */
+void usb_gamepad_rumble(int pad, const uint8_t *data, int len)
+{
+    static int on = -1;
+    XBOX_VIBRATION v;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_RUMBLE");
+        on = !(e && *e == '0');
+    }
+    if (!on || !data || len < 6 || data[0] != 0x00 || data[1] < 6)
+        return;
+    v.wLeftMotorSpeed = (uint16_t)(data[2] | (data[3] << 8));
+    v.wRightMotorSpeed = (uint16_t)(data[4] | (data[5] << 8));
+    {
+        static int shown;
+        if ((v.wLeftMotorSpeed || v.wRightMotorSpeed) && shown < 4) {
+            shown++;
+            fprintf(stderr, "  PAD: rumble pad %d left %u right %u\n", pad,
+                    v.wLeftMotorSpeed, v.wRightMotorSpeed);
+        }
+    }
+    xbox_InputSetState((DWORD)(pad & 3), &v);
+}

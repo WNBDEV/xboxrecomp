@@ -157,8 +157,49 @@ int xbox_FramebufferKeyDown(int vk)
     return s_key_down[vk] != 0;
 }
 
+/* Borderless fullscreen on the window's monitor, and back. Alt+Enter or F11
+ * toggles; RECOMP_FULLSCREEN=1 starts that way. The frame keeps the
+ * console's 4:3 with black bars either side (nv2a_gpu_present letterboxes
+ * into whatever size the window is), so nothing is stretched. */
+static RECT s_windowed_rect;
+static int  s_fullscreen;
+
+static void fb_set_fullscreen(HWND h, int on)
+{
+    if (on == s_fullscreen)
+        return;
+    if (on) {
+        MONITORINFO mi;
+        mi.cbSize = sizeof mi;
+        GetWindowRect(h, &s_windowed_rect);
+        if (!GetMonitorInfoA(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi))
+            return;
+        SetWindowLongA(h, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+        SetWindowPos(h, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                     mi.rcMonitor.right - mi.rcMonitor.left,
+                     mi.rcMonitor.bottom - mi.rcMonitor.top,
+                     SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    } else {
+        SetWindowLongA(h, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
+        SetWindowPos(h, HWND_NOTOPMOST, s_windowed_rect.left, s_windowed_rect.top,
+                     s_windowed_rect.right - s_windowed_rect.left,
+                     s_windowed_rect.bottom - s_windowed_rect.top,
+                     SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    }
+    s_fullscreen = on;
+}
+
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
+    /* Alt+Enter arrives as a system key, F11 as an ordinary one; neither is
+     * a pad key, so they are taken here and not recorded as held. */
+    if ((m == WM_SYSKEYDOWN && w == VK_RETURN && (l & (1 << 29)) && !(l & (1 << 30)))
+        || (m == WM_KEYDOWN && w == VK_F11 && !(l & (1 << 30)))) {
+        fb_set_fullscreen(h, !s_fullscreen);
+        return 0;
+    }
+    if (m == WM_SYSCHAR && w == VK_RETURN)
+        return 0;                       /* no beep for Alt+Enter */
     switch (m) {
     case WM_CLOSE:
     case WM_DESTROY:
@@ -321,6 +362,11 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     }
     hdc = GetDC(hwnd);
     s_hwnd = hwnd;
+    {
+        const char *fs = getenv("RECOMP_FULLSCREEN");
+        if (fs && *fs == '1')
+            fb_set_fullscreen(hwnd, 1);
+    }
 
     memset(&bi, 0, sizeof(bi));
     bi.bmiHeader.biSize        = sizeof(bi.bmiHeader);
