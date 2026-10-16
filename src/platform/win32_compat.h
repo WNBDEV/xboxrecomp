@@ -448,6 +448,12 @@ typedef struct _EXCEPTION_POINTERS
 typedef void *PEXCEPTION_POINTERS;
 #endif
 typedef LONG (*PVECTORED_EXCEPTION_HANDLER)(PEXCEPTION_POINTERS info);
+/* Hold [base, base+len) -- a PAGE_NOACCESS reservation -- as the place fixed
+ * mappings go: inside it MapViewOfFileEx/VirtualAlloc at an address replace
+ * the reservation rather than being refused, and releasing puts it back. The
+ * guest address window (xbox_memory_layout.c). */
+void win32_compat_hold(void *base, size_t len);
+
 PVOID AddVectoredExceptionHandler(ULONG FirstHandler, PVECTORED_EXCEPTION_HANDLER Handler);
 ULONG RemoveVectoredExceptionHandler(PVOID Handle);
 

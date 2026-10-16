@@ -36,6 +36,21 @@ if os.path.exists(_WIN32_EXPORTS_FILE):
     with open(_WIN32_EXPORTS_FILE, encoding="ascii") as _f:
         _WIN32_EXPORTS.update(line.strip() for line in _f if line.strip())
 
+# The same for a native POSIX build, which links the C library itself, and
+# where the clash is worse than a link error: an executable's definition of
+# `write` or `close` silently preempts libc's for every caller -- the
+# runtime's own file code and every shared library -- so the first library
+# that closes a descriptor runs guest code. Alter Echo's CRT has close,
+# isatty, lseek and write; the native build crashed in SDL's audio init.
+# Generated from glibc's dynamic symbol table:
+#   nm -D --defined-only /usr/lib/libc.so.6 /usr/lib/libm.so.6 \
+#     | awk '$2 ~ /^[TWiV]$/ {print $3}' | sed 's/@.*//' \
+#     | grep -E '^[A-Za-z_][A-Za-z0-9_]*$' | sort -u
+_POSIX_LIBC_FILE = os.path.join(_DATA_DIR, "posix_libc_names.txt")
+if os.path.exists(_POSIX_LIBC_FILE):
+    with open(_POSIX_LIBC_FILE, encoding="ascii") as _f:
+        _WIN32_EXPORTS.update(line.strip() for line in _f if line.strip())
+
 
 # C identifiers a recompiled function name must not be: the generated TUs
 # include the C standard headers (math.h/string.h through recomp_types.h,

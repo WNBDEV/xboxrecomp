@@ -50,6 +50,24 @@ else()
     # Linux: platform layer (POSIX host primitives) + OpenSSL for crypto.
     find_package(OpenSSL REQUIRED)
     target_link_libraries(xbox_kernel PUBLIC platform OpenSSL::Crypto)
+
+    # The Direct3D 11 GPU backend on DXVK Native (nv2a_gpu_d3d11.c). Point
+    # XBOX_DXVK_NATIVE_INCLUDE at DXVK Native's headers (the include/dxvk
+    # directory of a dxvk-native release) to build it in. Only that one file
+    # sees them -- their Win32 types would clash with the platform layer's --
+    # and nothing is linked: DXVK and vkd3d-utils are opened at run time.
+    set(XBOX_DXVK_NATIVE_INCLUDE "" CACHE PATH
+        "DXVK Native headers (include/dxvk) for the GPU backend on Linux")
+    if(XBOX_DXVK_NATIVE_INCLUDE)
+        find_package(SDL2 REQUIRED)
+        get_target_property(_sdl2_inc SDL2::SDL2 INTERFACE_INCLUDE_DIRECTORIES)
+        set_source_files_properties(nv2a_gpu_d3d11.c PROPERTIES
+            COMPILE_DEFINITIONS XBOX_DXVK_NATIVE
+            INCLUDE_DIRECTORIES "${XBOX_DXVK_NATIVE_INCLUDE};${_sdl2_inc}"
+            COMPILE_OPTIONS "-Wno-unused-variable;-Wno-unused-const-variable")
+        target_link_libraries(xbox_kernel PUBLIC ${CMAKE_DL_LIBS})
+        message(STATUS "xbox_kernel: GPU backend on DXVK Native (${XBOX_DXVK_NATIVE_INCLUDE})")
+    endif()
 endif()
 
 if(MSVC)

@@ -28,8 +28,19 @@
 
 #include <stdint.h>
 
+/* Where a vectored handler can see a fault and edit the registers it resumes
+ * with: Windows, and Linux on x86-64 through win32_compat.c's signal-backed
+ * AddVectoredExceptionHandler. Elsewhere the devices stay untrapped. */
+#if defined(_WIN32) || (defined(__linux__) && defined(__x86_64__))
+#define MMIO_TRAPS 1
+#endif
+
+#if MMIO_TRAPS
 #if defined(_WIN32)
 #include <windows.h>
+#else
+#include "xbox_winnt.h"
+#endif
 
 /* Service one register access. dev is passed straight back to the callbacks. */
 typedef uint64_t (*mmio_read_fn)(void *dev, uint32_t off, int size);
@@ -247,5 +258,5 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
     }
 }
 
-#endif /* _WIN32 */
+#endif /* MMIO_TRAPS */
 #endif /* MMIO_DECODE_H */

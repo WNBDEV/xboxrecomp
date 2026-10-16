@@ -1123,10 +1123,16 @@ static void *mach_map_fixed(void *address, size_t size, int prot)
  * munmap cannot be called at all. */
 void view_register(void *addr, size_t len);
 size_t view_take(const void *addr);
+static int  hold_contains(const void *a, size_t n);
+static int  hold_claim(const void *a, size_t n);
+static BOOL hold_restore(void *a, size_t n);
 
 LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD protect)
 {
-    int prot  = prot_from_page(protect);
+    /* PROT_NONE is 0, so this used to be `prot ? prot : RW` -- which made
+     * every PAGE_NOACCESS reservation read-write memory. Only an unspecified
+     * protection defaults to read-write. */
+    int prot  = protect ? prot_from_page(protect) : PROT_READ | PROT_WRITE;
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
 
     /* MEM_COMMIT on a region already reserved by a prior VirtualAlloc:
@@ -1137,17 +1143,27 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
         /* fall through to a fresh mapping */
     }
 
+    /* A reservation is address space, not memory: no commit charge for it. */
+    if (!(allocationType & MEM_COMMIT))
+        flags |= MAP_NORESERVE;
 #if defined(MAP_FIXED_NOREPLACE)
-    if (address) flags |= MAP_FIXED_NOREPLACE;
+    if (address) {
+        int h = hold_claim(address, size);
+        if (h < 0) {
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return NULL;
+        }
+        flags |= h ? MAP_FIXED : MAP_FIXED_NOREPLACE;
+    }
 #endif
 
     void *p;
 #if defined(__APPLE__)
     if (address) {
-        p = mach_map_fixed(address, size, prot ? prot : PROT_READ | PROT_WRITE);
+        p = mach_map_fixed(address, size, prot);
     } else
 #endif
-    p = mmap(address, size, prot ? prot : PROT_READ | PROT_WRITE, flags, -1, 0);
+    p = mmap(address, size, prot, flags, -1, 0);
     if (p == MAP_FAILED) {
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return NULL;
@@ -1180,6 +1196,8 @@ BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD freeType)
         size_t len = view_take(address);
         if (size == 0) size = len;
         if (size == 0) return FALSE;
+        if (hold_contains(address, size))
+            return hold_restore(address, size);
         return munmap(address, size) == 0;
     }
     if (freeType & MEM_DECOMMIT)
@@ -1581,6 +1599,68 @@ int view_lookup(const void *addr, void **base_out, size_t *len_out)
     return found;
 }
 
+/* The held range.
+ *
+ * The guest's 4 GB address space has to sit at one host offset, with RAM, its
+ * mirrors, the contiguous window, the tiled aperture and the device apertures
+ * each at a fixed place inside it. Mapped one at a time with
+ * MAP_FIXED_NOREPLACE, each is at the mercy of whatever the host put there in
+ * the meantime: natively the C library, SDL and thread stacks land in the gaps
+ * and the 0x80000000 window failed. So xbox_memory_layout reserves the whole
+ * window once and hands it to win32_compat_hold. Inside it, a fixed mapping
+ * replaces the placeholder (MAP_FIXED) -- unless it would land on a live view,
+ * which still fails, as on Windows -- releasing puts the placeholder back, and
+ * VirtualQuery calls unused held space free. Outside it nothing changes. */
+static uintptr_t s_hold_lo, s_hold_hi;
+
+void win32_compat_hold(void *base, size_t len)
+{
+    view_take(base);            /* placeholder, not a view */
+    s_hold_lo = (uintptr_t)base;
+    s_hold_hi = s_hold_lo + len;
+}
+
+static int hold_contains(const void *a, size_t n)
+{
+    return s_hold_hi && (uintptr_t)a >= s_hold_lo
+        && n <= s_hold_hi - (uintptr_t)a;
+}
+
+/* The first live view at or above a, or 0. */
+static uintptr_t view_next(uintptr_t a)
+{
+    uintptr_t best = 0;
+    pthread_mutex_lock(&s_views_lock);
+    for (int i = 0; i < 512; i++) {
+        uintptr_t lo = (uintptr_t)s_views[i].addr;
+        if (lo && lo >= a && (!best || lo < best))
+            best = lo;
+    }
+    pthread_mutex_unlock(&s_views_lock);
+    return best;
+}
+
+/* 1: [a, a+n) is held and free, map it with MAP_FIXED. 0: not held, the
+ * caller's usual rules apply. -1: held, but a live view is in the way. */
+static int hold_claim(const void *a, size_t n)
+{
+    uintptr_t next;
+    void *base;
+
+    if (!hold_contains(a, n))
+        return 0;
+    if (view_lookup(a, &base, NULL))
+        return -1;
+    next = view_next((uintptr_t)a);
+    return (next && next < (uintptr_t)a + n) ? -1 : 1;
+}
+
+static BOOL hold_restore(void *a, size_t n)
+{
+    return mmap(a, n, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
+                | MAP_FIXED, -1, 0) != MAP_FAILED;
+}
+
 size_t view_take(const void *addr)
 {
     size_t len = 0;
@@ -1656,7 +1736,12 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
      * and dying somewhere unrelated a moment later. */
     if (baseAddr) {
 #if defined(MAP_FIXED_NOREPLACE)
-        flags |= MAP_FIXED_NOREPLACE;
+        int h = hold_claim(baseAddr, len);
+        if (h < 0) {
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return NULL;
+        }
+        flags |= h ? MAP_FIXED : MAP_FIXED_NOREPLACE;
 #elif defined(__APPLE__)
         /* Darwin has no MAP_FIXED_NOREPLACE. Claim the range first with
          * mach_vm_map(VM_FLAGS_FIXED), which refuses rather than displaces;
@@ -1693,6 +1778,8 @@ BOOL UnmapViewOfFile(LPCVOID baseAddr)
 {
     size_t len = view_take(baseAddr);
     if (len == 0) return FALSE;
+    if (hold_contains(baseAddr, len))
+        return hold_restore((void *)baseAddr, len);
     return munmap((void *)baseAddr, len) == 0;
 }
 
@@ -1727,14 +1814,43 @@ SIZE_T VirtualQuery(LPCVOID address, PMEMORY_BASIC_INFORMATION buffer, SIZE_T le
     void  *base = NULL;
     size_t len  = 0;
 
-    if (!view_lookup(address, &base, &len)) {
-        /* Not ours. Report it free rather than inventing a committed page. */
-        buffer->BaseAddress    = (PVOID)address;
+    if (!view_lookup(address, &base, &len) && hold_contains(address, 1)) {
+        /* Held but unused: free, up to the next view or the end of the hold. */
+        uintptr_t a = (uintptr_t)address & ~(uintptr_t)0xFFF;
+        uintptr_t next = view_next(a);
+        uintptr_t e = (next && next < s_hold_hi) ? next : s_hold_hi;
+        buffer->BaseAddress    = (PVOID)a;
         buffer->AllocationBase = NULL;
-        buffer->RegionSize     = 0;
+        buffer->RegionSize     = e - a;
         buffer->State          = MEM_FREE;
         buffer->Protect        = PAGE_NOACCESS;
         buffer->Type           = 0;
+        return sizeof(*buffer);
+    }
+    if (!view_lookup(address, &base, &len)) {
+        /* Not one of our views. Ask the kernel whether anything is mapped
+         * there -- mincore fails with ENOMEM exactly on unmapped pages -- and
+         * report the run of pages in the same state, as Win32 does. A
+         * RegionSize of 0 here once sent a caller walking free space
+         * (guest_vmem.c, host_free_run) round the same address for ever.
+         * Capped, so a query costs at most a few thousand syscalls; a caller
+         * that wants more asks again from the end. */
+        const long pg = sysconf(_SC_PAGESIZE);
+        const size_t cap = (size_t)64 << 20;
+        uintptr_t a = (uintptr_t)address & ~(uintptr_t)(pg - 1), e = a;
+        unsigned char vec;
+        int mapped = mincore((void *)a, (size_t)pg, &vec) == 0 || errno != ENOMEM;
+
+        do {
+            e += (uintptr_t)pg;
+        } while (e - a < cap
+                 && (mincore((void *)e, (size_t)pg, &vec) == 0 || errno != ENOMEM) == mapped);
+        buffer->BaseAddress    = (PVOID)a;
+        buffer->AllocationBase = mapped ? (PVOID)a : NULL;
+        buffer->RegionSize     = e - a;
+        buffer->State          = mapped ? MEM_COMMIT : MEM_FREE;
+        buffer->Protect        = mapped ? PAGE_READWRITE : PAGE_NOACCESS;
+        buffer->Type           = mapped ? MEM_PRIVATE : 0;
         return sizeof(*buffer);
     }
 
@@ -1912,8 +2028,174 @@ VOID RaiseException(DWORD code, DWORD flags, DWORD nargs, const ULONG_PTR *args)
     /* TODO: on Windows this does not return; SEH dispatch unimplemented. */
 }
 
+#if defined(__linux__) && defined(__x86_64__)
+/* Vectored exception handlers on signals.
+ *
+ * Every device trap in the tree is a vectored handler: a page left without
+ * access (or read-only) faults, a handler decodes or completes the access, and
+ * execution continues -- sometimes after setting TF to come back once the
+ * instruction has run. On Linux the fault is SIGSEGV and the single step is
+ * SIGTRAP; this turns each into the EXCEPTION_RECORD and CONTEXT a handler
+ * expects, runs the handlers in order, and copies the registers back when one
+ * of them continues execution. TF set in the CONTEXT survives sigreturn, so
+ * the step comes back as SIGTRAP exactly as it does on Windows.
+ *
+ * The list is fixed-size and only ever edited under a lock, which is enough
+ * here: handlers are added at init and the odd one removed by its owner, and
+ * the signal side reads a slot at a time. */
+#include <ucontext.h>
+
+#define VEH_MAX 16
+static PVECTORED_EXCEPTION_HANDLER volatile s_veh[VEH_MAX];
+static pthread_mutex_t s_veh_lock = PTHREAD_MUTEX_INITIALIZER;
+static int s_veh_installed;
+
+static void veh_to_context(const greg_t *g, PCONTEXT c)
+{
+    c->Rax = g[REG_RAX]; c->Rcx = g[REG_RCX]; c->Rdx = g[REG_RDX];
+    c->Rbx = g[REG_RBX]; c->Rsp = g[REG_RSP]; c->Rbp = g[REG_RBP];
+    c->Rsi = g[REG_RSI]; c->Rdi = g[REG_RDI];
+    c->R8  = g[REG_R8];  c->R9  = g[REG_R9];  c->R10 = g[REG_R10];
+    c->R11 = g[REG_R11]; c->R12 = g[REG_R12]; c->R13 = g[REG_R13];
+    c->R14 = g[REG_R14]; c->R15 = g[REG_R15];
+    c->Rip = g[REG_RIP];
+    c->EFlags = (uint32_t)g[REG_EFL];
+}
+
+static void veh_from_context(greg_t *g, const CONTEXT *c)
+{
+    g[REG_RAX] = c->Rax; g[REG_RCX] = c->Rcx; g[REG_RDX] = c->Rdx;
+    g[REG_RBX] = c->Rbx; g[REG_RSP] = c->Rsp; g[REG_RBP] = c->Rbp;
+    g[REG_RSI] = c->Rsi; g[REG_RDI] = c->Rdi;
+    g[REG_R8]  = c->R8;  g[REG_R9]  = c->R9;  g[REG_R10] = c->R10;
+    g[REG_R11] = c->R11; g[REG_R12] = c->R12; g[REG_R13] = c->R13;
+    g[REG_R14] = c->R14; g[REG_R15] = c->R15;
+    g[REG_RIP] = c->Rip;
+    g[REG_EFL] = (g[REG_EFL] & ~(greg_t)0xFFFFFFFF) | c->EFlags;
+}
+
+static void veh_signal(int sig, siginfo_t *si, void *ucv)
+{
+    ucontext_t *uc = (ucontext_t *)ucv;
+    greg_t *g = uc->uc_mcontext.gregs;
+    EXCEPTION_RECORD rec;
+    CONTEXT ctx;
+    EXCEPTION_POINTERS ep;
+    int saved_errno = errno, i;
+
+    memset(&rec, 0, sizeof(rec));
+    rec.ExceptionAddress = (PVOID)g[REG_RIP];
+    switch (sig) {
+    case SIGSEGV:
+    case SIGBUS:
+        rec.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
+        rec.NumberParameters = 2;
+        /* The page-fault error code: bit 1 set for a write. */
+        rec.ExceptionInformation[0] = (g[REG_ERR] & 2) ? 1 : 0;
+        rec.ExceptionInformation[1] = (ULONG_PTR)si->si_addr;
+        break;
+    case SIGTRAP:
+        rec.ExceptionCode = EXCEPTION_SINGLE_STEP;
+        break;
+    case SIGILL:
+        rec.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
+        break;
+    default:   /* SIGFPE */
+        rec.ExceptionCode = si->si_code == FPE_INTDIV
+                          ? EXCEPTION_INT_DIVIDE_BY_ZERO
+                          : EXCEPTION_FLT_INVALID_OPERATION;
+        break;
+    }
+    veh_to_context(g, &ctx);
+    ep.ExceptionRecord = &rec;
+    ep.ContextRecord = &ctx;
+
+    for (i = 0; i < VEH_MAX; i++) {
+        PVECTORED_EXCEPTION_HANDLER h = s_veh[i];
+        if (h && h(&ep) == EXCEPTION_CONTINUE_EXECUTION) {
+            veh_from_context(g, &ctx);
+            errno = saved_errno;
+            return;
+        }
+    }
+
+    /* Nobody wanted it: die the way the signal would have. A fault returns
+     * into the same instruction and takes the default action there; a trap
+     * has already completed, so it is raised again. */
+    signal(sig, SIG_DFL);
+    if (sig == SIGTRAP)
+        raise(sig);
+}
+
+static void veh_install(void)
+{
+    static const int sigs[] = { SIGSEGV, SIGBUS, SIGTRAP, SIGILL, SIGFPE };
+    struct sigaction sa;
+    size_t i;
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = veh_signal;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+    for (i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++)
+        sigaction(sigs[i], &sa, NULL);
+}
+
 PVOID AddVectoredExceptionHandler(ULONG First, PVECTORED_EXCEPTION_HANDLER Handler)
-{ (void)First; (void)Handler; return NULL; }   /* TODO: wire to sigaction */
+{
+    PVOID handle = NULL;
+    int i;
+
+    if (!Handler)
+        return NULL;
+    pthread_mutex_lock(&s_veh_lock);
+    if (!s_veh_installed) {
+        veh_install();
+        s_veh_installed = 1;
+    }
+    if (First) {
+        if (!s_veh[VEH_MAX - 1]) {
+            for (i = VEH_MAX - 1; i > 0; i--)
+                s_veh[i] = s_veh[i - 1];
+            s_veh[0] = Handler;
+            handle = (PVOID)Handler;
+        }
+    } else {
+        for (i = 0; i < VEH_MAX; i++)
+            if (!s_veh[i]) {
+                s_veh[i] = Handler;
+                handle = (PVOID)Handler;
+                break;
+            }
+    }
+    pthread_mutex_unlock(&s_veh_lock);
+    if (!handle)
+        fprintf(stderr, "[win32_compat] AddVectoredExceptionHandler: all %d "
+                "slots in use\n", VEH_MAX);
+    return handle;
+}
+
+ULONG RemoveVectoredExceptionHandler(PVOID h)
+{
+    ULONG found = 0;
+    int i;
+
+    pthread_mutex_lock(&s_veh_lock);
+    for (i = 0; i < VEH_MAX; i++)
+        if (s_veh[i] == (PVECTORED_EXCEPTION_HANDLER)h) {
+            for (; i < VEH_MAX - 1; i++)
+                s_veh[i] = s_veh[i + 1];
+            s_veh[VEH_MAX - 1] = NULL;
+            found = 1;
+            break;
+        }
+    pthread_mutex_unlock(&s_veh_lock);
+    return found;
+}
+#else
+PVOID AddVectoredExceptionHandler(ULONG First, PVECTORED_EXCEPTION_HANDLER Handler)
+{ (void)First; (void)Handler; return NULL; }   /* TODO: macOS (mach exceptions) */
 ULONG RemoveVectoredExceptionHandler(PVOID h) { (void)h; return 1; }
+#endif
 
 #endif /* !_WIN32 */

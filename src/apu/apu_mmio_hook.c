@@ -15,11 +15,11 @@
  * platform's MMIO hook is active, so define it before the #if guard. */
 MCPXAPUState *g_apu_state = NULL;
 
-/* The MMIO hook is a Win32-VEH x86-64 instruction decoder. On Linux the
- * equivalent goes through sigaction + ucontext_t (Stage 2 / main.c). For
- * now the whole body is Windows-only so apu_emu links on Debian. */
-#if defined(_WIN32)
-#include <windows.h>
+/* The MMIO hook is an x86-64 instruction decoder run from a vectored
+ * handler: Win32 VEH, or on Linux the signal-backed one in win32_compat.c
+ * (mmio_decode.h decides which hosts have one). */
+#include "../platform/mmio_decode.h"
+#if MMIO_TRAPS
 
 /* APU MMIO base in Xbox VA space */
 #define APU_MMIO_BASE  0xFE800000u
@@ -280,4 +280,4 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
     return ok;
 }
 
-#endif /* _WIN32 */
+#endif /* MMIO_TRAPS */

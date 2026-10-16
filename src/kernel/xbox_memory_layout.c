@@ -2032,14 +2032,24 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * above 4 GB, which is why Half-Life 2 (768 MB) never saw it. Doing
          * this on Windows needs placeholder reservations (VirtualAlloc2). */
 #ifndef _WIN32
-        g_span_size = g_memory_size * (size_t)(1 + XBOX_NUM_MIRRORS);
+        /* The whole 4 GB guest window, not just RAM and its mirrors: the
+         * contiguous window, the tiled aperture, the device apertures and the
+         * extended VMA all go at fixed offsets from the same base, and between
+         * one mapping and the next the host puts its own things in the gaps.
+         * Natively, the 0x80000000 window then failed and the extended VMA got
+         * 1 MB of its 120. Held (win32_compat_hold), the window stays ours and
+         * each fixed mapping replaces its piece of the reservation. */
+        g_span_size = (size_t)1 << 32;
         g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
+        if (g_span_base)
+            win32_compat_hold(g_span_base, g_span_size);
         if (g_span_base) {
             VirtualFree(g_span_base, g_memory_size, MEM_RELEASE);
             g_memory_base = MapViewOfFileEx(g_mapping_handle,
                                             FILE_MAP_ALL_ACCESS, 0, 0,
                                             g_memory_size, g_span_base);
             if (!g_memory_base) {
+                win32_compat_hold(NULL, 0);
                 VirtualFree(g_span_base, g_span_size, MEM_RELEASE);
                 g_span_base = NULL;
                 g_span_size = 0;
@@ -3013,6 +3023,9 @@ void xbox_MemoryLayoutShutdown(void)
     /* Whatever is left of the base+mirrors reservation. The views carved out
      * of it are already unmapped above; this releases the range itself. */
     if (g_span_base) {
+#ifndef _WIN32
+        win32_compat_hold(NULL, 0);     /* release the window, not re-hold it */
+#endif
         VirtualFree(g_span_base, g_span_size, MEM_RELEASE);
         g_span_base = NULL;
         g_span_size = 0;

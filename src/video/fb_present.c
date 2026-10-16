@@ -13,14 +13,29 @@
  * is busy with something else, such as the FMV player's own window.
  *
  * Off unless RECOMP_FB_WINDOW is set.
+ *
+ * The window is Win32 on Windows and SDL2 elsewhere; everything else here --
+ * the frame copy at the flip, the title, the keys, the BMP dump -- is shared.
  */
 #include <stdint.h>
-
-#if defined(_WIN32)
-#include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#if defined(_WIN32)
+#include <windows.h>
+#define FB_WINDOW 1
+typedef wchar_t fb_char;
+#elif defined(__has_include)
+#if __has_include(<SDL.h>)
+#include <SDL.h>
+#include "platform/xbox_winnt.h"
+#define FB_WINDOW 1
+typedef char fb_char;
+#endif
+#endif
+
+#if FB_WINDOW
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -46,7 +61,7 @@ static volatile LONG s_present_idx = -1;   /* -1 until the first flip */
  * whether it now does. Once it does, this thread stops drawing with GDI --
  * two presenters on one window flicker -- and only keeps the copy that
  * RECOMP_FB_DUMP reads, which the executor still refreshes now and then. */
-static HWND          s_hwnd;
+static void         *s_hwnd;          /* the HWND, or the SDL_Window */
 static volatile LONG s_gpu_owned;
 
 void *xbox_FramebufferWindowHwnd(void)
@@ -57,6 +72,17 @@ void *xbox_FramebufferWindowHwnd(void)
 void xbox_FramebufferWindowGpuOwned(int on)
 {
     InterlockedExchange(&s_gpu_owned, on ? 1 : 0);
+}
+
+/* The GPU backend will not present after all (no device, no swap chain).
+ * Only the SDL window needs to know: with RECOMP_GPU=1 it is made for Vulkan
+ * and leaves the drawing to the GPU, and this is its cue to draw the software
+ * frames itself instead. */
+static volatile LONG s_gpu_unavailable;
+
+void xbox_FramebufferWindowGpuUnavailable(void)
+{
+    InterlockedExchange(&s_gpu_unavailable, 1);
 }
 
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
@@ -131,7 +157,11 @@ static volatile unsigned char s_key_down[256];
 /* Title bar, the way ps3recomp's window shows it. Written by the flip,
  * read once a second by the window thread; a torn read shows one stale
  * number for a second, which nobody can tell apart from a real one. */
-static wchar_t       s_title[48] = L"Xbox Recomp";
+#if defined(_WIN32)
+static fb_char       s_title[48] = L"Xbox Recomp";
+#else
+static fb_char       s_title[48] = "Xbox Recomp";
+#endif
 static volatile LONG s_flips;
 static volatile LONG s_frame_draws;
 
@@ -139,7 +169,11 @@ void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars)
 {
     int i;
     for (i = 0; i < max_chars && i < 47 && name[i]; i++)
+#if defined(_WIN32)
         s_title[i] = (wchar_t)name[i];
+#else
+        s_title[i] = (char)(name[i] < 0x80 ? name[i] : '?');   /* SDL wants UTF-8 */
+#endif
     if (i)
         s_title[i] = 0;
 }
@@ -157,6 +191,7 @@ int xbox_FramebufferKeyDown(int vk)
     return s_key_down[vk] != 0;
 }
 
+#if defined(_WIN32)
 /* Borderless fullscreen on the window's monitor, and back. Alt+Enter or F11
  * toggles; RECOMP_FULLSCREEN=1 starts that way. The frame keeps the
  * console's 4:3 with black bars either side (nv2a_gpu_present letterboxes
@@ -241,6 +276,7 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     }
     return DefWindowProcA(h, m, w, l);
 }
+#endif /* _WIN32 */
 
 /* The display formats an Xbox front buffer is actually set to. The pitch says
  * how wide a row is in bytes, so pitch/width gives the pixel size; the exact
@@ -314,6 +350,7 @@ int xbox_FramebufferDumpBmp(const char *path)
     return 0;
 }
 
+#if defined(_WIN32)
 static DWORD WINAPI fb_thread(LPVOID unused)
 {
     HWND hwnd;
@@ -478,13 +515,219 @@ void xbox_FramebufferWindowStart(void)
         InterlockedExchange(&s_fb_running, 0);
 }
 
-#else
+#else /* SDL2 */
+
+/* SDL keys as the Win32 virtual-key codes the keyboard pad asks about. */
+static int fb_vk_from_sdl(SDL_Keycode k)
+{
+    if (k >= SDLK_a && k <= SDLK_z) return 'A' + (int)(k - SDLK_a);
+    if (k >= SDLK_0 && k <= SDLK_9) return '0' + (int)(k - SDLK_0);
+    if (k >= SDLK_KP_1 && k <= SDLK_KP_9) return 0x61 + (int)(k - SDLK_KP_1);
+    switch (k) {
+    case SDLK_KP_0:      return 0x60;
+    case SDLK_UP:        return 0x26;
+    case SDLK_DOWN:      return 0x28;
+    case SDLK_LEFT:      return 0x25;
+    case SDLK_RIGHT:     return 0x27;
+    case SDLK_RETURN:    return 0x0D;
+    case SDLK_BACKSPACE: return 0x08;
+    case SDLK_ESCAPE:    return 0x1B;
+    case SDLK_SPACE:     return 0x20;
+    case SDLK_TAB:       return 0x09;
+    case SDLK_LSHIFT: case SDLK_RSHIFT: return 0x10;
+    case SDLK_LCTRL:  case SDLK_RCTRL:  return 0x11;
+    case SDLK_LALT:   case SDLK_RALT:   return 0x12;
+    default:             return -1;
+    }
+}
+
+/* The same loop as the Win32 thread: events, show the newest finished frame,
+ * dumps, the title once a second. The renderer keeps the console's 4:3 with
+ * black bars at any window size (SDL_RenderSetLogicalSize) and presents with
+ * vsync, which also paces this thread. Window, renderer and events all stay
+ * on this one thread, as SDL requires. */
+/* The renderer that shows software frames. Made on first use: with the GPU
+ * presenting, an SDL_Renderer (GL) on the window would turn it into a GL
+ * window, and DXVK's Vulkan swap chain could not then attach to it. */
+static int fb_sdl_renderer(SDL_Window *win, SDL_Renderer **ren, SDL_Texture **tex)
+{
+    if (*tex)
+        return 1;
+    *ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED
+                                     | SDL_RENDERER_PRESENTVSYNC);
+    if (*ren && !SDL_RenderSetLogicalSize(*ren, (int)s_fb_width, (int)s_fb_height))
+        SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
+    *tex = *ren ? SDL_CreateTexture(*ren, SDL_PIXELFORMAT_ARGB8888,
+                                    SDL_TEXTUREACCESS_STREAMING,
+                                    (int)s_fb_width, (int)s_fb_height) : NULL;
+    if (!*tex)
+        fprintf(stderr, "  [FBWIN] no renderer: %s\n", SDL_GetError());
+    return *tex != NULL;
+}
+
+static int fb_thread(void *unused)
+{
+    SDL_Window *win;
+    SDL_Renderer *ren = NULL;
+    SDL_Texture *tex = NULL;
+    const char *ge = getenv("RECOMP_GPU");
+    int gpu = ge && *ge == '1';
+    int cw, ch;
+
+    (void)unused;
+    if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
+        fprintf(stderr, "  [FBWIN] SDL video: %s\n", SDL_GetError());
+        InterlockedExchange(&s_fb_running, 0);
+        return 0;
+    }
+    {
+        const char *e = getenv("RECOMP_SCALE");
+        int sc = e ? atoi(e) : 1;
+        SDL_Rect wa;
+        if (sc < 1 || sc > 4) sc = 1;
+        cw = (int)s_fb_width * sc; ch = (int)s_fb_height * sc;
+        if (SDL_GetDisplayUsableBounds(0, &wa) == 0) {
+            int aw = wa.w - 16, ah = wa.h - 48;
+            if (ch > ah) { cw = cw * ah / ch; ch = ah; }
+            if (cw > aw) { ch = ch * aw / cw; cw = aw; }
+        }
+    }
+    win = SDL_CreateWindow("Xbox Recomp - Framebuffer", SDL_WINDOWPOS_UNDEFINED,
+                           SDL_WINDOWPOS_UNDEFINED, cw, ch,
+                           SDL_WINDOW_RESIZABLE | (gpu ? SDL_WINDOW_VULKAN : 0));
+    if (!win || (!gpu && !fb_sdl_renderer(win, &ren, &tex))) {
+        fprintf(stderr, "  [FBWIN] no window: %s\n", SDL_GetError());
+        if (win) SDL_DestroyWindow(win);
+        InterlockedExchange(&s_fb_running, 0);
+        return 0;
+    }
+    s_hwnd = win;
+    {
+        const char *fs = getenv("RECOMP_FULLSCREEN");
+        if (fs && *fs == '1')
+            SDL_SetWindowFullscreen(win, SDL_WINDOW_FULLSCREEN_DESKTOP);
+    }
+    s_rgb = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height, 4);
+    fprintf(stderr, "  [FBWIN] framebuffer window open (%ux%u, SDL %s)\n",
+            s_fb_width, s_fb_height, SDL_GetCurrentVideoDriver());
+
+    while (InterlockedCompareExchange(&s_fb_running, 1, 1)) {
+        SDL_Event ev;
+        int have = 0;
+
+        while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_QUIT) {
+                InterlockedExchange(&s_fb_running, 0);
+            } else if (ev.type == SDL_KEYDOWN || ev.type == SDL_KEYUP) {
+                SDL_Keycode k = ev.key.keysym.sym;
+                int vk;
+                /* Alt+Enter or F11: fullscreen, not a pad key. */
+                if (ev.type == SDL_KEYDOWN && !ev.key.repeat
+                        && (k == SDLK_F11 || (k == SDLK_RETURN
+                                              && (ev.key.keysym.mod & KMOD_ALT)))) {
+                    int on = !(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN);
+                    SDL_SetWindowFullscreen(win, on ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+                    continue;
+                }
+                vk = fb_vk_from_sdl(k);
+                if (vk >= 0)
+                    s_key_down[vk] = ev.type == SDL_KEYDOWN;
+                if (ev.type == SDL_KEYDOWN && getenv("RECOMP_KEY_TRACE")) {
+                    static unsigned n;
+                    if (n++ < 40)
+                        fprintf(stderr, "  [KEY] down vk=0x%02X\n", (unsigned)vk);
+                }
+            } else if (ev.type == SDL_WINDOWEVENT
+                       && ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
+                memset((void *)s_key_down, 0, sizeof s_key_down);
+            }
+        }
+        if (s_present_idx >= 0 && s_rgb) {
+            LONG idx = s_present_idx;
+            if (s_present[idx])
+                memcpy(s_rgb, s_present[idx],
+                       (size_t)s_fb_width * s_fb_height * 4);
+            have = 1;
+        } else if (s_fb_va && s_fb_pitch && s_rgb) {
+            const uint8_t *src =
+                (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
+            fb_convert(src, s_fb_pitch / s_fb_width);
+            have = 1;
+        }
+        if (have && !s_gpu_owned && (!gpu || s_gpu_unavailable)
+                && fb_sdl_renderer(win, &ren, &tex)) {
+            /* The frame is X8R8G8B8 with the X byte whatever the title left
+             * there; ARGB8888 with blending off ignores it. Vsync paces. */
+            SDL_UpdateTexture(tex, NULL, s_rgb, (int)s_fb_width * 4);
+            SDL_RenderClear(ren);
+            SDL_RenderCopy(ren, tex, NULL, NULL);
+            SDL_RenderPresent(ren);
+        } else {
+            SDL_Delay(16);              /* the GPU presents, or nothing to show */
+        }
+        {
+            const char *dump = getenv("RECOMP_FB_DUMP");
+            const char *every = getenv("RECOMP_FB_WINDOW_DUMP_EVERY");
+            static int frames;
+            int period = every ? atoi(every) : 0;
+            frames++;
+            if (dump && *dump && period > 0) {
+                if (frames % period == 0)
+                    xbox_FramebufferDumpBmp(dump);
+            } else if (dump && *dump && frames == 600) {
+                xbox_FramebufferDumpBmp(dump);
+            }
+        }
+        {
+            static Uint32 t0;
+            static LONG f0;
+            Uint32 now = SDL_GetTicks();
+            if (now - t0 >= 1000) {
+                LONG f = s_flips;
+                char tb[128];
+                snprintf(tb, sizeof tb, "%s | FPS: %.1f | draws: %ld", s_title,
+                         t0 ? (f - f0) * 1000.0 / (now - t0) : 0.0,
+                         (long)s_frame_draws);
+                SDL_SetWindowTitle(win, tb);
+                t0 = now; f0 = f;
+            }
+        }
+    }
+
+    s_hwnd = NULL;
+    if (tex) SDL_DestroyTexture(tex);
+    if (ren) SDL_DestroyRenderer(ren);
+    SDL_DestroyWindow(win);
+    free(s_rgb);
+    s_rgb = NULL;
+    return 0;
+}
+
+void xbox_FramebufferWindowStart(void)
+{
+    SDL_Thread *th;
+
+    if (!getenv("RECOMP_FB_WINDOW"))
+        return;
+    if (InterlockedCompareExchange(&s_fb_running, 1, 0) != 0)
+        return;
+    th = SDL_CreateThread(fb_thread, "fb_window", NULL);
+    if (th)
+        SDL_DetachThread(th);
+    else
+        InterlockedExchange(&s_fb_running, 0);
+}
+#endif /* SDL2 */
+
+#else /* no window on this host */
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
 void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
 void xbox_FramebufferWindowStart(void) {}
 int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
 void xbox_FramebufferWindowSetTitle(const uint16_t *n, int m) { (void)n; (void)m; }
 void xbox_FramebufferWindowFrameStats(uint32_t draws) { (void)draws; }
-void *xbox_FramebufferWindowHwnd(void) { return NULL; }
+void *xbox_FramebufferWindowHwnd(void) { return (void *)0; }
 void xbox_FramebufferWindowGpuOwned(int on) { (void)on; }
+void xbox_FramebufferWindowGpuUnavailable(void) {}
+int xbox_FramebufferDumpBmp(const char *path) { (void)path; return -1; }
 #endif

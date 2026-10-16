@@ -515,6 +515,8 @@ translate:
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <errno.h>
+#include <dirent.h>
+#include <strings.h>
 
 static char s_game_dir[MAX_PATH];
 static char s_save_dir[MAX_PATH];
@@ -547,6 +549,61 @@ static void mkdir_p(const char* path)
     }
     if (mkdir(tmp, 0755) != 0 && errno != EEXIST)
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH, "mkdir %s: %s", tmp, strerror(errno));
+}
+
+/* Xbox file names are case-insensitive and a title spells them however it
+ * likes ("ODB DATA\\menu.ODB" for "ODB Data/Menu.odb"); a Linux file system
+ * matches exactly. When the path as spelled is not there, walk it from
+ * `from` (the end of the host base directory, which is spelled right) and
+ * replace each component that is missing with the entry that matches it
+ * ignoring case. A case-only difference never changes the length, so this
+ * edits in place. Components that are not there under any spelling -- a file
+ * about to be created -- are left as they are. */
+static void posix_fix_case(char* path, size_t from)
+{
+    struct stat st;
+    char* comp;
+
+    if (stat(path, &st) == 0)
+        return;
+    comp = path + from;
+    while (*comp == '/')
+        comp++;
+    while (*comp) {
+        char* end = strchr(comp, '/');
+        char save;
+
+        if (!end)
+            end = comp + strlen(comp);
+        save = *end;
+        *end = '\0';
+        if (stat(path, &st) != 0) {
+            struct dirent* de;
+            DIR* d;
+            int found = 0;
+
+            comp[-1] = '\0';
+            d = opendir(comp - 1 == path ? "/" : path);
+            comp[-1] = '/';
+            if (d) {
+                while ((de = readdir(d)) != NULL)
+                    if (strcasecmp(de->d_name, comp) == 0) {
+                        memcpy(comp, de->d_name, strlen(comp));
+                        found = 1;
+                        break;
+                    }
+                closedir(d);
+            }
+            if (!found) {
+                *end = save;
+                return;
+            }
+        }
+        *end = save;
+        if (!save)
+            break;
+        comp = end + 1;
+    }
 }
 
 void xbox_path_init(const char* game_dir, const char* save_dir)
@@ -645,6 +702,7 @@ translate:
             while (n > 1 && host_path_buf[n - 1] == '/')
                 host_path_buf[--n] = '\0';
         }
+        posix_fix_case(host_path_buf, strlen(base_dir));
 
         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s", xbox_path, host_path_buf);
         return TRUE;

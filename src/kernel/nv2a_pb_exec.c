@@ -2305,7 +2305,21 @@ static double prof_lap(void)
 #define NV_RASTER_MAX_THREADS 16
 #define NV_RASTER_MT_MIN_PIXELS 8192
 
-#if defined(_WIN32)
+/* The pool is Win32 events and threads, which win32_compat.c provides on
+ * POSIX too; these two it does not. */
+#if !defined(_WIN32)
+#include <unistd.h>
+#define InterlockedAdd64(p, v) __atomic_add_fetch((p), (v), __ATOMIC_SEQ_CST)
+static int nv_cpu_count(void) { return (int)sysconf(_SC_NPROCESSORS_ONLN); }
+#else
+static int nv_cpu_count(void)
+{
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return (int)si.dwNumberOfProcessors;
+}
+#endif
+
 static struct {
     int n;                                  /* threads incl. the caller */
     HANDLE start[NV_RASTER_MAX_THREADS], done;
@@ -2343,11 +2357,9 @@ static int raster_pool_size(void)
     static int init;
     if (!init) {
         const char *e = getenv("RECOMP_RASTER_THREADS");
-        SYSTEM_INFO si;
         int n, k;
         init = 1;
-        GetSystemInfo(&si);
-        n = e ? atoi(e) : (int)si.dwNumberOfProcessors - 1;
+        n = e ? atoi(e) : nv_cpu_count() - 1;
         if (n < 1) n = 1;
         if (n > NV_RASTER_MAX_THREADS) n = NV_RASTER_MAX_THREADS;
         s_pool.n = n;
@@ -2431,22 +2443,6 @@ static void xf_queue_run(XfCount *total)
         total->zpass += s_pool.cnt[k].zpass;
     }
 }
-#else
-static int raster_pool_size(void)
-{
-    return 1;
-}
-
-static void xf_rows_parallel(const XfTri *T, XfCount *total)
-{
-    xf_rows(T, T->miny, 1, total);
-}
-
-static void xf_queue_run(XfCount *total)
-{
-    xf_rows_queued(0, 1, total);
-}
-#endif
 
 static int xf_batching(void)
 {

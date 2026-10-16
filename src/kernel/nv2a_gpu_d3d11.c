@@ -10,6 +10,10 @@
  * decode as the software evaluator (nv2a_combiner.c), so the two can be held
  * against each other. Constants travel in a cbuffer, so a program differing
  * only in its factors reuses the shader.
+ *
+ * Natively on Linux the same code runs on DXVK Native -- DXVK's D3D11 built as
+ * Linux libraries -- when built with XBOX_DXVK_NATIVE; see the block below
+ * the includes.
  */
 #include "nv2a_gpu.h"
 #include "nv2a_vsh_interp.h"
@@ -18,9 +22,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <math.h>
 
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(XBOX_DXVK_NATIVE)
 
 #define COBJMACROS
 #include <windows.h>
@@ -29,7 +34,139 @@
 #include <dxgi.h>
 #include <d3dcompiler.h>
 
+#if !defined(_WIN32)
+/* DXVK Native: the D3D11 that runs under Wine, as Linux libraries
+ * (libdxvk_d3d11/libdxvk_dxgi), with HWND standing for an SDL_Window -- the
+ * one the framebuffer window opens (fb_present.c). Its headers give the D3D11
+ * and DXGI interfaces and little else of Win32, so the few other calls this
+ * file makes are stood in for here.
+ *
+ * Nothing is linked: DXVK, and vkd3d-utils for D3DCompile (the HLSL compiler
+ * Wine's d3dcompiler_47 is built on, so shaders compile the same way and the
+ * shader-cache/ blobs from a Wine run are reused as they are), are opened at
+ * run time. Without them D3D11CreateDevice fails and the software rasteriser
+ * draws, as it does without a GPU on Windows. */
+#include <dlfcn.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <SDL.h>
+#include <SDL_vulkan.h>
+
+typedef HRESULT (*PfnCreateDevice)(IDXGIAdapter *, D3D_DRIVER_TYPE, HMODULE,
+                                   UINT, const D3D_FEATURE_LEVEL *, UINT, UINT,
+                                   ID3D11Device **, D3D_FEATURE_LEVEL *,
+                                   ID3D11DeviceContext **);
+typedef HRESULT (*PfnCompile)(const void *, SIZE_T, const char *,
+                              const D3D_SHADER_MACRO *, ID3DInclude *,
+                              const char *, const char *, UINT, UINT,
+                              ID3DBlob **, ID3DBlob **);
+typedef HRESULT (*PfnCreateBlob)(SIZE_T, ID3DBlob **);
+static PfnCreateDevice p_create_device;
+static PfnCompile p_compile;
+static PfnCreateBlob p_create_blob;
+
+static void *native_sym(const char *const *libs, const char *name)
+{
+    for (; *libs; libs++) {
+        void *h = dlopen(*libs, RTLD_NOW | RTLD_LOCAL);
+        if (h)
+            return dlsym(h, name);
+    }
+    return NULL;
+}
+
+static int native_load(void)
+{
+    static int state = -1;
+    if (state < 0) {
+        static const char *const d3d11[] = { "libdxvk_d3d11.so.0", "libdxvk_d3d11.so", NULL };
+        static const char *const utils[] = { "libvkd3d-utils.so.1", "libvkd3d-utils.so", NULL };
+        /* DXVK Native picks its window system from this; ours is SDL2. */
+        setenv("DXVK_WSI_DRIVER", "SDL2", 0);
+        p_create_device = (PfnCreateDevice)native_sym(d3d11, "D3D11CreateDevice");
+        p_compile = (PfnCompile)native_sym(utils, "D3DCompile");
+        p_create_blob = (PfnCreateBlob)native_sym(utils, "D3DCreateBlob");
+        state = p_create_device && p_compile && p_create_blob;
+        if (!state)
+            fprintf(stderr, "[GPU] %s not found; drawing in software\n",
+                    !p_create_device ? "DXVK Native (libdxvk_d3d11.so.0)"
+                                     : "vkd3d-utils (libvkd3d-utils.so.1)");
+    }
+    return state;
+}
+
+static HRESULT native_D3D11CreateDevice(IDXGIAdapter *a, D3D_DRIVER_TYPE t, HMODULE m,
+                                        UINT f, const D3D_FEATURE_LEVEL *fl, UINT nfl,
+                                        UINT sdk, ID3D11Device **dev,
+                                        D3D_FEATURE_LEVEL *got, ID3D11DeviceContext **ctx)
+{
+    if (!native_load())
+        return E_FAIL;
+    return p_create_device(a, t, m, f, fl, nfl, sdk, dev, got, ctx);
+}
+
+static HRESULT native_D3DCompile(const void *src, SIZE_T n, const char *name,
+                                 const D3D_SHADER_MACRO *defs, ID3DInclude *inc,
+                                 const char *entry, const char *profile, UINT f1,
+                                 UINT f2, ID3DBlob **code, ID3DBlob **err)
+{
+    if (!native_load())
+        return E_FAIL;
+    return p_compile(src, n, name, defs, inc, entry, profile, f1, f2, code, err);
+}
+
+static HRESULT native_D3DCreateBlob(SIZE_T n, ID3DBlob **blob)
+{
+    if (!native_load())
+        return E_FAIL;
+    return p_create_blob(n, blob);
+}
+
+#define D3D11CreateDevice native_D3D11CreateDevice
+#define D3DCompile        native_D3DCompile
+#define D3DCreateBlob     native_D3DCreateBlob
+
+static BOOL QueryPerformanceCounter(LARGE_INTEGER *c)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    c->QuadPart = (LONGLONG)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    return TRUE;
+}
+
+static BOOL QueryPerformanceFrequency(LARGE_INTEGER *f)
+{
+    f->QuadPart = 1000000000LL;
+    return TRUE;
+}
+
+static DWORD GetTickCount(void)
+{
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return (DWORD)(c.QuadPart / 1000000);
+}
+
+#define MOVEFILE_REPLACE_EXISTING 1
+static BOOL CreateDirectoryA(const char *d, void *sa) { (void)sa; return mkdir(d, 0755) == 0; }
+static BOOL MoveFileExA(const char *a, const char *b, DWORD f) { (void)f; return rename(a, b) == 0; }
+static BOOL DeleteFileA(const char *a) { return unlink(a) == 0; }
+
+/* The drawable size of the SDL window the swap chain presents to. */
+static BOOL GetClientRect(HWND w, RECT *r)
+{
+    int cw = 0, ch = 0;
+    SDL_Vulkan_GetDrawableSize((SDL_Window *)w, &cw, &ch);
+    r->left = r->top = 0;
+    r->right = cw;
+    r->bottom = ch;
+    return cw > 0 && ch > 0;
+}
+#endif /* !_WIN32 */
+
 extern ptrdiff_t xbox_GetMemoryOffset(void);
+extern void xbox_FramebufferWindowGpuUnavailable(void);
 
 static int s_state = -1;                /* -1 untried, 0 unavailable, 1 ready */
 static ID3D11Device *s_dev;
@@ -1723,8 +1860,11 @@ int nv2a_gpu_enabled(void)
     }
     if (!on)
         return 0;
-    if (s_state < 0)
+    if (s_state < 0) {
         s_state = gpu_init();
+        if (s_state != 1)
+            xbox_FramebufferWindowGpuUnavailable();
+    }
     return s_state == 1;
 }
 
@@ -1865,6 +2005,7 @@ int nv2a_gpu_present(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, ui
     if (!s_swap) {
         if (!swap_create(hwnd, cw, ch)) {
             s_swap_failed = 1;
+            xbox_FramebufferWindowGpuUnavailable();
             return 0;
         }
         xbox_FramebufferWindowGpuOwned(1);
