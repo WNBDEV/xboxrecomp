@@ -1887,7 +1887,12 @@ class Lifter:
             r = ops[1].reg
             if r in ("al", "bl", "cl", "dl", "ah", "bh", "ch", "dh"):
                 src = f"SX8({src})"
-            elif r in ("ax", "bx", "cx", "dx", "si", "di"):
+            elif r in ("ax", "bx", "cx", "dx", "si", "di", "bp", "sp"):
+                # All eight, as movzx has them. bp and sp were missing, so
+                # `movsx ebp, bp` lifted to a zero-extend: Bink's IDCT keeps
+                # a row-6 DCT coefficient in bp, and every negative one turned
+                # into ~65,000 -- the striped 8x8 blocks in Alter Echo's
+                # videos, on the detailed edges where those coefficients live.
                 src = f"SX16({src})"
         return [_fmt_operand_write(ops[0], src)]
 
