@@ -53,13 +53,19 @@ extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 extern void nv2a_pb_exec_report(void);
 static int s_exec_enabled = -1;
 
+/* Where each (subchannel, method) sits in s_seen, plus one; 0 is unseen.
+ * note() runs for every method the executor is handed, and finding the entry
+ * by scanning s_seen made it a third of the GPU thread's time in Alter Echo
+ * (perf, ~300 distinct methods). Methods are word offsets below 0x2000. */
+static uint16_t s_seen_at[8][0x800];
+
 static void note(uint32_t subch, uint32_t method)
 {
-    for (int i = 0; i < s_seen_count; i++) {
-        if (s_seen[i].method == method && s_seen[i].subch == subch) {
-            s_seen[i].count++;
-            return;
-        }
+    uint16_t *at = &s_seen_at[subch & 7u][(method >> 2) & 0x7FFu];
+
+    if (*at) {
+        s_seen[*at - 1].count++;
+        return;
     }
     if (s_seen_count >= PB_MAX_METHODS) {
         /* Silently dropping past the cap is how a truncated inventory reads as
@@ -77,6 +83,7 @@ static void note(uint32_t subch, uint32_t method)
         s_seen[s_seen_count].subch  = subch;
         s_seen[s_seen_count].count  = 1;
         s_seen_count++;
+        *at = (uint16_t)s_seen_count;
     }
 }
 

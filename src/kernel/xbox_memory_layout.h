@@ -468,6 +468,7 @@ uint32_t xbox_HeapBlockSize(uint32_t xbox_va);
  * Off by default; it changes which address later allocations get.
  */
 int xbox_HeapReclaimEnabled(void);
+int xbox_HeapVfreeEnabled(void);
 
 /**
  * Get the file mapping handle for the Xbox memory region.

@@ -921,6 +921,81 @@ static void crtc_raster_tick(volatile uint32_t *regs)
     regs[0x600808 / 4] = (regs[0x600808 / 4] & ~0x7FFu) | line;
 }
 
+/* The PFB write-combine flush, completed on the write.
+ *
+ * D3D's KickOff -- and the helper beside it at 0x16C7A0 in Alter Echo -- set
+ * PFB 0x100410 bit 16 and spin until it reads clear; a page above, the busy
+ * ack thread clears it, but only once a millisecond, because a thread that
+ * looked more often would cost a core. Alter Echo kicks off many times a
+ * frame: perf on a player's session put 80% of its game thread in those two
+ * spins, about 20 ms of every 33 ms frame, and the game ran at 27-37 fps with
+ * the GPU thread two-thirds busy.
+ *
+ * So, as with the AC'97 channel reset, the PFB page is read-only: a write
+ * faults, is single-stepped, and the flush bit is cleared the moment the
+ * write lands. A flush has nothing to wait for here -- the aperture is
+ * coherent memory -- so completing at once is exact. Two exceptions per
+ * kickoff instead of up to a millisecond of spinning. The busy ack thread
+ * still clears the bit, for anything that slips past (a write landing while
+ * another thread holds the page open). RECOMP_PFB_TRAP=0 turns this off. */
+#define PFB_PAGE        0x100000u
+#define PFB_FLUSH_REG   0x410u
+#define PFB_FLUSH_BIT   0x00010000u
+
+static void *g_pfb_page = NULL;
+static RECOMP_TLS int s_pfb_stepping = 0;
+
+static LONG CALLBACK pfb_flush_veh(PEXCEPTION_POINTERS ep)
+{
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    DWORD old;
+
+    if (!g_pfb_page)
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (code == EXCEPTION_SINGLE_STEP && s_pfb_stepping) {
+        volatile LONG *r = (volatile LONG *)((char *)g_pfb_page + PFB_FLUSH_REG);
+        LONG v;
+        s_pfb_stepping = 0;
+        while ((v = *r) & (LONG)PFB_FLUSH_BIT)
+            if (InterlockedCompareExchange(r, v & ~(LONG)PFB_FLUSH_BIT, v) == v)
+                break;
+        VirtualProtect(g_pfb_page, 4096, PAGE_READONLY, &old);
+        ep->ContextRecord->EFlags &= ~0x100u;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (code == EXCEPTION_ACCESS_VIOLATION
+            && ep->ExceptionRecord->ExceptionInformation[0] == 1) {
+        uintptr_t fault = ep->ExceptionRecord->ExceptionInformation[1];
+        if (fault >= (uintptr_t)g_pfb_page && fault < (uintptr_t)g_pfb_page + 4096) {
+            if (!VirtualProtect(g_pfb_page, 4096, PAGE_READWRITE, &old))
+                return EXCEPTION_CONTINUE_SEARCH;
+            s_pfb_stepping = 1;
+            ep->ContextRecord->EFlags |= 0x100u;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void pfb_arm_flush_trap(void)
+{
+    DWORD old;
+    const char *e = getenv("RECOMP_PFB_TRAP");
+
+    if (!g_nv2a_memory || g_pfb_page || (e && *e == '0'))
+        return;
+    g_pfb_page = (char *)g_nv2a_memory + PFB_PAGE;
+    if (!AddVectoredExceptionHandler(1, pfb_flush_veh)
+            || !VirtualProtect(g_pfb_page, 4096, PAGE_READONLY, &old)) {
+        g_pfb_page = NULL;
+        fprintf(stderr, "  NV2A: could not trap PFB writes; a flush waits"
+                        " for the busy ack thread\n");
+        return;
+    }
+    fprintf(stderr, "  NV2A: PFB writes trapped (a write-combine flush"
+                    " completes on the write)\n");
+}
+
 static DWORD WINAPI nv2a_busy_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
@@ -1157,6 +1232,7 @@ static void xbox_Nv2aAckStart(void)
     g_nv2a_ack_stop = 0;
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);
+    pfb_arm_flush_trap();
     if (!(getenv("RECOMP_BUSY_ACK") && *getenv("RECOMP_BUSY_ACK") == '0')) {
         HANDLE busy = CreateThread(NULL, 0, nv2a_busy_ack_thread,
                                    g_nv2a_memory, 0, NULL);
@@ -3009,8 +3085,30 @@ static SRWLOCK g_heap_lock = SRWLOCK_INIT;
 int xbox_HeapReclaimEnabled(void)
 {
     static int on = -1;
-    if (on < 0)
-        on = getenv("RECOMP_HEAP_RECLAIM") != NULL;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_HEAP_RECLAIM");
+        on = e && *e && *e != '0';
+    }
+    return on;
+}
+
+/* RECOMP_HEAP_VFREE: the narrow half of RECOMP_HEAP_RECLAIM, for titles
+ * that boot wrong under the whole of it (Alter Echo stalls before its first
+ * frame). NtFreeVirtualMemory returns heap-backed memory, and a freed block
+ * is not spent whole on a request much smaller than it.
+ *
+ * Without it, memory NtAllocateVirtualMemory took from the heap never came
+ * back: every Bink video leaked its buffers (16, 8, 4 or 2 MB, whichever its
+ * ladder got), and after enough of them Alter Echo's tutorial video found
+ * under 2 MB left, could not get a stack for its decoder thread either, ran
+ * that thread inline and hung the game. */
+int xbox_HeapVfreeEnabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_HEAP_VFREE");
+        on = e && *e && *e != '0';
+    }
     return on;
 }
 
@@ -3362,12 +3460,55 @@ uint32_t xbox_ContiguousAllocatedBytes(void)
 
 static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment);
 
+/* RECOMP_HEAP_STATS=1: every 10 s of allocating, how far the bump pointer
+ * has gone, how much of that is live and how much free in the block table,
+ * and the largest free block -- which is what a big request needs. A heap
+ * that runs out with plenty "free" is fragmentation or blocks reused whole;
+ * one that runs out with everything live is a leak or real demand. */
+static void heap_stats_locked(void)
+{
+    static int on = -1;
+    static DWORD last;
+    uint64_t live = 0, free_b = 0;
+    uint32_t largest = 0, tail;
+    DWORD now;
+    int i, nlive = 0;
+
+    if (on < 0)
+        on = getenv("RECOMP_HEAP_STATS") != NULL;
+    now = GetTickCount();
+    if (!on || now - last < 10000)
+        return;
+    last = now;
+    for (i = 0; i < g_heap_block_count; i++) {
+        if (!g_heap_blocks[i].size)
+            continue;
+        if (g_heap_blocks[i].free) {
+            free_b += g_heap_blocks[i].size;
+            if (g_heap_blocks[i].size > largest)
+                largest = g_heap_blocks[i].size;
+        } else {
+            live += g_heap_blocks[i].size;
+            nlive++;
+        }
+    }
+    tail = XBOX_HEAP_TOP - g_heap_next;
+    fprintf(stderr, "  [HEAP] stats: reached %u KB of %u KB; live %llu KB in %d"
+            " blocks, free %llu KB in the table (largest %u KB), %u KB untouched"
+            " at the top%s\n", (g_heap_next - XBOX_HEAP_BASE) >> 10,
+            (unsigned)(XBOX_HEAP_TOP - XBOX_HEAP_BASE) >> 10,
+            (unsigned long long)(live >> 10), nlive,
+            (unsigned long long)(free_b >> 10), largest >> 10, tail >> 10,
+            xbox_HeapReclaimEnabled() ? " (reclaim on)" : "");
+}
+
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
 {
     uint32_t r;
 
     AcquireSRWLockExclusive(&g_heap_lock);
     r = heap_alloc_locked(size, alignment);
+    heap_stats_locked();
     ReleaseSRWLockExclusive(&g_heap_lock);
     return r;
 }
@@ -3404,6 +3545,10 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
             }
             if (g_heap_blocks[i].addr & (alignment - 1)) {
                 continue;   /* wrong alignment for this request */
+            }
+            if (xbox_HeapVfreeEnabled() && g_heap_blocks[i].size / 2 > size
+                    && g_heap_blocks[i].size - size > 65536) {
+                continue;   /* a freed video buffer is not a 64-byte node */
             }
             g_heap_blocks[i].free = 0;
             result = g_heap_blocks[i].addr;

@@ -1144,7 +1144,8 @@ static void bridge_NtFreeVirtualMemory(void)
      * VirtualFree, which fails, so none of it ever came back. Under
      * RECOMP_HEAP_RECLAIM a release returns the block to the heap and a
      * decommit zeroes the pages it names, since heap memory stays committed. */
-    if (xbox_HeapReclaimEnabled() && base_ptr && size_ptr) {
+    if ((xbox_HeapReclaimEnabled() || xbox_HeapVfreeEnabled())
+            && base_ptr && size_ptr) {
         uint32_t vm_base = BRIDGE_MEM32(base_ptr);
         uint32_t left = xbox_HeapBlockSize(vm_base);
 
