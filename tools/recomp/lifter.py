@@ -739,6 +739,47 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("ja", "jnbe"):
             return f"(!_cf && {lhs} != 0)", desc
 
+    # ── add/sub: signed conditions, and sub's ordered ones, at width ──
+    #
+    # Signed "less" is SF != OF. Reading it off the result's sign alone
+    # (`(int32_t)result < 0`) is right only when the add or sub did not
+    # overflow, and the reconstruction below for sub -- original a = result
+    # + b, compared at 32 bits -- was right only for 32-bit operands. The
+    # conformance fuzzer found both: 323 of 30,000 vectors, every one an
+    # add or sub feeding a signed setcc, at all three widths.
+    #
+    # Exact instead: sub recovers a by wrapping result + b back to the
+    # operand's width, and compares a with b as the instruction did; for add,
+    # SF != OF holds exactly when the full-precision sum a + b is negative.
+    if (flag_setter in ("add", "sub") and lhs == "_fa" and rhs == "_fb"
+            and flag_ops):
+        width = _operand_width(flag_ops[0]) or 4
+        if width not in (1, 2, 4):
+            width = 4
+        mask = {1: "0xFFu", 2: "0xFFFFu", 4: "0xFFFFFFFFu"}[width]
+        sx = {1: "(int8_t)", 2: "(int16_t)", 4: "(int32_t)"}[width]
+        signed_jcc = {"jl": "<", "jnge": "<", "jge": ">=", "jnl": ">=",
+                      "jle": "<=", "jng": "<=", "jg": ">", "jnle": ">"}
+        if flag_setter == "sub":
+            a_u = f"((uint32_t)(_fa + _fb) & {mask})"
+            if jcc in signed_jcc:
+                return f"((int32_t){sx}{a_u} {signed_jcc[jcc]} _fbs)", desc
+            unsigned_jcc = {"jb": "<", "jnae": "<", "jc": "<", "jae": ">=",
+                            "jnb": ">=", "jnc": ">=", "jbe": "<=", "jna": "<=",
+                            "ja": ">", "jnbe": ">"}
+            if jcc in unsigned_jcc:
+                return f"({a_u} {unsigned_jcc[jcc]} _fb)", desc
+        else:
+            total = f"((int64_t){sx}((uint32_t)(_fa - _fb) & {mask}) + (int64_t)_fbs)"
+            if jcc in ("jl", "jnge"):
+                return f"({total} < 0)", desc
+            if jcc in ("jge", "jnl"):
+                return f"({total} >= 0)", desc
+            if jcc in ("jle", "jng"):
+                return f"({total} < 0 || _fa == 0)", desc
+            if jcc in ("jg", "jnle"):
+                return f"({total} >= 0 && _fa != 0)", desc
+
     # ── sub: a = a - b, flags from (a_orig - b) ──
     if flag_setter == "sub":
         if jcc in ("je", "jz"):
