@@ -291,7 +291,24 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         wc.lpszClassName = "XboxRecompFramebuffer";
         RegisterClassA(&wc);
     }
-    r.left = 0; r.top = 0; r.right = (LONG)s_fb_width; r.bottom = (LONG)s_fb_height;
+    /* RECOMP_SCALE renders N times the console's resolution (the GPU
+     * backend); open the window that large too, shrunk to fit the screen's
+     * work area with the console's 4:3 kept. It can be resized freely: the
+     * swap chain scales to whatever the window is. */
+    {
+        const char *e = getenv("RECOMP_SCALE");
+        int sc = e ? atoi(e) : 1;
+        RECT wa;
+        LONG cw, ch;
+        if (sc < 1 || sc > 4) sc = 1;
+        cw = (LONG)s_fb_width * sc; ch = (LONG)s_fb_height * sc;
+        if (SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0)) {
+            LONG aw = wa.right - wa.left - 16, ah = wa.bottom - wa.top - 48;
+            if (ch > ah) { cw = cw * ah / ch; ch = ah; }
+            if (cw > aw) { ch = ch * aw / cw; cw = aw; }
+        }
+        r.left = 0; r.top = 0; r.right = cw; r.bottom = ch;
+    }
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Xbox Recomp - Framebuffer",
                            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
@@ -332,17 +349,22 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             if (s_present[idx])
                 memcpy(s_rgb, s_present[idx],
                        (size_t)s_fb_width * s_fb_height * 4);
-            if (!s_gpu_owned)
-                StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
+            if (!s_gpu_owned) {
+                RECT cr;
+                GetClientRect(hwnd, &cr);
+                StretchDIBits(hdc, 0, 0, cr.right, cr.bottom,
                               0, 0, (int)s_fb_width, (int)s_fb_height,
                               s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
+            }
         } else if (s_fb_va && s_fb_pitch && s_rgb && !s_gpu_owned) {
             /* No flip yet, or pinned with RECOMP_FB_VA: read guest memory as
              * before, which is also what a title that never flips needs. */
             const uint8_t *src =
                 (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
+            RECT cr;
             fb_convert(src, s_fb_pitch / s_fb_width);
-            StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
+            GetClientRect(hwnd, &cr);
+            StretchDIBits(hdc, 0, 0, cr.right, cr.bottom,
                           0, 0, (int)s_fb_width, (int)s_fb_height,
                           s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
         }
