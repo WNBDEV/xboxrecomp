@@ -22,6 +22,20 @@
 
 static void xa2_stats(const int16_t *samples, int n, int dropped);
 
+/* RECOMP_AUDIO_MUTE=1: everything as usual -- stats, RECOMP_AUDIO_DUMP --
+ * except that the device is handed silence. For tests on a machine someone
+ * is sitting at. */
+static const int16_t *xa2_audible(const int16_t *samples)
+{
+    static int mute = -1;
+    static const int16_t silence[XA2_BUF_SAMPLES * XA2_CHANNELS];
+    if (mute < 0) {
+        const char *e = getenv("RECOMP_AUDIO_MUTE");
+        mute = e && *e == '1';
+    }
+    return mute ? silence : samples;
+}
+
 #if defined(_WIN32)
 
 #define COBJMACROS
@@ -149,6 +163,7 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
         return 0;
     }
     xa2_stats(samples, num_samples, 0);
+    samples = xa2_audible(samples);
 
     idx = g_xa2_next_buf;
     copy_samples = (num_samples > XA2_BUF_SAMPLES) ? XA2_BUF_SAMPLES : num_samples;
@@ -230,6 +245,7 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
         return 0;
     }
     xa2_stats(samples, num_samples, 0);
+    samples = xa2_audible(samples);
     if (SDL_QueueAudio(g_sdl_dev, samples, (Uint32)n * bytes_per) != 0)
         return 0;
     g_sdl_frames_written++;

@@ -3132,6 +3132,25 @@ int xbox_HeapReclaimEnabled(void)
     return on;
 }
 
+/* RECOMP_CONTIG_FREE: the contiguous-arena half of RECOMP_HEAP_RECLAIM --
+ * MmFreeContiguousMemory gives blocks back and they are reused -- for titles
+ * that cannot run the whole of it. Alter Echo allocates ~4.5 MB of
+ * contiguous memory for every Bink video and frees it afterwards; with the
+ * bump allocator the high-water mark climbed by that much per video, and on
+ * the fourth play of the attract-mode intro it passed the address of the
+ * video's sound buffer, which lives in ordinary RAM. The APU decides RAM or
+ * contiguous window by that mark (mcpx_apu_phys), so from then on it played
+ * stale window memory: a loud looping buzz. */
+int xbox_ContigReclaimEnabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_CONTIG_FREE");
+        on = xbox_HeapReclaimEnabled() || (e && *e && *e != '0');
+    }
+    return on;
+}
+
 /* RECOMP_HEAP_VFREE: the narrow half of RECOMP_HEAP_RECLAIM, for titles
  * that boot wrong under the whole of it (Alter Echo stalls before its first
  * frame). NtFreeVirtualMemory returns heap-backed memory, and a freed block
@@ -3375,7 +3394,7 @@ static void contig_insert(int at, uint32_t addr, uint32_t size, int is_free)
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
 {
     uint32_t result = 0;
-    int reclaim = xbox_HeapReclaimEnabled();
+    int reclaim = xbox_ContigReclaimEnabled();
     int i;
 
     if (alignment < 4096) alignment = 4096;
@@ -3421,9 +3440,17 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
             return 0;
         }
         if (reclaim) {
-            if (result > g_contig_next)    /* the alignment gap stays usable */
+            /* The alignment gap is recorded but not handed out. The bump
+             * allocator never gave those pages to anyone, and something in
+             * the XDK treats the page after a block as its own: reusing the
+             * gaps -- 0x80083000, just past D3D's 512 KB push buffer, first
+             * -- stalled Alter Echo before its first frame with the GPU's
+             * PUT stuck at 0x3000, which is what had made the whole of
+             * RECOMP_HEAP_RECLAIM unusable for it. Blocks the title frees
+             * are reused as before. */
+            if (result > g_contig_next)
                 contig_insert(g_contig_block_count, g_contig_next,
-                              result - g_contig_next, 1);
+                              result - g_contig_next, 0);
             contig_insert(g_contig_block_count, result, size, 0);
         }
         g_contig_next = result + size;
@@ -3432,6 +3459,9 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
         ReleaseSRWLockExclusive(&g_contig_lock);
 
     memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
+    if (getenv("RECOMP_CONTIG_TRACE"))
+        fprintf(stderr, "  [CONTIG] alloc %08X +%X (align %X) hwm %08X\n",
+                result, size, alignment, g_contig_next);
     return result;
 }
 
@@ -3441,7 +3471,7 @@ int xbox_ContiguousFree(uint32_t addr)
 {
     int i, found = 0;
 
-    if (!xbox_HeapReclaimEnabled())
+    if (!xbox_ContigReclaimEnabled())
         return 0;
     AcquireSRWLockExclusive(&g_contig_lock);
     for (i = 0; i < g_contig_block_count; i++) {
@@ -3449,6 +3479,8 @@ int xbox_ContiguousFree(uint32_t addr)
             continue;
         g_contig_blocks[i].free = 1;
         found = 1;
+        if (getenv("RECOMP_CONTIG_TRACE"))
+            fprintf(stderr, "  [CONTIG] free  %08X +%X\n", addr, g_contig_blocks[i].size);
         if (i + 1 < g_contig_block_count && g_contig_blocks[i + 1].free
                 && g_contig_blocks[i].addr + g_contig_blocks[i].size == g_contig_blocks[i + 1].addr) {
             g_contig_blocks[i].size += g_contig_blocks[i + 1].size;
@@ -3475,7 +3507,7 @@ uint32_t xbox_ContiguousBlockSize(uint32_t addr)
     uint32_t r = 0;
     int i;
 
-    if (!xbox_HeapReclaimEnabled())
+    if (!xbox_ContigReclaimEnabled())
         return 0;
     AcquireSRWLockShared(&g_contig_lock);
     for (i = 0; i < g_contig_block_count; i++)
@@ -3495,6 +3527,34 @@ uint32_t xbox_ContiguousBlockSize(uint32_t addr)
 uint32_t xbox_ContiguousAllocatedBytes(void)
 {
     return g_contig_next - XBOX_CONTIG_BASE;
+}
+
+/* Does physical address `phys` name contiguous memory (rather than RAM)? For
+ * bus masters -- the APU, the USB controller -- handed physical addresses.
+ * Below the high-water mark is the old answer, and the only one without block
+ * tracking. With it, a block that has been freed is no longer contiguous
+ * memory, so an address inside one is RAM's. */
+int xbox_ContiguousOwns(uint32_t phys)
+{
+    uint32_t va = XBOX_CONTIG_BASE + phys;
+    int i, owns;
+
+    if (phys >= g_contig_next - XBOX_CONTIG_BASE)
+        return 0;
+    if (!xbox_ContigReclaimEnabled())
+        return 1;
+    owns = 1;                   /* not in the table: allocated before tracking, or fixed */
+    AcquireSRWLockShared(&g_contig_lock);
+    for (i = 0; i < g_contig_block_count; i++) {
+        if (va < g_contig_blocks[i].addr)
+            break;              /* blocks are in address order */
+        if (va < g_contig_blocks[i].addr + g_contig_blocks[i].size) {
+            owns = !g_contig_blocks[i].free;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_contig_lock);
+    return owns;
 }
 
 

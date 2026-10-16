@@ -65,7 +65,7 @@ else()
             COMPILE_DEFINITIONS XBOX_DXVK_NATIVE
             INCLUDE_DIRECTORIES "${XBOX_DXVK_NATIVE_INCLUDE};${_sdl2_inc}"
             COMPILE_OPTIONS "-Wno-unused-variable;-Wno-unused-const-variable")
-        target_link_libraries(xbox_kernel PUBLIC ${CMAKE_DL_LIBS})
+        target_link_libraries(xbox_kernel PUBLIC SDL2::SDL2 ${CMAKE_DL_LIBS})
         message(STATUS "xbox_kernel: GPU backend on DXVK Native (${XBOX_DXVK_NATIVE_INCLUDE})")
     endif()
 endif()

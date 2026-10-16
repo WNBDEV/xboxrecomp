@@ -496,11 +496,12 @@ static int guest_ok(uint32_t va, uint32_t bytes)
  * inside it is the image. Sending that one to the window delivered the
  * descriptor where the driver never looked, and it reset the port and asked
  * again, forever. */
+extern int xbox_ContiguousOwns(uint32_t phys);   /* xbox_memory_layout.c */
 static uint32_t bus_resolve(uint32_t addr)
 {
     if (addr >= g_xbox_image_lo && addr < g_xbox_image_hi)
         return addr;
-    if (addr && addr < xbox_ContiguousAllocatedBytes())
+    if (addr && xbox_ContiguousOwns(addr))
         return OHCI_CONTIG_BASE + addr;
     return addr;
 }

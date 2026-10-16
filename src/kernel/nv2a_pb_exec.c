@@ -4785,10 +4785,16 @@ void nv2a_pb_exec_report(void)
     int i, j;
 
     {
-        /* Frames per second of guest time, from flips between reports. */
+        /* Frames per second, from flips between reports. Wall time: clock()
+         * is that under MinGW but CPU time on POSIX, which reported 160 fps
+         * natively for a game held at 60. */
         static uint32_t last_flips;
         static unsigned long last_ms;
-        unsigned long now = (unsigned long)(clock() * 1000.0 / CLOCKS_PER_SEC);
+        LARGE_INTEGER qc, qf;
+        unsigned long now;
+        QueryPerformanceCounter(&qc);
+        QueryPerformanceFrequency(&qf);
+        now = (unsigned long)(qc.QuadPart / (qf.QuadPart / 1000));
         if (last_ms && now > last_ms)
             fprintf(stderr, "[GPU] %.2f fps (%u flips)%c",
                     (s_gpu.flips - last_flips) * 1000.0 / (now - last_ms),

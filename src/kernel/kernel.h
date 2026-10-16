@@ -559,9 +559,11 @@ const wchar_t *xbox_LastHostPath(void);
 
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size);
 
-#if defined(_WIN32)
 /* TRUE if a host path is on the utility drive (Z:, cache partitions 3-5). */
+#if defined(_WIN32)
 BOOL xbox_path_is_utility_drive(const WCHAR *host_path);
+#else
+BOOL xbox_path_is_utility_drive(const char *host_path);
 #endif
 
 /* Optional: a project sets this to see the guest paths the kernel translates

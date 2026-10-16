@@ -127,8 +127,45 @@ static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
  * Voice off / lock
  * ============================================================ */
 
+/* RECOMP_APU_VOICES=1: each voice as the title switches it on or off, with
+ * its format and buffer registers -- which voice handle, where its samples
+ * are, how long, looping or streamed. A stream that goes wrong after several
+ * plays of the same thing shows up as a difference between those lines. */
+static void voice_trace(MCPXAPUState *d, const char *what, uint16_t v)
+{
+    static int on = -1;
+    static unsigned n;
+    if (on < 0)
+        on = getenv("RECOMP_APU_VOICES") != NULL;
+    if (!on || n++ >= 4000)
+        return;
+    fprintf(stderr, "[APU-VOICE] %s %3u fmt=%08X ba=%08X lbo=%06X ebo=%06X cbo=%06X "
+            "pitch=%08X vol=%08X/%08X\n", what, v,
+            voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFF),
+            voice_get_mask(d, v, NV_PAVS_VOICE_CUR_PSL_START, 0xFFFFFFFF),
+            voice_get_mask(d, v, NV_PAVS_VOICE_CUR_PSH_SAMPLE, 0xFFFFFFFF) & 0xFFFFFF,
+            voice_get_mask(d, v, NV_PAVS_VOICE_PAR_NEXT, NV_PAVS_VOICE_PAR_NEXT_EBO),
+            voice_get_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET, NV_PAVS_VOICE_PAR_OFFSET_CBO),
+            voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK, 0xFFFFFFFF),
+            voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLA, 0xFFFFFFFF),
+            voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLB, 0xFFFFFFFF));
+    {
+        /* Where its first page is, and how far the contiguous allocator has
+         * got: mcpx_apu_phys reads an address below that from the
+         * contiguous window, at or above it from RAM. */
+        extern uint32_t xbox_ContiguousAllocatedBytes(void);
+        uint32_t ba = voice_get_mask(d, v, NV_PAVS_VOICE_CUR_PSL_START,
+                                     NV_PAVS_VOICE_CUR_PSL_START_BA);
+        uint32_t page = ldl_le_phys(address_space_memory,
+                                    d->regs[NV_PAPU_VPSGEADDR] + ba * 8);
+        fprintf(stderr, "[APU-VOICE]     page0=%08X contig_hwm=%08X\n", page,
+                xbox_ContiguousAllocatedBytes());
+    }
+}
+
 static void voice_off(MCPXAPUState *d, uint16_t v)
 {
+    voice_trace(d, "off", v);
     voice_set_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 0);
 
@@ -280,6 +317,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
                        NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 1);
 
         if (!locked) voice_lock(d, (uint16_t)selected_handle, false);
+        voice_trace(d, "on ", (uint16_t)selected_handle);
         break;
     }
 

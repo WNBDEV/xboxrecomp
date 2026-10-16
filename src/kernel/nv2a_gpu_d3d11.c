@@ -57,14 +57,81 @@ typedef HRESULT (*PfnCreateDevice)(IDXGIAdapter *, D3D_DRIVER_TYPE, HMODULE,
                                    UINT, const D3D_FEATURE_LEVEL *, UINT, UINT,
                                    ID3D11Device **, D3D_FEATURE_LEVEL *,
                                    ID3D11DeviceContext **);
-typedef HRESULT (*PfnCompile)(const void *, SIZE_T, const char *,
-                              const D3D_SHADER_MACRO *, ID3DInclude *,
-                              const char *, const char *, UINT, UINT,
-                              ID3DBlob **, ID3DBlob **);
-typedef HRESULT (*PfnCreateBlob)(SIZE_T, ID3DBlob **);
+/* vkd3d-utils keeps the Windows x64 calling convention on Linux (its WINAPI
+ * and STDMETHODCALLTYPE are ms_abi), where DXVK Native uses the host's. So
+ * D3DCompile is called as ms_abi, and the blobs it returns -- whose methods
+ * are ms_abi too -- are copied into blobs of our own (NativeBlob) before
+ * anything here or in DXVK touches them. Calling across the two unmarked
+ * scrambled the arguments: "Ignoring effect flags 0x24c80", then a crash. */
+#define MS_ABI __attribute__((ms_abi))
+typedef struct MsBlob MsBlob;
+typedef struct {
+    HRESULT (MS_ABI *QueryInterface)(MsBlob *, const GUID *, void **);
+    ULONG   (MS_ABI *AddRef)(MsBlob *);
+    ULONG   (MS_ABI *Release)(MsBlob *);
+    void   *(MS_ABI *GetBufferPointer)(MsBlob *);
+    SIZE_T  (MS_ABI *GetBufferSize)(MsBlob *);
+} MsBlobVtbl;
+struct MsBlob { const MsBlobVtbl *lpVtbl; };
+typedef HRESULT (MS_ABI *PfnCompile)(const void *, SIZE_T, const char *,
+                                     const D3D_SHADER_MACRO *, void *,
+                                     const char *, const char *, UINT, UINT,
+                                     MsBlob **, MsBlob **);
 static PfnCreateDevice p_create_device;
 static PfnCompile p_compile;
-static PfnCreateBlob p_create_blob;
+
+/* An ID3DBlob in this side's convention: a refcount and a copy of the bytes. */
+typedef struct {
+    ID3D10Blob iface;
+    LONG refs;
+    SIZE_T size;
+    unsigned char data[];
+} NativeBlob;
+
+static HRESULT STDMETHODCALLTYPE nb_query(ID3D10Blob *b, REFIID riid, void **out)
+{
+    (void)b; (void)riid;
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG STDMETHODCALLTYPE nb_addref(ID3D10Blob *b)
+{
+    return (ULONG)__atomic_add_fetch(&((NativeBlob *)b)->refs, 1, __ATOMIC_SEQ_CST);
+}
+static ULONG STDMETHODCALLTYPE nb_release(ID3D10Blob *b)
+{
+    LONG n = __atomic_sub_fetch(&((NativeBlob *)b)->refs, 1, __ATOMIC_SEQ_CST);
+    if (!n)
+        free(b);
+    return (ULONG)n;
+}
+static LPVOID STDMETHODCALLTYPE nb_pointer(ID3D10Blob *b) { return ((NativeBlob *)b)->data; }
+static SIZE_T STDMETHODCALLTYPE nb_size(ID3D10Blob *b) { return ((NativeBlob *)b)->size; }
+static ID3D10BlobVtbl s_nb_vtbl = { nb_query, nb_addref, nb_release, nb_pointer, nb_size };
+
+static ID3DBlob *native_blob(const void *data, SIZE_T n)
+{
+    NativeBlob *b = (NativeBlob *)malloc(sizeof(*b) + n);
+    if (!b)
+        return NULL;
+    b->iface.lpVtbl = &s_nb_vtbl;
+    b->refs = 1;
+    b->size = n;
+    if (data)
+        memcpy(b->data, data, n);
+    return (ID3DBlob *)&b->iface;
+}
+
+/* An ms_abi blob from vkd3d, copied over and released. */
+static ID3DBlob *native_from_ms(MsBlob *m)
+{
+    ID3DBlob *b;
+    if (!m)
+        return NULL;
+    b = native_blob(m->lpVtbl->GetBufferPointer(m), m->lpVtbl->GetBufferSize(m));
+    m->lpVtbl->Release(m);
+    return b;
+}
 
 static void *native_sym(const char *const *libs, const char *name)
 {
@@ -84,10 +151,16 @@ static int native_load(void)
         static const char *const utils[] = { "libvkd3d-utils.so.1", "libvkd3d-utils.so", NULL };
         /* DXVK Native picks its window system from this; ours is SDL2. */
         setenv("DXVK_WSI_DRIVER", "SDL2", 0);
+        /* And it asks SDL for Vulkan's instance extensions when the device
+         * is made, which can be before the framebuffer window has opened --
+         * with video not yet initialised that read through a null device
+         * inside SDL. Initialise it here; the window's own init then only
+         * counts up. */
+        if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0)
+            fprintf(stderr, "[GPU] SDL video: %s\n", SDL_GetError());
         p_create_device = (PfnCreateDevice)native_sym(d3d11, "D3D11CreateDevice");
         p_compile = (PfnCompile)native_sym(utils, "D3DCompile");
-        p_create_blob = (PfnCreateBlob)native_sym(utils, "D3DCreateBlob");
-        state = p_create_device && p_compile && p_create_blob;
+        state = p_create_device && p_compile;
         if (!state)
             fprintf(stderr, "[GPU] %s not found; drawing in software\n",
                     !p_create_device ? "DXVK Native (libdxvk_d3d11.so.0)"
@@ -111,16 +184,24 @@ static HRESULT native_D3DCompile(const void *src, SIZE_T n, const char *name,
                                  const char *entry, const char *profile, UINT f1,
                                  UINT f2, ID3DBlob **code, ID3DBlob **err)
 {
+    MsBlob *mc = NULL, *me = NULL;
+    HRESULT hr;
+
+    if (code) *code = NULL;
+    if (err) *err = NULL;
     if (!native_load())
         return E_FAIL;
-    return p_compile(src, n, name, defs, inc, entry, profile, f1, f2, code, err);
+    (void)inc;                          /* never used here: no #include */
+    hr = p_compile(src, n, name, defs, NULL, entry, profile, f1, f2, &mc, &me);
+    if (code) *code = native_from_ms(mc); else if (mc) mc->lpVtbl->Release(mc);
+    if (err) *err = native_from_ms(me); else if (me) me->lpVtbl->Release(me);
+    return hr;
 }
 
 static HRESULT native_D3DCreateBlob(SIZE_T n, ID3DBlob **blob)
 {
-    if (!native_load())
-        return E_FAIL;
-    return p_create_blob(n, blob);
+    *blob = native_blob(NULL, n);
+    return *blob ? S_OK : E_OUTOFMEMORY;
 }
 
 #define D3D11CreateDevice native_D3D11CreateDevice

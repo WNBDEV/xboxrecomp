@@ -62,7 +62,6 @@ static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
  * dashboard with "invalid hard disk" before it drew a frame. */
 #define XBE_INIT_FLAGS_VA           (XBOX_BASE_ADDRESS + 0x124u)
 
-#if defined(_WIN32)
 static ULONG xbox_utility_sectors_per_cluster(void)
 {
     uint32_t flags;
@@ -74,7 +73,6 @@ static ULONG xbox_utility_sectors_per_cluster(void)
            sizeof(flags));
     return (0x4000u << (flags >> 30)) / XBOX_BYTES_PER_SECTOR;
 }
-#endif
 
 /* ======================================================================== */
 /* Shared by both backends. kernel_bridge.c calls xbox_LastFileError()
@@ -857,6 +855,16 @@ NTSTATUS __stdcall xbox_NtCreateFile(
 
     int fd;
     if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
+        struct stat st;
+        /* A partition device (an image file) opened as a directory: the title
+         * wants the volume -- free space, cluster size -- not the bytes. As
+         * the Windows backend does, hand it the directory holding the image,
+         * which answers NtQueryVolumeInformationFile. */
+        if (stat(host_path, &st) == 0 && S_ISREG(st.st_mode)) {
+            char *slash = strrchr(host_path, '/');
+            if (slash && slash != host_path)
+                *slash = '\0';
+        }
         if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
             mkdir(host_path, 0755);   /* EEXIST is fine */
         fd = open(host_path, O_RDONLY | O_DIRECTORY);
@@ -1112,9 +1120,12 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
             struct statvfs vfs;
             int fd = w32_handle_fd(FileHandle);
             /* Xbox geometry, not the host's -- see the note on
-             * XBOX_SECTORS_PER_CLUSTER above. */
+             * XBOX_SECTORS_PER_CLUSTER above -- and on the utility drive the
+             * title's own cluster size. */
             info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
-            info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
+            info->SectorsPerAllocationUnit =
+                xbox_path_is_utility_drive(w32_handle_path(FileHandle))
+                    ? xbox_utility_sectors_per_cluster() : XBOX_SECTORS_PER_CLUSTER;
             if (fd >= 0 && fstatvfs(fd, &vfs) == 0) {
                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
                 ULONGLONG total = (ULONGLONG)vfs.f_blocks * vfs.f_frsize;

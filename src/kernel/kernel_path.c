@@ -168,6 +168,70 @@ const wchar_t *xbox_LastHostPath(void)
     return s_last_host_path_shared;
 }
 
+/* The retail disk geometry, shared by both backends' partition images (see
+ * "The raw disk device" below): the partition table sector Partition0 carries,
+ * and the size of each partition device in sectors. */
+#define XBOX_PART_TABLE_OFFSET 0x800
+#define XBOX_PART_IN_USE       0x80000000u
+
+static const unsigned long long s_part_sectors[6] = {
+    0,             /* 0: whole disk: the table only     */
+    0x00465400ull, /* 1: E: game and saves              */
+    0x000FA000ull, /* 2: C: system                      */
+    0x00177000ull, /* 3: X: cache                       */
+    0x00177000ull, /* 4: Y: cache                       */
+    0x00177000ull, /* 5: Z: cache                       */
+};
+
+static void xbox_partition_table_sector(unsigned char sector[512])
+{
+    /* name[16], flags, lba_start, lba_size, reserved -- 32 bytes each */
+    static const struct { const char *name; uint32_t start, size; } parts[] = {
+        { "XBOX_PART_X",  0x00000400, 0x00177000 },  /* X: cache      */
+        { "XBOX_PART_Y",  0x00177400, 0x00177000 },  /* Y: cache      */
+        { "XBOX_PART_Z",  0x002EE400, 0x00177000 },  /* Z: cache      */
+        { "XBOX_PART_C",  0x00465400, 0x000FA000 },  /* C: system     */
+        { "XBOX_PART_E",  0x0055F400, 0x00465400 },  /* E: game/save  */
+    };
+    size_t i;
+
+    memset(sector, 0, 512);
+    memcpy(sector, "****PARTINFO****", 16);
+    for (i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
+        unsigned char *e = sector + 48 + i * 32;   /* 16 magic + 32 reserved */
+        size_t n = strlen(parts[i].name);
+        uint32_t v[4] = { XBOX_PART_IN_USE, parts[i].start, parts[i].size, 0 };
+        memset(e, ' ', 16);
+        memcpy(e, parts[i].name, n < 16 ? n : 16);
+        memcpy(e + 16, v, sizeof v);
+    }
+}
+
+/* "\Device\Harddisk0\PartitionN", nothing below it: the partition device
+ * itself, backed by PartitionN.img. Returns N, or -1. See the Windows
+ * backend's xbox_partition_device_path for why the cache partitions' root
+ * directories are not the device. */
+static int xbox_partition_device_number(const char *xbox_path)
+{
+    static const char *prefix = "\\Device\\Harddisk0\\Partition";
+    int len = match_prefix(xbox_path, prefix);
+    int digit;
+    const char *rest;
+
+    if (!len)
+        return -1;
+    digit = xbox_path[len];
+    if (digit < '0' || digit > '9')
+        return -1;
+    rest = xbox_path + len + 1;
+    if (*rest == '\\' || *rest == '/') {
+        if (digit >= '3' && digit <= '5')
+            return -1;
+        rest++;
+    }
+    return *rest == '\0' ? digit - '0' : -1;
+}
+
 #if defined(_WIN32)
 /* ======================================================================== */
 
@@ -191,43 +255,20 @@ static BOOL  s_initialized = FALSE;
  * has to be there, not fabricating anything the title owns.
  */
 #define XBOX_DISK_IMAGE_NAME   L"Partition0.img"
-#define XBOX_PART_TABLE_OFFSET 0x800
-#define XBOX_PART_IN_USE       0x80000000u
 
 static void xbox_write_partition_table(const WCHAR *path)
 {
-    /* name[16], flags, lba_start, lba_size, reserved -- 32 bytes each */
-    static const struct { const char *name; ULONG start, size; } parts[] = {
-        { "XBOX_PART_X",  0x00000400, 0x00177000 },  /* X: cache      */
-        { "XBOX_PART_Y",  0x00177400, 0x00177000 },  /* Y: cache      */
-        { "XBOX_PART_Z",  0x002EE400, 0x00177000 },  /* Z: cache      */
-        { "XBOX_PART_C",  0x00465400, 0x000FA000 },  /* C: system     */
-        { "XBOX_PART_E",  0x0055F400, 0x00465400 },  /* E: game/save  */
-    };
     unsigned char sector[512];
     HANDLE h;
     DWORD written;
     LARGE_INTEGER off;
-    size_t i;
 
     h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL,
                     OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE)
         return;
 
-    memset(sector, 0, sizeof(sector));
-    memcpy(sector, "****PARTINFO****", 16);
-    for (i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
-        unsigned char *e = sector + 48 + i * 32;   /* 16 magic + 32 reserved */
-        size_t n = strlen(parts[i].name);
-        memset(e, ' ', 16);
-        memcpy(e, parts[i].name, n < 16 ? n : 16);
-        *(ULONG *)(e + 16) = XBOX_PART_IN_USE;
-        *(ULONG *)(e + 20) = parts[i].start;
-        *(ULONG *)(e + 24) = parts[i].size;
-        *(ULONG *)(e + 28) = 0;
-    }
-
+    xbox_partition_table_sector(sector);
     off.QuadPart = XBOX_PART_TABLE_OFFSET;
     if (SetFilePointerEx(h, off, NULL, FILE_BEGIN))
         WriteFile(h, sector, sizeof(sector), &written, NULL);
@@ -246,36 +287,20 @@ static void xbox_write_partition_table(const WCHAR *path)
  * The rest start empty, which is what an unformatted partition looks like, so
  * a title that wants a filesystem there formats one.
  */
+/* Nothing below the device, allowing for a single trailing separator --
+ * except on the cache partitions. There "PartitionN\" is the root directory of
+ * the utility drive, and the rules table already sends everything under that
+ * root to the Cache directory, so the root itself belongs there too.
+ * XMountUtilityDrive opens it as a directory to check the cluster size of the
+ * volume it has just formatted; handed the image instead, the check never
+ * looked at the utility drive at all. (xbox_partition_device_number.) */
 static BOOL xbox_partition_device_path(const char *xbox_path, WCHAR *out, DWORD n)
 {
-    static const char *prefix = "\\Device\\Harddisk0\\Partition";
-    int len = match_prefix(xbox_path, prefix);
-    int digit;
-    const char *rest;
+    int digit = xbox_partition_device_number(xbox_path);
 
-    if (!len)
+    if (digit < 0)
         return FALSE;
-    digit = xbox_path[len];
-    if (digit < '0' || digit > '9')
-        return FALSE;
-
-    rest = xbox_path + len + 1;
-    /* Nothing below it, allowing for a single trailing separator -- except on
-     * the cache partitions. There "PartitionN\" is the root directory of the
-     * utility drive, and the rules table already sends everything under that
-     * root to the Cache directory, so the root itself belongs there too.
-     * XMountUtilityDrive opens it as a directory to check the cluster size of
-     * the volume it has just formatted; handed the image instead, the check
-     * never looked at the utility drive at all. */
-    if (*rest == '\\' || *rest == '/') {
-        if (digit >= '3' && digit <= '5')
-            return FALSE;
-        rest++;
-    }
-    if (*rest != '\0')
-        return FALSE;
-
-    swprintf_s(out, n, L"%s\\Partition%c.img", s_save_dir, (WCHAR)digit);
+    swprintf_s(out, n, L"%s\\Partition%d.img", s_save_dir, digit);
     return TRUE;
 }
 
@@ -375,14 +400,6 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
          * first: the cache partitions are 750 MB each and none of that is
          * touched until something writes to it. */
         {
-            static const ULONGLONG part_sectors[6] = {
-                0,             /* 0: whole disk, sized below      */
-                0x00465400ull, /* 1: E: game and saves            */
-                0x000FA000ull, /* 2: C: system                    */
-                0x00177000ull, /* 3: X: cache                     */
-                0x00177000ull, /* 4: Y: cache                     */
-                0x00177000ull, /* 5: Z: cache                     */
-            };
             for (int p = 1; p <= 5; p++) {
                 HANDLE h;
                 DWORD ret;
@@ -396,7 +413,7 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
                     continue;
                 DeviceIoControl(h, FSCTL_SET_SPARSE, NULL, 0, NULL, 0,
                                 &ret, NULL);
-                end.QuadPart = (LONGLONG)(part_sectors[p] * 512ull);
+                end.QuadPart = (LONGLONG)(s_part_sectors[p] * 512ull);
                 if (SetFilePointerEx(h, end, NULL, FILE_BEGIN))
                     SetEndOfFile(h);
                 CloseHandle(h);
@@ -559,6 +576,22 @@ static void mkdir_p(const char* path)
  * ignoring case. A case-only difference never changes the length, so this
  * edits in place. Components that are not there under any spelling -- a file
  * about to be created -- are left as they are. */
+/* As the Windows backend's: is a host path on the utility drive, the Cache
+ * directory Z: and the cache partitions 3-5 map to? kernel_file.c asks,
+ * because that volume's cluster size is the title's choice. */
+BOOL xbox_path_is_utility_drive(const char *host_path)
+{
+    char cache[MAX_PATH];
+    size_t n;
+
+    if (!host_path || !s_initialized)
+        return FALSE;
+    snprintf(cache, sizeof(cache), "%s/Cache", s_save_dir);
+    n = strlen(cache);
+    return strncasecmp(host_path, cache, n) == 0 &&
+           (host_path[n] == '\0' || host_path[n] == '/');
+}
+
 static void posix_fix_case(char* path, size_t from)
 {
     struct stat st;
@@ -635,6 +668,46 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
     strip_trailing_slash(s_game_dir);
     strip_trailing_slash(s_save_dir);
 
+    /* The save-side directories and the partition images, as the Windows
+     * backend makes them (see "The raw disk device"): Partition0.img carries
+     * the partition table, and 1-5 are sized to the geometry it describes --
+     * sparse, so the 750 MB cache partitions cost nothing until written. A
+     * title that cannot read the table at 0x800 decides the disk is
+     * unformatted; Alter Echo then asks to reboot to the dashboard. */
+    {
+        static const char *subs[] = { "TitleData", "UserData", "Cache", "SystemData" };
+        char path[MAX_PATH];
+        unsigned char sector[512];
+        FILE *f;
+
+        mkdir_p(s_save_dir);
+        for (int i = 0; i < (int)(sizeof(subs) / sizeof(subs[0])); i++) {
+            snprintf(path, sizeof(path), "%s/%s", s_save_dir, subs[i]);
+            mkdir_p(path);
+        }
+        snprintf(path, sizeof(path), "%s/Partition0.img", s_save_dir);
+        f = fopen(path, "r+b");
+        if (!f)
+            f = fopen(path, "w+b");
+        if (f) {
+            xbox_partition_table_sector(sector);
+            if (fseek(f, XBOX_PART_TABLE_OFFSET, SEEK_SET) == 0)
+                fwrite(sector, 1, sizeof(sector), f);
+            fclose(f);
+        }
+        for (int p = 1; p <= 5; p++) {
+            snprintf(path, sizeof(path), "%s/Partition%d.img", s_save_dir, p);
+            if (truncate(path, (off_t)(s_part_sectors[p] * 512ull)) != 0) {
+                f = fopen(path, "ab");
+                if (f)
+                    fclose(f);
+                if (truncate(path, (off_t)(s_part_sectors[p] * 512ull)) != 0)
+                    xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH, "cannot size %s: %s",
+                             path, strerror(errno));
+            }
+        }
+    }
+
     s_initialized = TRUE;
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%s, save=%s",
              s_game_dir, s_save_dir);
@@ -657,6 +730,15 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
         char linked[512];
         if (resolve_symlink(xbox_path, linked, sizeof(linked)))
             return xbox_translate_path(linked, host_path_buf, buf_size);
+    }
+
+    {
+        int part = xbox_partition_device_number(xbox_path);
+        if (part >= 0) {
+            snprintf(host_path_buf, buf_size, "%s/Partition%d.img", s_save_dir, part);
+            XBOX_TRACE(XBOX_LOG_PATH, "%s -> partition image", xbox_path);
+            return TRUE;
+        }
     }
 
     for (int i = 0; i < PATH_RULE_COUNT; i++) {
