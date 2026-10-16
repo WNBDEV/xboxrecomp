@@ -42,6 +42,23 @@ static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
 static uint32_t     *s_present[2];
 static volatile LONG s_present_idx = -1;   /* -1 until the first flip */
 
+/* The window, for the GPU backend to present into (nv2a_gpu_present), and
+ * whether it now does. Once it does, this thread stops drawing with GDI --
+ * two presenters on one window flicker -- and only keeps the copy that
+ * RECOMP_FB_DUMP reads, which the executor still refreshes now and then. */
+static HWND          s_hwnd;
+static volatile LONG s_gpu_owned;
+
+void *xbox_FramebufferWindowHwnd(void)
+{
+    return s_fb_running ? (void *)s_hwnd : NULL;
+}
+
+void xbox_FramebufferWindowGpuOwned(int on)
+{
+    InterlockedExchange(&s_gpu_owned, on ? 1 : 0);
+}
+
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
 {
     /* RECOMP_FB_VA pins the window to one guest address instead of following
@@ -286,6 +303,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         return 0;
     }
     hdc = GetDC(hwnd);
+    s_hwnd = hwnd;
 
     memset(&bi, 0, sizeof(bi));
     bi.bmiHeader.biSize        = sizeof(bi.bmiHeader);
@@ -314,10 +332,11 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             if (s_present[idx])
                 memcpy(s_rgb, s_present[idx],
                        (size_t)s_fb_width * s_fb_height * 4);
-            StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
-                          0, 0, (int)s_fb_width, (int)s_fb_height,
-                          s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
-        } else if (s_fb_va && s_fb_pitch && s_rgb) {
+            if (!s_gpu_owned)
+                StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
+                              0, 0, (int)s_fb_width, (int)s_fb_height,
+                              s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
+        } else if (s_fb_va && s_fb_pitch && s_rgb && !s_gpu_owned) {
             /* No flip yet, or pinned with RECOMP_FB_VA: read guest memory as
              * before, which is also what a title that never flips needs. */
             const uint8_t *src =
@@ -368,6 +387,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         Sleep(16);
     }
 
+    s_hwnd = NULL;
     ReleaseDC(hwnd, hdc);
     DestroyWindow(hwnd);
     free(s_rgb);
@@ -397,4 +417,6 @@ void xbox_FramebufferWindowStart(void) {}
 int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
 void xbox_FramebufferWindowSetTitle(const uint16_t *n, int m) { (void)n; (void)m; }
 void xbox_FramebufferWindowFrameStats(uint32_t draws) { (void)draws; }
+void *xbox_FramebufferWindowHwnd(void) { return NULL; }
+void xbox_FramebufferWindowGpuOwned(int on) { (void)on; }
 #endif

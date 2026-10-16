@@ -91,6 +91,10 @@ void nv2a_gpu_sync(uint32_t addr, uint32_t bytes);
 void nv2a_gpu_guest_written(uint32_t addr, uint32_t bytes);
 /* A frame was presented. */
 void nv2a_gpu_frame(void);
+/* Show the w x h surface at addr in the framebuffer window, straight from the
+ * GPU, with vsync. Returns 0 if it cannot (no window yet, no swap chain,
+ * RECOMP_GPU_PRESENT=0); the caller then shows it through guest memory. */
+int  nv2a_gpu_present(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, uint32_t h);
 
 /* Provided by the executor: decode face `face` of `tex` into width*height
  * A8R8G8B8 texels, unreadable texels white, as the software sampler has it. */

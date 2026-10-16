@@ -3327,6 +3327,57 @@ static void frame_trace_flip(void)
     }
 }
 
+/* Without a swap chain to wait on (RECOMP_GPU=0, or no window), nothing
+ * held flips to the display's rate: light scenes ran at 66 fps and menus at
+ * 100, where the console shows 60. This caps flips at RECOMP_FLIP_HZ (60;
+ * 0 for none) on average. Up to two frames of slack are banked, so a frame
+ * that runs late is followed by one that does not wait, and a scene at 40
+ * fps stays at 40 rather than dropping to 30 as strict vsync would. */
+static void flip_pace(void)
+{
+    static double hz = -1.0;
+    static LARGE_INTEGER freq;
+    static int64_t next;
+    LARGE_INTEGER now;
+    int64_t period;
+
+    if (hz < 0.0) {
+        const char *e = getenv("RECOMP_FLIP_HZ");
+        hz = e ? atof(e) : 60.0;
+        QueryPerformanceFrequency(&freq);
+    }
+    if (hz <= 0.0)
+        return;
+    period = (int64_t)((double)freq.QuadPart / hz);
+    QueryPerformanceCounter(&now);
+    if (next && now.QuadPart < next) {
+        int64_t ms = (next - now.QuadPart) * 1000 / freq.QuadPart;
+        if (ms > 0)
+            Sleep((DWORD)ms);
+        do
+            QueryPerformanceCounter(&now);
+        while (now.QuadPart < next);        /* under a millisecond */
+    }
+    if (!next || now.QuadPart - next > 2 * period)
+        next = now.QuadPart - 2 * period;   /* bank at most two frames */
+    next += period;
+}
+
+/* Whether this flip should also go through guest memory to the window's own
+ * copy, which RECOMP_FB_DUMP and RECOMP_FB_WINDOW_DUMP_EVERY save -- every
+ * fourth flip while those are set (RECOMP_FB_COPY_EVERY changes it), never
+ * otherwise: it is the readback presenting from the GPU exists to avoid. */
+static int fb_copy_due(void)
+{
+    static int every = -1;
+    static unsigned n;
+    if (every < 0) {
+        const char *d = getenv("RECOMP_FB_DUMP"), *e = getenv("RECOMP_FB_COPY_EVERY");
+        every = e ? atoi(e) : (d && *d ? 4 : 0);
+    }
+    return every > 0 && (++n % (unsigned)every) == 0;
+}
+
 static void draw_primitive(void)
 {
     float v[4];
@@ -4184,10 +4235,19 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch
                                                 : s_gpu.pitch;
             if (done) {
-                /* What the GPU drew has to be in guest memory to be seen. */
-                nv2a_gpu_sync(dma_resolve(done), pitch * (s_gpu.drawn_y + s_gpu.drawn_h));
-                xbox_FramebufferWindowSet(dma_resolve(done), pitch);
-                xbox_FramebufferWindowPresent(dma_resolve(done), pitch);
+                uint32_t va = dma_resolve(done);
+                /* Straight from the GPU when it can (nv2a_gpu_present);
+                 * otherwise what the GPU drew has to be in guest memory to
+                 * be seen, and the window paces nothing, so pace here. */
+                int shown = nv2a_gpu_enabled()
+                            && nv2a_gpu_present(va, pitch, surface_bpp(), 640, 480);
+                xbox_FramebufferWindowSet(va, pitch);
+                if (!shown || fb_copy_due()) {
+                    nv2a_gpu_sync(va, pitch * (s_gpu.drawn_y + s_gpu.drawn_h));
+                    xbox_FramebufferWindowPresent(va, pitch);
+                }
+                if (!shown)
+                    flip_pace();
             }
             nv2a_gpu_frame();
         }

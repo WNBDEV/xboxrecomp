@@ -81,11 +81,84 @@ static uint64_t hash_bytes(uint64_t h, const uint8_t *p, size_t n)
 
 /* ---- shaders ------------------------------------------------------------ */
 
+/* Compiled shaders, kept on disk by a hash of their source.
+ *
+ * Every combiner setup and vertex program a title uses becomes HLSL that is
+ * compiled the first time it is drawn, and each compile holds up the frame
+ * it lands in. Kept, each is compiled once ever rather than once a session.
+ * RECOMP_SHADER_CACHE names the directory (default shader-cache, under the
+ * working directory); 0 turns it off. A stale entry cannot be wrong: the key
+ * is the source itself, profile included. */
+static const char *shader_cache_dir(void)
+{
+    static const char *dir = (const char *)-1;
+    if (dir == (const char *)-1) {
+        const char *e = getenv("RECOMP_SHADER_CACHE");
+        dir = (e && *e == '0' && !e[1]) ? NULL : (e && *e ? e : "shader-cache");
+        if (dir)
+            CreateDirectoryA(dir, NULL);
+    }
+    return dir;
+}
+
 static ID3DBlob *compile(const char *src, const char *profile, const char *what)
 {
+    static unsigned compiled, loaded;
+    static double compile_ms;
     ID3DBlob *code = NULL, *err = NULL;
-    HRESULT hr = D3DCompile(src, strlen(src), what, NULL, NULL, "main", profile,
-                            D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err);
+    const char *dir = shader_cache_dir();
+    char path[512];
+    LARGE_INTEGER t0, t1, fq;
+    HRESULT hr;
+
+    if (dir) {
+        uint64_t key = hash_bytes(hash_bytes(0xCBF29CE484222325ull, (const uint8_t *)src,
+                                             strlen(src)),
+                                  (const uint8_t *)profile, strlen(profile));
+        FILE *f;
+        snprintf(path, sizeof path, "%s/%016llx.%s.bin", dir, (unsigned long long)key, profile);
+        f = fopen(path, "rb");
+        if (f) {
+            long n;
+            fseek(f, 0, SEEK_END);
+            n = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            if (n > 0 && SUCCEEDED(D3DCreateBlob((SIZE_T)n, &code))
+                && fread(ID3D10Blob_GetBufferPointer(code), 1, (size_t)n, f) == (size_t)n) {
+                fclose(f);
+                loaded++;
+                return code;
+            }
+            if (code) {
+                ID3D10Blob_Release(code);
+                code = NULL;
+            }
+            fclose(f);
+        }
+    }
+    QueryPerformanceCounter(&t0);
+    hr = D3DCompile(src, strlen(src), what, NULL, NULL, "main", profile,
+                    D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err);
+    QueryPerformanceCounter(&t1);
+    QueryPerformanceFrequency(&fq);
+    compiled++;
+    compile_ms += (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)fq.QuadPart;
+    if ((compiled & (compiled - 1)) == 0)       /* 1, 2, 4, 8, ... */
+        gpu_log("shaders: %u compiled (%.0f ms in all), %u from the cache",
+                compiled, compile_ms, loaded);
+    if (SUCCEEDED(hr) && dir) {
+        char tmp[520];
+        FILE *f;
+        snprintf(tmp, sizeof tmp, "%s.tmp", path);
+        f = fopen(tmp, "wb");
+        if (f) {
+            size_t n = ID3D10Blob_GetBufferSize(code);
+            int ok = fwrite(ID3D10Blob_GetBufferPointer(code), 1, n, f) == n;
+            ok &= fclose(f) == 0;
+            if (!ok || !MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING))
+                DeleteFileA(tmp);
+        }
+    }
     if (FAILED(hr)) {
         gpu_log("compiling %s failed (0x%08lX): %s", what, (unsigned long)hr,
                 err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "?");
@@ -635,6 +708,7 @@ typedef struct {
     int synced;                         /* guest_hash describes guest memory */
     uint64_t guest_hash;
     uint32_t last_used;
+    uint32_t checked;                   /* s_frame guest memory was last compared */
 } GpuRt;
 
 typedef struct {
@@ -648,12 +722,22 @@ typedef struct {
 static GpuRt s_rt[GPU_RTS];
 static GpuDs s_ds[GPU_RTS];
 
+/* A sample of the surface's guest memory: one word in sixteen of every other
+ * row. It only has to notice that something other than the GPU wrote the
+ * surface -- a CPU-decoded video frame, a 2D blit -- which changes far more
+ * than it samples, and it runs once a frame for every surface, where a hash
+ * of every byte cost 7% of the GPU thread. */
 static uint64_t rt_guest_hash(const GpuRt *r)
 {
     uint64_t h = 0xCBF29CE484222325ull;
-    uint32_t y;
-    for (y = 0; y < r->h; y++)
-        h = hash_bytes(h, guest(r->addr + y * r->pitch), (size_t)r->w * r->bpp);
+    uint32_t y, x, words = r->w * r->bpp / 4;
+    for (y = 0; y < r->h; y += 2) {
+        const uint32_t *row = (const uint32_t *)guest(r->addr + y * r->pitch);
+        for (x = 0; x < words; x += 16) {
+            h = (h ^ row[x]) * 0x100000001B3ull;
+            h ^= h >> 29;
+        }
+    }
     return h;
 }
 
@@ -781,16 +865,29 @@ static GpuRt *get_rt(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, ui
 }
 
 /* Before the GPU draws into a surface: if anything but the GPU changed its
- * guest memory since it was last synced, start from that. */
+ * guest memory since it was last synced, start from that.
+ *
+ * Checked whenever guest memory holds the surface (after a readback a blit
+ * may have written it), and once a frame while the GPU holds it: frames are
+ * no longer read back at the flip (nv2a_gpu_present), so a surface can stay
+ * the GPU's for good, and the CPU writing a video frame into it is only
+ * seen here. */
+static void rt_check(GpuRt *r)
+{
+    uint64_t h;
+    if (r->gpu_dirty && r->checked == s_frame)
+        return;
+    r->checked = s_frame;
+    h = rt_guest_hash(r);
+    if (!r->synced || h != r->guest_hash)
+        rt_upload(r);
+    r->guest_hash = h;
+    r->synced = 1;
+}
+
 static void rt_begin(GpuRt *r)
 {
-    if (!r->gpu_dirty) {
-        uint64_t h = rt_guest_hash(r);
-        if (!r->synced || h != r->guest_hash)
-            rt_upload(r);
-        r->guest_hash = h;
-        r->synced = 1;
-    }
+    rt_check(r);
     r->gpu_dirty = 1;
 }
 
@@ -1400,6 +1497,121 @@ void nv2a_gpu_frame(void)
         s_frame = 1;
 }
 
+/* ---- presenting ---------------------------------------------------------- */
+
+/* Frames used to reach the screen through guest memory: read back from the
+ * GPU at every flip (a stall while the GPU finished, then a copy), copied
+ * again for the window, again by the window, and drawn with GDI on the
+ * window's own 16 ms clock -- so even a steady 60 fps showed doubled and
+ * dropped frames. Now the finished surface is copied on the GPU into a
+ * swap chain on the same window and presented with vsync: one GPU copy,
+ * shown at the display's refresh, and the swap chain's queue limits the
+ * title to the display's rate the way the console's flip did.
+ *
+ * RECOMP_GPU_PRESENT=0 keeps the old path. */
+extern void *xbox_FramebufferWindowHwnd(void);
+extern void xbox_FramebufferWindowGpuOwned(int on);
+
+static IDXGISwapChain *s_swap;
+static uint32_t s_swap_w, s_swap_h;
+static int s_swap_failed;
+
+static int swap_create(HWND hwnd, uint32_t w, uint32_t h)
+{
+    IDXGIDevice *dx = NULL;
+    IDXGIDevice1 *dx1 = NULL;
+    IDXGIAdapter *ad = NULL;
+    IDXGIFactory *f = NULL;
+    DXGI_SWAP_CHAIN_DESC d;
+    HRESULT hr = E_FAIL;
+
+    memset(&d, 0, sizeof d);
+    d.BufferDesc.Width = w;
+    d.BufferDesc.Height = h;
+    d.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    d.SampleDesc.Count = 1;
+    d.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    d.BufferCount = 2;
+    d.OutputWindow = hwnd;
+    d.Windowed = TRUE;
+    d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    if (SUCCEEDED(ID3D11Device_QueryInterface(s_dev, &IID_IDXGIDevice, (void **)&dx))
+        && SUCCEEDED(IDXGIDevice_GetAdapter(dx, &ad))
+        && SUCCEEDED(IDXGIAdapter_GetParent(ad, &IID_IDXGIFactory, (void **)&f)))
+        hr = IDXGIFactory_CreateSwapChain(f, (IUnknown *)s_dev, &d, &s_swap);
+    /* Two frames queued at most: enough to keep the GPU fed, few enough
+     * that a button press shows within ~33 ms. */
+    if (SUCCEEDED(hr) && dx
+        && SUCCEEDED(IDXGIDevice_QueryInterface(dx, &IID_IDXGIDevice1, (void **)&dx1))) {
+        IDXGIDevice1_SetMaximumFrameLatency(dx1, 2);
+        IDXGIDevice1_Release(dx1);
+    }
+    if (f) {
+        /* The window thread owns Alt+Enter and sizing; DXGI must not. */
+        IDXGIFactory_MakeWindowAssociation(f, hwnd, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
+        IDXGIFactory_Release(f);
+    }
+    if (ad) IDXGIAdapter_Release(ad);
+    if (dx) IDXGIDevice_Release(dx);
+    if (FAILED(hr)) {
+        gpu_log("no swap chain on the window (0x%08lX); frames go through guest memory",
+                (unsigned long)hr);
+        s_swap = NULL;
+        return 0;
+    }
+    s_swap_w = w;
+    s_swap_h = h;
+    gpu_log("presenting %ux%u straight to the window, vsync", w, h);
+    return 1;
+}
+
+int nv2a_gpu_present(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, uint32_t h)
+{
+    static int on = -1;
+    ID3D11Texture2D *back = NULL;
+    D3D11_BOX box;
+    GpuRt *r;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_GPU_PRESENT");
+        on = !(e && *e == '0');
+    }
+    if (!on || s_state != 1 || s_swap_failed || !addr || !w || !h
+        || (bpp != 4 && bpp != 2))
+        return 0;
+    if (!s_swap) {
+        HWND hwnd = (HWND)xbox_FramebufferWindowHwnd();
+        if (!hwnd)
+            return 0;                   /* window not open yet */
+        if (!swap_create(hwnd, w, h)) {
+            s_swap_failed = 1;
+            return 0;
+        }
+        xbox_FramebufferWindowGpuOwned(1);
+    }
+    if (w != s_swap_w || h != s_swap_h) {
+        if (FAILED(IDXGISwapChain_ResizeBuffers(s_swap, 0, w, h, DXGI_FORMAT_UNKNOWN, 0)))
+            return 0;
+        s_swap_w = w;
+        s_swap_h = h;
+    }
+    /* The surface as the GPU holds it, or as guest memory has it if the CPU
+     * produced this frame. */
+    r = get_rt(addr, pitch, bpp, w, h);
+    if (!r)
+        return 0;
+    rt_check(r);
+    if (FAILED(IDXGISwapChain_GetBuffer(s_swap, 0, &IID_ID3D11Texture2D, (void **)&back)))
+        return 0;
+    box.left = 0; box.top = 0; box.front = 0;
+    box.right = w; box.bottom = h; box.back = 1;
+    ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)back, 0, 0, 0, 0,
+                                              (ID3D11Resource *)r->tex, 0, &box);
+    ID3D11Texture2D_Release(back);
+    IDXGISwapChain_Present(s_swap, 1, 0);
+    return 1;
+}
+
 /* ---- draws --------------------------------------------------------------- */
 
 static void unpack_argb(uint32_t c, float *o)
@@ -1705,5 +1917,7 @@ void nv2a_gpu_clear(const Nv2aGpuState *st, uint32_t flags, uint32_t color,
 void nv2a_gpu_sync(uint32_t addr, uint32_t bytes) { (void)addr; (void)bytes; }
 void nv2a_gpu_guest_written(uint32_t addr, uint32_t bytes) { (void)addr; (void)bytes; }
 void nv2a_gpu_frame(void) {}
+int  nv2a_gpu_present(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, uint32_t h)
+{ (void)addr; (void)pitch; (void)bpp; (void)w; (void)h; return 0; }
 
 #endif
