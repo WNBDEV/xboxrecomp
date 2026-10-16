@@ -328,7 +328,11 @@ typedef union RecompXmm {
 } RecompXmm;
 #endif
 
-#define XBOX_STACK_SIZE     (8 * 1024 * 1024)
+/* The main thread's stack region: 8 MB unless RECOMP_STACK_KB says otherwise
+ * (xbox_memory_layout.c). The heap begins where it ends, so every megabyte
+ * here is one the title cannot allocate. */
+extern uint32_t g_xbox_stack_size;
+#define XBOX_STACK_SIZE     (g_xbox_stack_size)
 
 /** Base VA of the stack area (above last XBE section). */
 /* Where the fake TIB lives -- the linear address fs: is based at.

@@ -424,8 +424,13 @@ static volatile LONG g_worker_stack_used[XBOX_WORKER_STACK_COUNT];
 
 int xbox_worker_stack_alloc(void)
 {
-    int i;
-    for (i = 0; i < XBOX_WORKER_STACK_COUNT; i++) {
+    /* Slices grow up from the region's bottom and the main thread's stack
+     * down from its top; with a smaller region (RECOMP_STACK_KB) fewer slices
+     * fit before its top megabyte, which is the main stack's. */
+    int i, n = (int)((XBOX_STACK_SIZE - 1024u * 1024u) / XBOX_WORKER_STACK_SIZE);
+    if (n > XBOX_WORKER_STACK_COUNT)
+        n = XBOX_WORKER_STACK_COUNT;
+    for (i = 0; i < n; i++) {
         if (InterlockedCompareExchange(&g_worker_stack_used[i], 1, 0) == 0)
             return i;
     }

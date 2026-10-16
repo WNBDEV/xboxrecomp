@@ -46,6 +46,31 @@ static ptrdiff_t g_memory_offset = 0;  /* actual_base - XBOX_BASE_ADDRESS */
 
 /* Actual mapped RAM for this run; see the header. Default retail 64 MB. */
 size_t g_xbox_total_ram = XBOX_TOTAL_RAM;
+
+/* RECOMP_STACK_KB: the size of the stack region, 1-8 MB, 64 KB steps.
+ *
+ * The heap starts where this region ends, and 8 MB is far more than a title's
+ * main thread uses -- Alter Echo asks for 256 KB in its XBE and was measured
+ * 20 KB deep after menus, gameplay and videos -- while its heap ran within
+ * 285 KB of full the moment a level loaded and a tutorial video then found
+ * nothing left. The console gives a title its RAM minus the image; this region
+ * was costing 8 MB of that. Worker slices for runtime threads come from its
+ * bottom (xbox_worker_stack_alloc keeps them clear of the main stack's top
+ * megabyte). */
+uint32_t g_xbox_stack_size = 8u * 1024u * 1024u;
+static uint32_t g_heap_next;          /* tentative; defined with the heap below */
+
+static void stack_size_from_env(void)
+{
+    const char *e = getenv("RECOMP_STACK_KB");
+    unsigned kb;
+    if (!e || !*e)
+        return;
+    kb = (unsigned)strtoul(e, NULL, 0);
+    if (kb < 1024) kb = 1024;
+    if (kb > 8192) kb = 8192;
+    g_xbox_stack_size = (kb & ~63u) * 1024u;
+}
 size_t g_xbox_map_size = 0;   /* 0 = same as RAM */
 
 void xbox_SetTotalRam(size_t bytes)
@@ -1923,6 +1948,8 @@ volatile uint64_t g_icall_count = 0;
 BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 {
     g_force_return = getenv("RECOMP_FORCE_RETURN") != NULL;
+    stack_size_from_env();
+    g_heap_next = XBOX_HEAP_BASE;
     DWORD old_protect;
     const uint8_t *xbe = (const uint8_t *)xbe_data;
 
@@ -3056,7 +3083,7 @@ ptrdiff_t xbox_GetMemoryOffset(void)
  * Returns Xbox VAs within the mapped region so MEM32() works correctly.
  * No free support (bump-only for now).
  */
-static uint32_t g_heap_next = XBOX_HEAP_BASE;
+static uint32_t g_heap_next;          /* XBOX_HEAP_BASE once the layout is set */
 
 static int g_heap_alloc_count = 0;
 
