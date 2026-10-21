@@ -1424,6 +1424,29 @@ static ID3D11ShaderResourceView *rt_as_texture(const Nv2aGpuTexture *t, const Gp
                                                float *tw, float *th, int *alpha_one)
 {
     int i;
+    if (getenv("RECOMP_RT_DIRECT_WHY")) {
+        /* Once per address: a texture over a surface the GPU drew, and
+         * whether it can be sampled straight from it -- and if not, why. */
+        static uint32_t seen[64];
+        static int nseen;
+        for (i = 0; i < GPU_RTS; i++) {
+            const GpuRt *r = &s_rt[i];
+            int k;
+            if (!r->tex || t->addr < r->addr || t->addr >= r->addr + r->pitch * r->h)
+                continue;
+            for (k = 0; k < nseen && seen[k] != t->addr; k++) {}
+            if (k < nseen || nseen >= 64)
+                break;
+            seen[nseen++] = t->addr;
+            gpu_log("texture %08X %ux%u pitch %u fmt %02X linear %d cube %d over surface "
+                    "%08X %ux%u pitch %u: %s%s%s%s", t->addr, t->width, t->height, t->pitch,
+                    t->format, t->linear, t->cube, r->addr, r->w, r->h, r->pitch,
+                    r == target ? "is the target; " : "", !r->gpu_dirty ? "not GPU-held; " : "",
+                    r->addr != t->addr || r->pitch != t->pitch ? "offset/pitch differ; " : "",
+                    !t->linear ? "swizzled" : "");
+            break;
+        }
+    }
     if (!rt_direct_on() || !t->linear || t->cube)
         return NULL;
     for (i = 0; i < GPU_RTS; i++) {
@@ -1979,6 +2002,85 @@ void nv2a_gpu_guest_written(uint32_t addr, uint32_t bytes)
     }
 }
 
+/* NV09F image blits, on the GPU too.
+ *
+ * The executor copies a blit's bytes in guest memory (image_blit), and at
+ * RECOMP_SCALE > 1 guest memory only holds the console-sized readback of a
+ * scaled surface. A title that copies its back buffer into a texture for a
+ * full-screen effect -- Alter Echo's loading transition and its exposition
+ * screens -- then drew that effect from a 640x480 frame, and the whole
+ * picture went soft. When the GPU drew the source, also copy its scaled
+ * pixels into a surface at the destination: with RECOMP_RT_DIRECT that is
+ * what the effect samples (rt_as_texture). Guest memory still gets the
+ * executor's copy and is recorded as matching, so the scaled pixels are not
+ * replaced by an upload of the small ones.
+ *
+ * nv2a_gpu_blit_source runs before the executor's copy reads the source back
+ * (afterwards it no longer looks like the GPU's), nv2a_gpu_blit_copy after.
+ * RECOMP_BLIT_GPU=0 leaves blits to guest memory alone, as before. */
+int nv2a_gpu_blit_source(uint32_t src, uint32_t pitch, uint32_t bpp, uint32_t w, uint32_t h)
+{
+    static int on = -1;
+    int i;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_BLIT_GPU");
+        on = !(e && *e == '0');
+    }
+    if (!on || s_state != 1 || s_scale < 2 || !rt_direct_on())
+        return -1;
+    for (i = 0; i < GPU_RTS; i++) {
+        const GpuRt *r = &s_rt[i];
+        uint32_t off;
+        if (!r->tex || !r->gpu_dirty || r->pitch != pitch || r->bpp != bpp
+            || src < r->addr || src >= r->addr + r->pitch * r->h)
+            continue;
+        off = src - r->addr;
+        if (off % pitch % bpp == 0 && off % pitch / bpp + w <= r->w && off / pitch + h <= r->h)
+            return i;
+    }
+    return -1;
+}
+
+void nv2a_gpu_blit_copy(int src_rt, uint32_t src, uint32_t dst, uint32_t pitch,
+                        uint32_t w, uint32_t h)
+{
+    GpuRt *s, *d;
+    uint32_t off, s_addr;
+    D3D11_BOX box;
+
+    if (s_state != 1 || src_rt < 0 || src_rt >= GPU_RTS || !s_rt[src_rt].tex)
+        return;
+    s = &s_rt[src_rt];
+    if (dst < s->addr + s->pitch * s->h && s->addr < dst + pitch * h)
+        return;                         /* within one surface: the guest copy alone */
+    s_addr = s->addr;
+    s->last_used = s_frame;             /* not the one get_rt evicts */
+    d = get_rt(dst, pitch, s->bpp, w, h);
+    if (!d || d == s || !s->tex || s->addr != s_addr)
+        return;
+    if (w < d->w || h < d->h)
+        rt_check(d);                    /* the rest of it is guest memory's */
+    off = src - s->addr;
+    box.left = off % s->pitch / s->bpp * s_scale;
+    box.top = off / s->pitch * s_scale;
+    box.right = box.left + w * s_scale;
+    box.bottom = box.top + h * s_scale;
+    box.front = 0;
+    box.back = 1;
+    ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)d->tex, 0, 0, 0, 0,
+                                              (ID3D11Resource *)s->tex, 0, &box);
+    d->gpu_dirty = 1;
+    d->synced = 1;
+    d->guest_hash = rt_guest_hash(d);
+    d->checked = s_frame;
+    {
+        static int logged;
+        if (!logged++)
+            gpu_log("image blits of GPU-drawn surfaces copied at %ux: %08X -> %08X %ux%u",
+                    s_scale, src, dst, w, h);
+    }
+}
+
 void nv2a_gpu_frame(void)
 {
     s_frame++;
@@ -2054,6 +2156,66 @@ static int swap_create(HWND hwnd, uint32_t w, uint32_t h)
     return 1;
 }
 
+/* RECOMP_GPU_SHOT=<prefix>: every RECOMP_GPU_SHOT_EVERY presented frames
+ * [60], the frame at the resolution it was rendered, as <prefix>NNNNN.bmp
+ * (32-bit, top-down), read straight from the GPU: what the window shows,
+ * without the window having to be on screen, and not the console-sized guest
+ * copy RECOMP_FB_DUMP takes. At most 1000. */
+static void gpu_shot(const GpuRt *r, uint32_t w, uint32_t h)
+{
+    static const char *prefix;
+    static int every = -1, n, frames;
+    const uint32_t W = w * s_scale, H = h * s_scale;
+    uint8_t hdr[54];
+    D3D11_TEXTURE2D_DESC d;
+    D3D11_MAPPED_SUBRESOURCE m;
+    D3D11_BOX box;
+    ID3D11Texture2D *st = NULL;
+    char path[512];
+    uint32_t y, v;
+    FILE *f;
+
+    if (every < 0) {
+        const char *e = getenv("RECOMP_GPU_SHOT_EVERY");
+        prefix = getenv("RECOMP_GPU_SHOT");
+        every = e && atoi(e) > 0 ? atoi(e) : 60;
+    }
+    if (!prefix || !*prefix || n >= 1000 || ++frames % every)
+        return;
+    memset(&d, 0, sizeof d);
+    d.Width = W; d.Height = H; d.MipLevels = 1; d.ArraySize = 1;
+    d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    d.SampleDesc.Count = 1;
+    d.Usage = D3D11_USAGE_STAGING;
+    d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &d, NULL, &st)))
+        return;
+    box.left = 0; box.top = 0; box.front = 0;
+    box.right = W; box.bottom = H; box.back = 1;
+    ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)st, 0, 0, 0, 0,
+                                              (ID3D11Resource *)r->tex, 0, &box);
+    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)st, 0, D3D11_MAP_READ, 0, &m))) {
+        snprintf(path, sizeof path, "%s%05d.bmp", prefix, n++);
+        f = fopen(path, "wb");
+        if (f) {
+            memset(hdr, 0, sizeof hdr);
+            hdr[0] = 'B'; hdr[1] = 'M';
+            v = 54 + W * H * 4;  memcpy(hdr + 2, &v, 4);
+            v = 54;              memcpy(hdr + 10, &v, 4);
+            v = 40;              memcpy(hdr + 14, &v, 4);
+            v = W;               memcpy(hdr + 18, &v, 4);
+            v = (uint32_t)-(int32_t)H; memcpy(hdr + 22, &v, 4);   /* top-down */
+            hdr[26] = 1; hdr[28] = 32;
+            fwrite(hdr, 1, sizeof hdr, f);
+            for (y = 0; y < H; y++)
+                fwrite((const uint8_t *)m.pData + (size_t)y * m.RowPitch, 4, W, f);
+            fclose(f);
+        }
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)st, 0);
+    }
+    ID3D11Texture2D_Release(st);
+}
+
 int nv2a_gpu_present(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, uint32_t h)
 {
     static int on = -1;
@@ -2103,6 +2265,7 @@ int nv2a_gpu_present(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, ui
     if (!r)
         return 0;
     rt_check(r);
+    gpu_shot(r, w, h);
     if (!r->srv && FAILED(ID3D11Device_CreateShaderResourceView(
             s_dev, (ID3D11Resource *)r->tex, NULL, &r->srv)))
         return 0;
@@ -2447,6 +2610,11 @@ void nv2a_gpu_clear(const Nv2aGpuState *st, uint32_t flags, uint32_t color,
 { (void)st; (void)flags; (void)color; (void)zstencil; }
 void nv2a_gpu_sync(uint32_t addr, uint32_t bytes) { (void)addr; (void)bytes; }
 void nv2a_gpu_guest_written(uint32_t addr, uint32_t bytes) { (void)addr; (void)bytes; }
+int nv2a_gpu_blit_source(uint32_t src, uint32_t pitch, uint32_t bpp, uint32_t w, uint32_t h)
+{ (void)src; (void)pitch; (void)bpp; (void)w; (void)h; return -1; }
+void nv2a_gpu_blit_copy(int src_rt, uint32_t src, uint32_t dst, uint32_t pitch,
+                        uint32_t w, uint32_t h)
+{ (void)src_rt; (void)src; (void)dst; (void)pitch; (void)w; (void)h; }
 void nv2a_gpu_frame(void) {}
 int  nv2a_gpu_present(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, uint32_t h)
 { (void)addr; (void)pitch; (void)bpp; (void)w; (void)h; return 0; }

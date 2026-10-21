@@ -98,6 +98,7 @@ Environment variables, read at start-up. Defaults in brackets.
 | | `RECOMP_GPU_PRESENT` [1] | 0: the old window path, flips capped at `RECOMP_FLIP_HZ` [60] |
 | | `RECOMP_SCALE` [1] | render at N x the console's resolution (1-4) |
 | | `RECOMP_RT_DIRECT` [0] | 1: sample render targets on the GPU, no readback |
+| | `RECOMP_BLIT_GPU` [1] | 0: 2D image blits of GPU-drawn surfaces only in guest memory (console size) |
 | | `RECOMP_SHADER_CACHE` [shader-cache] | the cache directory; 0 turns it off |
 | | `RECOMP_FULLSCREEN` [0] | 1: start fullscreen (Alt+Enter / F11 toggle) |
 | | `RECOMP_CULL` [1] | 0 disables face culling, 2 inverts the winding |
@@ -113,6 +114,8 @@ Environment variables, read at start-up. Defaults in brackets.
 | | `RECOMP_AUDIO_STATS`, `RECOMP_APU_VOICES`, `RECOMP_APU_PHYS_STATS` | levels, voices on/off, how APU reads resolve |
 | | `RECOMP_HEAP_STATS`, `RECOMP_CONTIG_TRACE` | heap use; contiguous allocations and frees |
 | | `RECOMP_FRAME_TRACE`, `RECOMP_TRI_PROBE=x,y`, `RECOMP_DEBUG_HOLES`, `RECOMP_TEX_DIAG`, `RECOMP_VSH_NAN` | one frame's methods; the triangles covering a pixel; undrawn pixels in magenta; bad texels; NaN vertex outputs |
+| | `RECOMP_GPU_SHOT=<prefix>`, `RECOMP_GPU_SHOT_EVERY` [60] | the presented frame at full render resolution as `<prefix>NNNNN.bmp`, from the GPU (works with the window hidden) |
+| | `RECOMP_RT_DIRECT_WHY` | why a texture over a GPU-drawn surface is or is not sampled from it directly |
 | | `RECOMP_BUSY_ACK`, `RECOMP_PFB_TRAP` [1] | 0 to turn off the busy-bit acknowledger, the PFB flush trap |
 
 ## Tests

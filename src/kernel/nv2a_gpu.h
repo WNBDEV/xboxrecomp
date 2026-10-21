@@ -89,6 +89,13 @@ void nv2a_gpu_sync(uint32_t addr, uint32_t bytes);
 /* Something other than the GPU wrote [addr, addr + bytes): textures cached
  * from those bytes are checked again before their next use. */
 void nv2a_gpu_guest_written(uint32_t addr, uint32_t bytes);
+/* An NV09F image blit of a w x h rectangle at src. Before the executor's
+ * guest copy: the render target holding src at full scale, or -1 if the GPU
+ * does not hold it (or it would gain nothing: RECOMP_SCALE 1, no
+ * RECOMP_RT_DIRECT). After it: copy those pixels to dst on the GPU too. */
+int  nv2a_gpu_blit_source(uint32_t src, uint32_t pitch, uint32_t bpp, uint32_t w, uint32_t h);
+void nv2a_gpu_blit_copy(int src_rt, uint32_t src, uint32_t dst, uint32_t pitch,
+                        uint32_t w, uint32_t h);
 /* A frame was presented. */
 void nv2a_gpu_frame(void);
 /* Show the w x h surface at addr in the framebuffer window, straight from the

@@ -4082,7 +4082,7 @@ static void image_blit(uint32_t size)
     uint32_t xo = s_2d.point_out & 0xFFFF, yo = s_2d.point_out >> 16;
     uint32_t sp = s_2d.pitch & 0xFFFF, dp = s_2d.pitch >> 16;
     uint32_t bpp = surf2d_bpp(s_2d.format), r;
-    int ok_s, ok_d;
+    int ok_s, ok_d, gpu_src;
     uint32_t sb = dma_object_base(s_2d.dma_src, &ok_s);
     uint32_t db = dma_object_base(s_2d.dma_dst, &ok_d);
     uint32_t src = dma_resolve(sb + s_2d.src_off + yi * sp + xi * bpp);
@@ -4094,6 +4094,8 @@ static void image_blit(uint32_t size)
         fprintf(stderr, "[GPU] image blit %ux%u: 0x%08X (pitch %u) -> 0x%08X "
                 "(pitch %u), format %X%s\n", w, h, src, sp, dst, dp,
                 s_2d.format, ok_s && ok_d ? "" : " (DMA object not found)");
+    /* Asked first: the sync below makes the source guest memory's. */
+    gpu_src = nv2a_gpu_blit_source(src, sp, bpp, w, h);
     nv2a_gpu_sync(src, (h - 1) * sp + w * bpp);
     nv2a_gpu_sync(dst, (h - 1) * dp + w * bpp);
     if (surface_write_refused(dst, (h - 1) * dp + w * bpp, "blit into"))
@@ -4101,6 +4103,8 @@ static void image_blit(uint32_t size)
     for (r = 0; r < h; r++)
         memmove(mem + dst + r * dp, mem + src + r * sp, (size_t)w * bpp);
     nv2a_gpu_guest_written(dst, (h - 1) * dp + w * bpp);
+    if (gpu_src >= 0)
+        nv2a_gpu_blit_copy(gpu_src, src, dst, dp, w, h);
 }
 
 /* 1 if a non-3D subchannel's method was handled here. */
