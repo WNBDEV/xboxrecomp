@@ -21,6 +21,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if !defined(_WIN32)
+#include <unistd.h>   /* _exit */
+#endif
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -224,6 +227,22 @@ static void fb_set_fullscreen(HWND h, int on)
     s_fullscreen = on;
 }
 
+/* The player closed the window (Alt+F4, the close button, the desktop's
+ * quit): end the program. A console title never exits by itself, so
+ * stopping only this window's thread left the game running with nothing on
+ * screen and no way to close it short of killing the process. Terminated
+ * outright rather than through ExitProcess: with the title's threads still
+ * running, the graphics and sound libraries' detach code can hang. */
+static void fb_player_closed(void)
+{
+    fprintf(stderr, "[FB] window closed: exiting\n");
+    fflush(NULL);
+#if defined(_WIN32)
+    TerminateProcess(GetCurrentProcess(), 0);
+#endif
+    _exit(0);
+}
+
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     /* Alt+Enter arrives as a system key, F11 as an ordinary one; neither is
@@ -237,6 +256,8 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;                       /* no beep for Alt+Enter */
     switch (m) {
     case WM_CLOSE:
+        fb_player_closed();
+        return 0;
     case WM_DESTROY:
         InterlockedExchange(&s_fb_running, 0);
         return 0;
@@ -617,7 +638,7 @@ static int fb_thread(void *unused)
 
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_QUIT) {
-                InterlockedExchange(&s_fb_running, 0);
+                fb_player_closed();
             } else if (ev.type == SDL_KEYDOWN || ev.type == SDL_KEYUP) {
                 SDL_Keycode k = ev.key.keysym.sym;
                 int vk;
