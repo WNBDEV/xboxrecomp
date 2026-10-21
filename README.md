@@ -13,6 +13,34 @@
 
 > Turn any Xbox game binary into a native Windows executable. No emulation. No interpreter. Just raw, recompiled C.
 
+> **This is a fork,** carrying the work done for
+> [alter-echo-recomp](https://github.com/FILL-IN/alter-echo-recomp) on top of
+> upstream [sp00nznet/xboxrecomp](https://github.com/sp00nznet/xboxrecomp)
+> v0.13.1, on the `gpu-backend` branch. All credit for the toolkit itself goes
+> upstream; the license is unchanged (MIT, see [License](#license)). What it adds:
+>
+> - **A Direct3D 11 GPU backend** (`RECOMP_GPU=1`): rasterisation, register
+>   combiners and vertex programs on the host GPU, presented to the window with
+>   vsync, compiled shaders cached, rendering at N x resolution, fullscreen with
+>   letterboxing. The software rasteriser stays as the reference.
+> - **NV2A:** stencil, face culling, the 2D blit path, GPU semaphores and
+>   software methods, pushbuffer execution in ring order, `ARRAY_ELEMENT32`,
+>   batches up to 65536 indices, a CRTC scanline, vblanks that wait for their
+>   acknowledgement.
+> - **Translator and lifter correctness,** most of it found with the
+>   conformance fuzzer (now runnable on Linux with `gcc -m32`): multiply and
+>   divide widths and flags, signed conditions after add/sub, `movsx` of
+>   bp/sp, `neg`/rotate flags, `cwd`, `xadd`, `cpuid`/`pushfd`/`popfd`, switch
+>   tables whose padding cut a function short. Each with tests.
+> - **APU:** voices resampled at their own rate, the mixdown folded to stereo
+>   and actually played, and physical addresses resolved by what the title's
+>   `MmGetPhysicalAddress` said rather than guessed.
+> - **Kernel, memory and USB:** fixes found bringing up Alter Echo, plus
+>   diagnostics (`RECOMP_WAIT_PROFILE`, `RECOMP_GPU_PROFILE`,
+>   `RECOMP_APU_PHYS_STATS`, ...).
+> - **A native Linux build** (experimental): signals for vectored exception
+>   handling, SDL2 for window, sound and pads, DXVK Native for Direct3D 11.
+
 **[Join the sp00nznet recomp Discord](https://discord.gg/CRpzGWZFcu)** — the
 community hub for sp00nznet's recomp projects, where ps3recomp development
 happens in the open. Good place to ask questions, show a port you are working
