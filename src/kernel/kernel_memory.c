@@ -177,11 +177,18 @@ ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
      * title writes the result into a pushbuffer, the NV2A reads an address
      * with bit 31 set, and the corruption surfaces as wrong geometry with
      * nothing naming this function.
+     *
+     * The answer is also remembered per page, with which store the VA was in:
+     * the APU needs it to tell RAM from the contiguous window, since here they
+     * are separate and share physical addresses (xbox_PhysicalOrigin).
      */
+    extern void xbox_PhysicalNoteOrigin(uint32_t phys, int contiguous);
     uint32_t va = (uint32_t)(uintptr_t)BaseAddress;
-    return (ULONG_PTR)((va >= XBOX_CONTIG_BASE &&
-                        (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
-                     ? va - XBOX_CONTIG_BASE : va);
+    int contiguous = va >= XBOX_CONTIG_BASE &&
+                     (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
+    uint32_t phys = contiguous ? va - XBOX_CONTIG_BASE : va;
+    xbox_PhysicalNoteOrigin(phys, contiguous);
+    return (ULONG_PTR)phys;
 }
 
 VOID __stdcall xbox_MmPersistContiguousMemory(PVOID BaseAddress, ULONG NumberOfBytes, BOOLEAN Persist)

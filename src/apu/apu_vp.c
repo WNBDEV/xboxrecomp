@@ -150,16 +150,22 @@ static void voice_trace(MCPXAPUState *d, const char *what, uint16_t v)
             voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLA, 0xFFFFFFFF),
             voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLB, 0xFFFFFFFF));
     {
-        /* Where its first page is, and how far the contiguous allocator has
-         * got: mcpx_apu_phys reads an address below that from the
-         * contiguous window, at or above it from RAM. */
+        /* Where its first page is, how far the contiguous allocator has got,
+         * and what the title's MmGetPhysicalAddress said the page is (ram,
+         * contig, or ? if it never asked -- then mcpx_apu_phys guesses from
+         * the allocator). Streamed voices (a Bink video's sound) read their
+         * data through segment lists, not these pages, so for them page0 is
+         * meaningless; RECOMP_APU_PHYS_STATS counts what reads really do. */
         extern uint32_t xbox_ContiguousAllocatedBytes(void);
+        extern int xbox_PhysicalOrigin(uint32_t phys);
+        static const char *const origin[] = { "?", "ram", "contig" };
         uint32_t ba = voice_get_mask(d, v, NV_PAVS_VOICE_CUR_PSL_START,
                                      NV_PAVS_VOICE_CUR_PSL_START_BA);
         uint32_t page = ldl_le_phys(address_space_memory,
                                     d->regs[NV_PAPU_VPSGEADDR] + ba * 8);
-        fprintf(stderr, "[APU-VOICE]     page0=%08X contig_hwm=%08X\n", page,
-                xbox_ContiguousAllocatedBytes());
+        fprintf(stderr, "[APU-VOICE]     page0=%08X contig_hwm=%08X origin=%s\n",
+                page, xbox_ContiguousAllocatedBytes(),
+                origin[xbox_PhysicalOrigin(page)]);
     }
 }
 

@@ -195,6 +195,15 @@ uint32_t xbox_GetDisplayFramebuffer(uint32_t *pitch);
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment);
 uint32_t xbox_ContiguousAllocatedBytes(void);
 
+/* Which store a physical page is in, as the title's last MmGetPhysicalAddress
+ * for that page said: for bus masters given physical addresses (the APU).
+ * UNKNOWN when it never asked; see xbox_memory_layout.c. */
+#define XBOX_PHYS_UNKNOWN    0
+#define XBOX_PHYS_RAM        1
+#define XBOX_PHYS_CONTIGUOUS 2
+void xbox_PhysicalNoteOrigin(uint32_t phys, int contiguous);
+int xbox_PhysicalOrigin(uint32_t phys);
+
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t put_off, uint32_t get_ptr_off);
 

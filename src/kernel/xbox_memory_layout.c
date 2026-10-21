@@ -3557,6 +3557,37 @@ int xbox_ContiguousOwns(uint32_t phys)
     return owns;
 }
 
+/* Where the bytes of a physical page live, as the title last learned that
+ * page's address from MmGetPhysicalAddress.
+ *
+ * Physical P is both the RAM a guest VA of P stands for and the contiguous
+ * window's XBOX_CONTIG_BASE + P; on hardware those are one store, here two.
+ * Asking the allocator (xbox_ContiguousOwns) only guesses which one a bus
+ * master's address means, and the guess goes wrong once contiguous blocks
+ * reach an address the title also uses as RAM: Alter Echo's Bink sound buffer
+ * is heap memory, every video leaks ~4.5 MB of contiguous memory, and by the
+ * fourth the APU read the video's sound from the window -- a loud buzz.
+ *
+ * The title itself knows. On hardware the only way to get the physical
+ * address of an ordinary (non-contiguous) page is to ask MmGetPhysicalAddress,
+ * so every RAM page a bus master is given went through it, and the call says
+ * which store the VA was in. Only a contiguous address can be worked out by
+ * arithmetic, so a page nobody asked about falls back to the allocator. The
+ * latest answer for a page wins: a buffer remapped after its memory changed
+ * hands is right again from its next submission. */
+static volatile uint8_t g_phys_origin[XBOX_CONTIG_SIZE >> 12];
+
+void xbox_PhysicalNoteOrigin(uint32_t phys, int contiguous)
+{
+    if (phys < XBOX_CONTIG_SIZE)
+        g_phys_origin[phys >> 12] = contiguous ? XBOX_PHYS_CONTIGUOUS : XBOX_PHYS_RAM;
+}
+
+int xbox_PhysicalOrigin(uint32_t phys)
+{
+    return phys < XBOX_CONTIG_SIZE ? g_phys_origin[phys >> 12] : XBOX_PHYS_UNKNOWN;
+}
+
 
 static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment);
 

@@ -72,10 +72,45 @@ void mcpx_debug_end_frame(void) {}
  * on exactly that (IDirectSoundBuffer::GetStatus, polled forever). */
 extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
 extern int xbox_ContiguousOwns(uint32_t phys);
+extern int xbox_PhysicalOrigin(uint32_t phys);
+
+/* What the title said when it got the page's physical address decides first
+ * (xbox_PhysicalOrigin: every RAM page a bus master sees went through
+ * MmGetPhysicalAddress). The guesses below are for pages it never asked
+ * about, which can only be contiguous memory addressed by arithmetic -- or
+ * the image. Guessing alone played Alter Echo's Bink sound, a heap buffer,
+ * from the window once enough videos had passed: a buzz. */
+/* RECOMP_APU_PHYS_STATS=1: how each lookup was decided, every few million
+ * lookups -- in particular how often the title's answer overrode what the
+ * allocator alone would have guessed (the reads the guess got wrong). */
+static void apu_phys_stats(int origin, uint32_t a)
+{
+    static unsigned long n, by[3], overrode;
+    int guess_contig = !(a >= g_xbox_image_lo && a < g_xbox_image_hi)
+                       && xbox_ContiguousOwns(a);
+    by[origin]++;
+    if ((origin == 1 && guess_contig) || (origin == 2 && !guess_contig))
+        overrode++;
+    if (++n % (1ul << 23) == 0)
+        fprintf(stderr, "[APU-PHYS] %lu lookups: ram %lu, contig %lu, guessed %lu; "
+                "title overrode the guess %lu\n", n, by[1], by[2], by[0], overrode);
+}
 
 uint8_t *mcpx_apu_phys(uint64_t addr)
 {
+    static int stats = -1;
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
+    int origin = xbox_PhysicalOrigin(a);
+    if (stats) {
+        if (stats < 0)
+            stats = getenv("RECOMP_APU_PHYS_STATS") != NULL;
+        if (stats)
+            apu_phys_stats(origin, a);
+    }
+    switch (origin) {
+    case 1: return g_apu_ram_ptr + (a & 0x03FFFFFFu);    /* XBOX_PHYS_RAM */
+    case 2: return g_apu_ram_ptr + 0x80000000u + a;      /* XBOX_PHYS_CONTIGUOUS */
+    }
     if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
         return g_apu_ram_ptr + a;
     if (xbox_ContiguousOwns(a))
