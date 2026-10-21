@@ -1076,6 +1076,14 @@ class FunctionTranslator:
 
         A tail_jump_alias entry is a second entry into another body, so it
         does not bound the gap.
+
+        A compiled switch is laid out the other way: the arms follow the
+        dispatch, a ret often ends the listed function before them, and the
+        table comes last, dword-aligned with filler (mov edi, edi). The
+        function list can take that filler for a weak entry of its own, which
+        ends the gap just short of the table. A weak entry less than four
+        bytes before one of the function's tables is the table's padding, so
+        it does not bound the gap either.
         """
         bounds = sorted(
             addr for addr, info in self.func_db.items()
@@ -1089,16 +1097,28 @@ class FunctionTranslator:
             following = bisect.bisect_right(bounds, start)
             if following >= len(bounds) or bounds[following] <= end:
                 continue
-            upper = bounds[following]
             raw_bytes = self._read_func_bytes(start, end)
-            if not raw_bytes or not any(
-                    insn.mnemonic == "jmp" and insn.jump_target is None
-                    and insn.operands and insn.operands[0].type == "mem"
-                    and insn.operands[0].mem_index
-                    and not insn.operands[0].mem_base
-                    and start <= insn.operands[0].mem_disp < upper
-                    for insn in self.disasm.disassemble_function(
-                        raw_bytes, start, end)):
+            if not raw_bytes:
+                continue
+            tables = [
+                insn.operands[0].mem_disp
+                for insn in self.disasm.disassemble_function(
+                    raw_bytes, start, end)
+                if insn.mnemonic == "jmp" and insn.jump_target is None
+                and insn.operands and insn.operands[0].type == "mem"
+                and insn.operands[0].mem_index
+                and not insn.operands[0].mem_base
+            ]
+            while (following < len(bounds)
+                   and any(0 <= table - bounds[following] < 4
+                           for table in tables)
+                   and not self._is_strong_entry(
+                       self.func_db[bounds[following]], bounds[following])):
+                following += 1
+            if following >= len(bounds):
+                continue
+            upper = bounds[following]
+            if not any(start <= table < upper for table in tables):
                 continue
             recovered = self._recover_cfg(start, upper, set(), set())
             if recovered is None or not recovered[1]:
