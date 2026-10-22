@@ -257,6 +257,8 @@ static ID3D11PixelShader *s_clear_ps;
 static ID3D11InputLayout *s_layout;
 static ID3D11Buffer *s_vb, *s_vs_cb, *s_ps_cb, *s_clear_cb;
 static ID3D11Buffer *s_ib, *s_const_cb, *s_prog_cb;
+/* 16 zero bytes, bound with stride 0 to the inputs a program does not read. */
+static ID3D11Buffer *s_zero_vb;
 static ID3D11InputLayout *s_attr_layout;
 static uint32_t s_ib_pos, s_const_gen_up;
 static ID3D11RasterizerState *s_rs, *s_rs_cull[2];   /* none; CW, CCW culled */
@@ -1553,8 +1555,11 @@ static int rt_direct_on(void)
 static ID3D11ShaderResourceView *rt_as_texture(const Nv2aGpuTexture *t, const GpuRt *target,
                                                float *tw, float *th, int *alpha_one)
 {
+    static int why = -1;                /* read once: this runs per texture per draw */
     int i;
-    if (getenv("RECOMP_RT_DIRECT_WHY")) {
+    if (why < 0)
+        why = getenv("RECOMP_RT_DIRECT_WHY") != NULL;
+    if (why) {
         /* Once per address: a texture over a surface the GPU drew, and
          * whether it can be sampled straight from it -- and if not, why. */
         static uint32_t seen[64];
@@ -1987,9 +1992,24 @@ static int gpu_init(void)
     if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_vb)))
         return 0;
     {
+        static const float zero[4];
+        D3D11_BUFFER_DESC zd;
+        D3D11_SUBRESOURCE_DATA zi;
+        memset(&zd, 0, sizeof zd);
+        zd.ByteWidth = sizeof zero;
+        zd.Usage = D3D11_USAGE_IMMUTABLE;
+        zd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+        memset(&zi, 0, sizeof zi);
+        zi.pSysMem = zero;
+        if (FAILED(ID3D11Device_CreateBuffer(s_dev, &zd, &zi, &s_zero_vb)))
+            return 0;
+    }
+    {
         /* One input layout serves every generated program: v0..v15 as
          * float4, made against a shader that reads all sixteen (a program's
-         * own signature is a subset, which a layout may exceed). */
+         * own signature is a subset, which a layout may exceed). Input k
+         * comes from slot k, so each is uploaded as its own packed array
+         * and only the ones a program reads are sent. */
         D3D11_INPUT_ELEMENT_DESC al[16];
         Str src = { NULL, 0, 0 };
         int k;
@@ -2008,8 +2028,8 @@ static int gpu_init(void)
             al[k].SemanticName = "ATTR";
             al[k].SemanticIndex = (UINT)k;
             al[k].Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
-            al[k].InputSlot = 0;
-            al[k].AlignedByteOffset = (UINT)(16 * k);
+            al[k].InputSlot = (UINT)k;
+            al[k].AlignedByteOffset = 0;
             al[k].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
             al[k].InstanceDataStepRate = 0;
         }
@@ -2776,6 +2796,33 @@ static int ring_put(ID3D11Buffer *b, uint32_t *pos, uint32_t cap, const void *da
     return 1;
 }
 
+/* ring_put for several arrays under one Map: they land back to back, each at
+ * a 16-byte-aligned offset[i]. */
+static int ring_put_n(ID3D11Buffer *b, uint32_t *pos, uint32_t cap, const void *const *data,
+                      const uint32_t *bytes, uint32_t n, uint32_t *offset)
+{
+    D3D11_MAPPED_SUBRESOURCE m;
+    uint32_t i, total = 0;
+    for (i = 0; i < n; i++)
+        total += (bytes[i] + 15u) & ~15u;
+    if (total > cap)
+        return 0;
+    *pos = (*pos + 15u) & ~15u;
+    if (*pos + total > cap)
+        *pos = 0;
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)b, 0,
+                                       *pos ? D3D11_MAP_WRITE_NO_OVERWRITE
+                                            : D3D11_MAP_WRITE_DISCARD, 0, &m)))
+        return 0;
+    for (i = 0; i < n; i++) {
+        memcpy((uint8_t *)m.pData + *pos, data[i], bytes[i]);
+        offset[i] = *pos;
+        *pos += (bytes[i] + 15u) & ~15u;
+    }
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)b, 0);
+    return 1;
+}
+
 void nv2a_gpu_draw(const Nv2aGpuState *st, const Nv2aGpuVertex *v, uint32_t n)
 {
     GpuRt *r;
@@ -2802,14 +2849,16 @@ void nv2a_gpu_draw(const Nv2aGpuState *st, const Nv2aGpuVertex *v, uint32_t n)
     ID3D11DeviceContext_Draw(s_ctx, n, 0);
 }
 
-int nv2a_gpu_draw_program(const Nv2aGpuState *st, const float (*attr)[16][4],
+int nv2a_gpu_draw_program(const Nv2aGpuState *st, const float *const attr[16],
                           uint32_t nverts, const uint32_t *idx, uint32_t nidx)
 {
     ID3D11VertexShader *vs;
-    ID3D11Buffer *cbs[2];
+    ID3D11Buffer *cbs[2], *vbs[16];
     GpuRt *r;
     float pcb[8];
-    uint32_t voff, ioff, stride = 16 * 16;
+    const void *src[16];
+    uint32_t bytes[16], off[16], strides[16], offs[16], used[16];
+    uint32_t ioff, a, n = 0;
 
     if (s_state != 1)
         return 0;
@@ -2835,14 +2884,30 @@ int nv2a_gpu_draw_program(const Nv2aGpuState *st, const float (*attr)[16][4],
     pcb[6] = st->fog_param[0];
     pcb[7] = st->fog_param[1];
     cb_write(s_prog_cb, pcb, sizeof pcb);
-    if (!ring_put(s_vb, &s_vb_pos, GPU_VB_BYTES, attr, nverts * stride, &voff)
+    for (a = 0; a < 16; a++)
+        if (attr[a]) {
+            src[n] = attr[a];
+            bytes[n] = nverts * 16;
+            used[n++] = a;
+        }
+    if (!ring_put_n(s_vb, &s_vb_pos, GPU_VB_BYTES, src, bytes, n, off)
         || !ring_put(s_ib, &s_ib_pos, GPU_IB_BYTES, idx, nidx * 4, &ioff))
         return 1;
+    for (a = 0; a < 16; a++) {
+        vbs[a] = s_zero_vb;
+        strides[a] = 0;
+        offs[a] = 0;
+    }
+    for (a = 0; a < n; a++) {
+        vbs[used[a]] = s_vb;
+        strides[used[a]] = 16;
+        offs[used[a]] = off[a];
+    }
     cbs[0] = s_const_cb;
     cbs[1] = s_prog_cb;
     ID3D11DeviceContext_IASetInputLayout(s_ctx, s_attr_layout);
     ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, 1, &s_vb, &stride, &voff);
+    ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, 16, vbs, strides, offs);
     ID3D11DeviceContext_IASetIndexBuffer(s_ctx, s_ib, DXGI_FORMAT_R32_UINT, ioff);
     ID3D11DeviceContext_VSSetShader(s_ctx, vs, NULL, 0);
     ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 2, cbs);
@@ -2917,7 +2982,7 @@ void nv2a_gpu_clear(const Nv2aGpuState *st, uint32_t flags, uint32_t color,
 int  nv2a_gpu_enabled(void) { return 0; }
 void nv2a_gpu_draw(const Nv2aGpuState *st, const Nv2aGpuVertex *v, uint32_t n)
 { (void)st; (void)v; (void)n; }
-int nv2a_gpu_draw_program(const Nv2aGpuState *st, const float (*attr)[16][4],
+int nv2a_gpu_draw_program(const Nv2aGpuState *st, const float *const attr[16],
                           uint32_t nverts, const uint32_t *idx, uint32_t nidx)
 { (void)st; (void)attr; (void)nverts; (void)idx; (void)nidx; return 0; }
 void nv2a_gpu_clear(const Nv2aGpuState *st, uint32_t flags, uint32_t color,

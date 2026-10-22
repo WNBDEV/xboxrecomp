@@ -79,10 +79,12 @@ typedef struct {
 int  nv2a_gpu_enabled(void);
 /* A triangle list of vertices the CPU transformed. */
 void nv2a_gpu_draw(const Nv2aGpuState *st, const Nv2aGpuVertex *v, uint32_t n);
-/* An indexed triangle list of untransformed vertices: v0..v15 per vertex, run
- * through the current vertex program (nv2a_vsh_interp's) on the GPU. Returns
- * 0 if that program cannot run there, and the caller transforms on the CPU. */
-int  nv2a_gpu_draw_program(const Nv2aGpuState *st, const float (*attr)[16][4],
+/* An indexed triangle list of untransformed vertices, run through the current
+ * vertex program (nv2a_vsh_interp's) on the GPU. attr[a] holds input va's
+ * nverts float4s back to back, or is NULL when the program does not read it.
+ * Returns 0 if that program cannot run there, and the caller transforms on
+ * the CPU. */
+int  nv2a_gpu_draw_program(const Nv2aGpuState *st, const float *const attr[16],
                            uint32_t nverts, const uint32_t *idx, uint32_t nidx);
 /* NV097 CLEAR_SURFACE: flags bit 0 Z, bit 1 stencil, 0xF0 colour (R G B A). */
 void nv2a_gpu_clear(const Nv2aGpuState *st, uint32_t flags, uint32_t color,

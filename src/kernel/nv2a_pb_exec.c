@@ -3157,8 +3157,11 @@ static void gpu_draw_batch(uint32_t n)
  * could not translate it; the caller then transforms on the CPU. */
 static int gpu_draw_batch_program(uint32_t n)
 {
-    static float attr[NV_MAX_INDICES][16][4];
+    /* One array per input, packed: the GPU gets only what the program reads
+     * (16 bytes a vertex per input, not 256). */
+    static float attr[16][NV_MAX_INDICES][4];
     static uint32_t local[NV_MAX_INDICES], tri[NV_MAX_INDICES * 3];
+    const float *in[16];
     /* Open addressing, kept under half full: up to NV_MAX_INDICES distinct
      * indices in 2^17 slots. */
     static struct { uint32_t index, gen, slot; } map[1u << 17];
@@ -3187,7 +3190,7 @@ static int gpu_draw_batch_program(uint32_t n)
                 map[h].slot = nv;
                 for (a = 0; a < 16; a++)
                     if (mask & (1u << a))
-                        fetch_attr(&s_gpu.attr[a], idx, attr[nv][a]);
+                        fetch_attr(&s_gpu.attr[a], idx, attr[a][nv]);
                 nv++;
                 break;
             }
@@ -3231,7 +3234,9 @@ static int gpu_draw_batch_program(uint32_t n)
                            (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch))
         return 1;
     gpu_state(&g);
-    if (!nv2a_gpu_draw_program(&g, (const float (*)[16][4])attr, nv, tri, k))
+    for (a = 0; a < 16; a++)
+        in[a] = (mask & (1u << a)) ? attr[a][0] : NULL;
+    if (!nv2a_gpu_draw_program(&g, in, nv, tri, k))
         return 0;
     s_gpu.tris_drawn += k / 3;
     note_drawn();
@@ -3627,6 +3632,17 @@ static void index_overflow(void)
                 NV_MAX_INDICES);
 }
 
+/* RECOMP_PB_EXEC_VERBOSE, read once: getenv walks the whole environment, and
+ * uncached in the per-method and per-draw paths it was a quarter of the
+ * executor's time, then (the draw and flip ones, left behind) another 4%. */
+static int pb_verbose(void)
+{
+    static int verbose = -1;
+    if (verbose < 0)
+        verbose = getenv("RECOMP_PB_EXEC_VERBOSE") != NULL;
+    return verbose;
+}
+
 static void draw_primitive(void)
 {
     float v[4];
@@ -3707,7 +3723,7 @@ static void draw_primitive(void)
         }
     }
 
-    if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+    if (pb_verbose()) {
         static int shown;
         if (shown++ < 6) {
             fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
@@ -4201,12 +4217,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     }
     /* Bring-up: the first parameters each surface method carries. A wrong
      * pitch or clip is indistinguishable from a method never arriving unless
-     * the values are visible. Cached: this runs for every method, and an
-     * uncached getenv here was a quarter of the executor's time. */
-    static int verbose = -1;
-    if (verbose < 0)
-        verbose = getenv("RECOMP_PB_EXEC_VERBOSE") != NULL;
-    if (verbose) {
+     * the values are visible. */
+    if (pb_verbose()) {
         static int shown[8];
         int slot = -1;
         switch (method) {
@@ -4549,7 +4561,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         }
         s_gpu.drawn_stale = 1;
 
-        if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+        if (pb_verbose()) {
             static unsigned n;
             if (n++ < 8) {
                 fprintf(stderr, "  [GPU] flip %u: read=%u write=%u\n",

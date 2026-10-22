@@ -257,6 +257,7 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
 bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
                           uint32_t fault_xbox_va, int is_write)
 {
+    static int trace = -1;              /* read once: this runs per register access */
     uint32_t mmio_offset = fault_xbox_va - APU_MMIO_BASE;
     bool ok = apu_decode_and_handle(ctx, mmio_offset, is_write);
 
@@ -264,7 +265,9 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
      * a title that waits on one waits forever, and the only way to work out
      * what it is waiting for is to see the register traffic that precedes the
      * wait. */
-    if (getenv("RECOMP_APU_TRACE")) {
+    if (trace < 0)
+        trace = getenv("RECOMP_APU_TRACE") != NULL;
+    if (trace) {
         static unsigned n;
         if (n++ < 400) {
             /* The value as well as the offset: finding which register carries
