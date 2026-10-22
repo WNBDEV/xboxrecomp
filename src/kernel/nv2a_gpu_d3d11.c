@@ -2159,14 +2159,25 @@ int nv2a_gpu_enabled(void)
 #define GPU_FORGET_MAX 64
 static struct { uint32_t addr, end; } s_forget[GPU_FORGET_MAX];
 static int s_forget_n;
-static volatile LONG s_forget_pending;
-static SRWLOCK s_forget_lock;            /* zero is the initial state */
+static volatile long s_forget_pending, s_forget_lock;
+
+/* A spinlock, held for a few stores: the native build's windows.h is
+ * DXVK's, with no SRW locks or Interlocked calls. */
+#if defined(_MSC_VER)
+#define FORGET_XCHG(p, v) InterlockedExchange((volatile LONG *)(p), (v))
+#define FORGET_LOAD(p)    InterlockedCompareExchange((volatile LONG *)(p), 0, 0)
+#else
+#define FORGET_XCHG(p, v) __atomic_exchange_n((p), (v), __ATOMIC_SEQ_CST)
+#define FORGET_LOAD(p)    __atomic_load_n((p), __ATOMIC_SEQ_CST)
+#endif
+static void forget_lock(void)   { while (FORGET_XCHG(&s_forget_lock, 1)) {} }
+static void forget_unlock(void) { FORGET_XCHG(&s_forget_lock, 0); }
 
 void nv2a_gpu_forget(uint32_t addr, uint32_t bytes)
 {
     if (!bytes)
         return;
-    AcquireSRWLockExclusive(&s_forget_lock);
+    forget_lock();
     if (s_forget_n < GPU_FORGET_MAX) {
         s_forget[s_forget_n].addr = addr;
         s_forget[s_forget_n].end = addr + bytes;
@@ -2177,8 +2188,8 @@ void nv2a_gpu_forget(uint32_t addr, uint32_t bytes)
         if (addr + bytes > s_forget[GPU_FORGET_MAX - 1].end)
             s_forget[GPU_FORGET_MAX - 1].end = addr + bytes;
     }
-    InterlockedExchange(&s_forget_pending, 1);
-    ReleaseSRWLockExclusive(&s_forget_lock);
+    FORGET_XCHG(&s_forget_pending, 1);
+    forget_unlock();
 }
 
 static void forget_drain(void)
@@ -2187,14 +2198,14 @@ static void forget_drain(void)
     int i, k, n, dropped = 0;
     struct { uint32_t addr, end; } q[GPU_FORGET_MAX];
 
-    if (!InterlockedCompareExchange(&s_forget_pending, 0, 0))
+    if (!FORGET_LOAD(&s_forget_pending))
         return;
-    AcquireSRWLockExclusive(&s_forget_lock);
+    forget_lock();
     n = s_forget_n;
     memcpy(q, s_forget, sizeof q[0] * (size_t)n);
     s_forget_n = 0;
-    InterlockedExchange(&s_forget_pending, 0);
-    ReleaseSRWLockExclusive(&s_forget_lock);
+    FORGET_XCHG(&s_forget_pending, 0);
+    forget_unlock();
     for (k = 0; k < n; k++) {
         for (i = 0; i < GPU_RTS; i++) {
             GpuRt *r = &s_rt[i];
