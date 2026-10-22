@@ -64,6 +64,16 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 
 /* Memory access - same as recomp_types.h MEM32 but without the #define guard */
 #define BRIDGE_MEM32(addr) (*(volatile uint32_t *)((uintptr_t)(addr) + g_xbox_mem_offset))
+/* The NV2A interrupt status registers are shared: the timer thread raises
+ * vblank in them, the executor raises and retires software methods, the
+ * title's handler acknowledges, the poll threads clear. A plain |= or &= is a
+ * read and a write, and another thread's update in between is lost. When the
+ * lost bit was PMC's PGRAPH bit, the title's ISR never saw a software method,
+ * D3D's BlockOnTime never got its event, and the game froze for good -- once
+ * in a boss fight; with the vblank update's window widened to 2 ms, within
+ * seconds of entering a level. Every read-modify-write of them is atomic. */
+#define BRIDGE_OR32(addr, v)  __atomic_fetch_or(&BRIDGE_MEM32(addr), (uint32_t)(v), __ATOMIC_SEQ_CST)
+#define BRIDGE_AND32(addr, v) __atomic_fetch_and(&BRIDGE_MEM32(addr), (uint32_t)(v), __ATOMIC_SEQ_CST)
 
 /* Translate Xbox VA to native pointer (NULL-safe: 0 → NULL) */
 #define XBOX_TO_NATIVE(va) ((va) ? (void*)((uintptr_t)(va) + g_xbox_mem_offset) : NULL)
@@ -2275,9 +2285,9 @@ static void kernel_vblank_tick(void)
      * title's DPC (XBOX_NV2A_VBLANK_UNACKED). PCRTC first: the poll loop reads
      * it to decide whether PMC's bit is fair game. A vblank still unacknowledged
      * from last time is simply asserted again, as a level-triggered line is. */
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |=
-        NV2A_PCRTC_INTR_VBLANK | XBOX_NV2A_VBLANK_UNACKED;
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
+    BRIDGE_OR32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0,
+                NV2A_PCRTC_INTR_VBLANK | XBOX_NV2A_VBLANK_UNACKED);
+    BRIDGE_OR32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0, NV2A_PMC_INTR_PCRTC);
 
     {
         static unsigned n;
@@ -2371,7 +2381,7 @@ static LONG CALLBACK pgraph_w1c_veh(PEXCEPTION_POINTERS ep)
             uint32_t now = s_pgraph_old & ~*r;
             *r = now;
             if (!now)
-                BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0) &= ~NV2A_PMC_INTR_PGRAPH;
+                BRIDGE_AND32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0, ~NV2A_PMC_INTR_PGRAPH);
         }
         if (s_pgraph_armed)
             VirtualProtect(s_pgraph_page, 4096, PAGE_READONLY, &old);
@@ -2441,8 +2451,8 @@ void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t method, uint32_t param)
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_TRAPPED_DATA_LOW) = param;
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_NSOURCE) =
         NV2A_PGRAPH_NSOURCE_NOTIFY;
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_INTR) |= NV2A_PGRAPH_INTR_ERROR;
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)  |= NV2A_PMC_INTR_PGRAPH;
+    BRIDGE_OR32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_INTR, NV2A_PGRAPH_INTR_ERROR);
+    BRIDGE_OR32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0, NV2A_PMC_INTR_PGRAPH);
     pgraph_w1c_arm(1);
     InterlockedExchange(&s_swmethod_pending, 1);
     if (s_timer_wake)
@@ -2459,15 +2469,28 @@ void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t method, uint32_t param)
      * from here too. */
     for (waited = 0; waited < 500; waited++) {
         uint32_t pcrtc = BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0);
-        if (pcrtc && !(pcrtc & XBOX_NV2A_VBLANK_UNACKED)) {
-            BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) = 0;
-            BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0) &= ~NV2A_PMC_INTR_PCRTC;
-        }
+        /* As the busy ack thread does: only the acknowledged vblank it read,
+         * so one the timer raises meanwhile is not wiped. */
+        if (pcrtc && !(pcrtc & XBOX_NV2A_VBLANK_UNACKED)
+                && __atomic_compare_exchange_n(&BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0),
+                                               &pcrtc, 0, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+            BRIDGE_AND32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0, ~NV2A_PMC_INTR_PCRTC);
         if (BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_FIFO) & 1u) {
             handled = 1;
             break;
         }
         Sleep(1);
+    }
+    if (!handled && n_lost < 3) {
+        /* What the title's ISR would have seen: a lost method with PMC's
+         * PGRAPH bit clear was taken from under it (see BRIDGE_OR32). */
+        fprintf(stderr, "  [NV2A] at the timeout: PMC_INTR_0 %08X PGRAPH_INTR %08X "
+                "NSOURCE %08X PCRTC_INTR_0 %08X FIFO %08X\n",
+                BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0),
+                BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_INTR),
+                BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_NSOURCE),
+                BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0),
+                BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_FIFO));
     }
     pgraph_w1c_arm(0);
     InterlockedExchange(&s_swmethod_pending, 0);
@@ -2475,9 +2498,9 @@ void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t method, uint32_t param)
         QueryPerformanceCounter(&t1);
         wait_profile_add(0xFFFF, method, param, wait_profile_ms(t0, t1));
     }
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_INTR)    &= ~NV2A_PGRAPH_INTR_ERROR;
+    BRIDGE_AND32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_INTR, ~NV2A_PGRAPH_INTR_ERROR);
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_NSOURCE) = 0;
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)     &= ~NV2A_PMC_INTR_PGRAPH;
+    BRIDGE_AND32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0, ~NV2A_PMC_INTR_PGRAPH);
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_FIFO)    = 1;
 
     if (handled ? n_handled++ < 3 : n_lost++ < 3) {

@@ -1066,9 +1066,8 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 if (NV2A_ACK[i].offset == 0x000100)
                     mask &= ~(1u << 24);       /* PMC_INTR_0: its PCRTC bit */
             }
-            if (*r & mask) {
-                *r &= ~mask;
-            }
+            if (*r & mask)              /* atomic: see kernel_bridge.c, BRIDGE_OR32 */
+                __atomic_fetch_and(r, ~mask, __ATOMIC_SEQ_CST);
         }
         for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
             volatile uint32_t *r =
