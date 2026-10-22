@@ -2659,6 +2659,127 @@ static void gpu_shot(const GpuRt *r, uint32_t w, uint32_t h)
         gpu_shot_tex(r->tex, w * s_scale, h * s_scale);
 }
 
+/* ---- the frame counter (F1) ---------------------------------------------- */
+
+/* fb_present.c: the frame rate to show, or -1 while it is hidden. */
+extern int xbox_FramebufferOverlayFps(void);
+
+/* "NNN FPS" in a 5x7 font, drawn into a small texture whenever the number
+ * changes and copied into the top-left corner of the picture at each
+ * present, enlarged by whole pixels so it stays crisp. Opaque, so it reads
+ * the same over any scene. */
+#define OSD_CHARS 7
+#define OSD_W (3 + OSD_CHARS * 6)
+#define OSD_H 11
+
+static ID3D11Texture2D          *s_osd_tex;
+static ID3D11ShaderResourceView *s_osd_srv;
+static ID3D11PixelShader        *s_osd_ps;
+static int s_osd_fps = -1, s_osd_cols, s_osd_failed;
+
+static const uint8_t *osd_glyph(char c)
+{
+    /* rows top to bottom, bit 4 the leftmost column */
+    static const uint8_t digit[10][7] = {
+        {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}, {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E},
+        {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F}, {0x1F,0x02,0x04,0x02,0x01,0x11,0x0E},
+        {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02}, {0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E},
+        {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E}, {0x1F,0x01,0x02,0x04,0x08,0x08,0x08},
+        {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}, {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C},
+    };
+    static const uint8_t f[7] = {0x1F,0x10,0x10,0x1E,0x10,0x10,0x10};
+    static const uint8_t p[7] = {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10};
+    static const uint8_t s[7] = {0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E};
+    static const uint8_t blank[7];
+    if (c >= '0' && c <= '9') return digit[c - '0'];
+    return c == 'F' ? f : c == 'P' ? p : c == 'S' ? s : blank;
+}
+
+static int osd_make(void)
+{
+    static const char ps_src[] =
+        "Texture2D T : register(t0);\n"
+        "float4 main(float4 p : SV_Position, float2 uv : TEXCOORD0) : SV_Target\n"
+        "{ uint w, h; T.GetDimensions(w, h);\n"
+        "  return T.Load(int3(min(uv * float2(w, h), float2(w - 1, h - 1)), 0)); }\n";
+    D3D11_TEXTURE2D_DESC d;
+    ID3DBlob *b;
+
+    if (s_osd_srv || s_osd_failed)
+        return s_osd_srv != NULL;
+    s_osd_failed = 1;
+    b = compile(ps_src, "ps_4_0", "frame counter ps");
+    if (!b)
+        return 0;
+    ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(b),
+                                   ID3D10Blob_GetBufferSize(b), NULL, &s_osd_ps);
+    ID3D10Blob_Release(b);
+    memset(&d, 0, sizeof d);
+    d.Width = OSD_W;
+    d.Height = OSD_H;
+    d.MipLevels = 1;
+    d.ArraySize = 1;
+    d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    d.SampleDesc.Count = 1;
+    d.Usage = D3D11_USAGE_DEFAULT;
+    d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    if (!s_osd_ps
+        || FAILED(ID3D11Device_CreateTexture2D(s_dev, &d, NULL, &s_osd_tex))
+        || FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_osd_tex,
+                                                        NULL, &s_osd_srv)))
+        return 0;
+    s_osd_failed = 0;
+    return 1;
+}
+
+static void osd_text(int fps)
+{
+    uint32_t px[OSD_W * OSD_H];
+    char t[16];
+    int n, i, x, y;
+
+    n = snprintf(t, sizeof t, "%d FPS", fps > 999 ? 999 : fps);
+    if (n > OSD_CHARS)
+        n = OSD_CHARS;
+    for (i = 0; i < OSD_W * OSD_H; i++)
+        px[i] = 0xFF000000u;                        /* black */
+    for (i = 0; i < n; i++) {
+        const uint8_t *g = osd_glyph(t[i]);
+        for (y = 0; y < 7; y++)
+            for (x = 0; x < 5; x++)
+                if (g[y] & (0x10 >> x))
+                    px[(2 + y) * OSD_W + 2 + i * 6 + x] = 0xFFFFE040u;   /* yellow */
+    }
+    ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)s_osd_tex, 0, NULL,
+                                          px, OSD_W * 4, 0);
+    s_osd_cols = 3 + n * 6;
+}
+
+/* Over the picture whose top-left corner is (x0, y0) and height vh. */
+static void osd_draw(ID3D11RenderTargetView *rtv, float x0, float y0, float vh)
+{
+    int fps = xbox_FramebufferOverlayFps();
+    float k, x, y;
+
+    if (fps < 0 || !osd_make())
+        return;
+    if (fps != s_osd_fps) {
+        osd_text(fps);
+        s_osd_fps = fps;
+    }
+    k = floorf(vh / 320.0f + 0.5f);                 /* 3x at 960 lines */
+    if (k < 2.0f)
+        k = 2.0f;
+    x = floorf(x0 + 2.0f * k);
+    y = floorf(y0 + 2.0f * k);
+    {
+        const LONG clip[4] = { (LONG)x, (LONG)y, (LONG)(x + (float)s_osd_cols * k),
+                               (LONG)(y + (float)OSD_H * k) };
+        blit_rect_ps(s_osd_srv, rtv, x, y, (float)OSD_W * k, (float)OSD_H * k, clip,
+                     s_osd_ps, NULL);
+    }
+}
+
 int nv2a_gpu_present(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, uint32_t h)
 {
     static int on = -1;
@@ -2742,6 +2863,7 @@ int nv2a_gpu_present(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, ui
                          s_sharp_ps, s_sharp_cb);
         } else
             blit_rect(r->srv, rtv, x0, y0, (float)r->w * k, (float)r->h * k, frame);
+        osd_draw(rtv, x0, y0, vh);
     }
     if (gpu_shot_window())
         gpu_shot_tex(back, cw, ch);

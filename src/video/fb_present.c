@@ -157,6 +157,79 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
  * seen a frame late is indistinguishable from one made a frame later. */
 static volatile unsigned char s_key_down[256];
 
+/* The mouse, for the same stand-in. Buttons go into s_key_down under their
+ * Win32 virtual keys (VK_LBUTTON 0x01, VK_RBUTTON 0x02, VK_MBUTTON 0x04,
+ * VK_XBUTTON1/2 0x05/0x06), so a binding names a button as it names a key;
+ * the wheel is two codes Windows leaves unassigned, one notch one press;
+ * motion is summed here until the input side takes it.
+ *
+ * All of it only while the window holds the mouse. A click in the window
+ * takes it -- pointer hidden and kept inside -- and losing the focus gives
+ * it back, so Alt+Tab is the way out. The click that takes the mouse is not
+ * a press: it would otherwise attack. */
+#define FB_VK_WHEEL_UP   0x0A
+#define FB_VK_WHEEL_DOWN 0x0B
+static volatile LONG s_mouse_held;
+static volatile LONG s_mouse_dx, s_mouse_dy;
+static volatile LONG s_wheel[2];      /* notches not yet pressed: up, down */
+
+/* In src/input: whether the settings use the mouse at all (input = controller
+ * leaves it alone). */
+extern int xbox_InputUsesMouse(void);
+
+static void fb_mouse_add(long dx, long dy)
+{
+    if (s_mouse_held) {
+        InterlockedExchangeAdd(&s_mouse_dx, (LONG)dx);
+        InterlockedExchangeAdd(&s_mouse_dy, (LONG)dy);
+    }
+}
+
+static void fb_wheel_add(int down)
+{
+    /* A fast spin is a handful of presses, not a queue that runs for
+     * seconds after the wheel stops. */
+    if (s_mouse_held && s_wheel[down] < 3)
+        InterlockedIncrement(&s_wheel[down]);
+}
+
+static void fb_mouse_buttons_up(void)
+{
+    s_key_down[0x01] = s_key_down[0x02] = s_key_down[0x04] = 0;
+    s_key_down[0x05] = s_key_down[0x06] = 0;
+    InterlockedExchange(&s_wheel[0], 0);
+    InterlockedExchange(&s_wheel[1], 0);
+    InterlockedExchange(&s_mouse_dx, 0);
+    InterlockedExchange(&s_mouse_dy, 0);
+}
+
+void xbox_FramebufferMouseTake(int *dx, int *dy)
+{
+    *dx = (int)InterlockedExchange(&s_mouse_dx, 0);
+    *dy = (int)InterlockedExchange(&s_mouse_dy, 0);
+}
+
+/* The frame counter in the corner, F1 to show or hide (RECOMP_SHOW_FPS=1
+ * starts with it shown). The GPU backend draws it at the present; this
+ * only keeps the number, measured by the window thread with the title's. */
+static volatile LONG s_show_fps = -1;
+static volatile LONG s_fps_now;
+
+int xbox_FramebufferOverlayFps(void)
+{
+    if (s_show_fps < 0) {
+        const char *e = getenv("RECOMP_SHOW_FPS");
+        InterlockedExchange(&s_show_fps, (e && *e == '1') ? 1 : 0);
+    }
+    return s_show_fps ? (int)s_fps_now : -1;
+}
+
+static void fb_toggle_fps(void)
+{
+    xbox_FramebufferOverlayFps();
+    InterlockedExchange(&s_show_fps, !s_show_fps);
+}
+
 /* Title bar, the way ps3recomp's window shows it. Written by the flip,
  * read once a second by the window thread; a torn read shows one stale
  * number for a second, which nobody can tell apart from a real one. */
@@ -187,10 +260,32 @@ void xbox_FramebufferWindowFrameStats(uint32_t draws)
     InterlockedExchange(&s_frame_draws, (LONG)draws);
 }
 
+static uint32_t fb_ticks(void);
+
+/* A wheel notch as a press: down 60 ms, so a title reading the pad once a
+ * frame sees it, then up 40 ms, so the next notch is a new press. Asked
+ * only by the input thread, which owns the two timers. */
+static int fb_wheel_pressed(int down)
+{
+    static uint32_t until[2], gap[2];
+    uint32_t now = fb_ticks();
+
+    if ((int32_t)(now - until[down]) < 0)
+        return 1;
+    if ((int32_t)(now - gap[down]) < 0 || s_wheel[down] <= 0)
+        return 0;
+    InterlockedDecrement(&s_wheel[down]);
+    until[down] = now + 60;
+    gap[down] = now + 100;
+    return 1;
+}
+
 int xbox_FramebufferKeyDown(int vk)
 {
     if ((unsigned)vk > 255)
         return 0;
+    if (vk == FB_VK_WHEEL_UP || vk == FB_VK_WHEEL_DOWN)
+        return fb_wheel_pressed(vk == FB_VK_WHEEL_DOWN);
     return s_key_down[vk] != 0;
 }
 
@@ -212,6 +307,31 @@ static void fb_player_closed(void)
 }
 
 #if defined(_WIN32)
+static uint32_t fb_ticks(void) { return (uint32_t)GetTickCount(); }
+#else
+static uint32_t fb_ticks(void) { return (uint32_t)SDL_GetTicks(); }
+#endif
+
+#if defined(_WIN32)
+/* Take the mouse (on) or give it back. Taken, it is kept inside the client
+ * area and hidden (WM_SETCURSOR), and its motion read raw (WM_INPUT), which
+ * goes on reporting movement when the pointer is against an edge. */
+static void fb_mouse_hold(HWND h, int on)
+{
+    if (on) {
+        RECT r;
+        GetClientRect(h, &r);
+        MapWindowPoints(h, NULL, (POINT *)&r, 2);
+        ClipCursor(&r);
+        SetCursor(NULL);
+        InterlockedExchange(&s_mouse_held, 1);
+    } else if (s_mouse_held) {
+        InterlockedExchange(&s_mouse_held, 0);
+        ClipCursor(NULL);
+        fb_mouse_buttons_up();
+    }
+}
+
 /* Borderless fullscreen on the window's monitor, and back. Alt+Enter or F11
  * toggles; RECOMP_FULLSCREEN=1 starts that way. The frame keeps the
  * console's 4:3 with black bars either side (nv2a_gpu_present letterboxes
@@ -251,6 +371,10 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     if ((m == WM_SYSKEYDOWN && w == VK_RETURN && (l & (1 << 29)) && !(l & (1 << 30)))
         || (m == WM_KEYDOWN && w == VK_F11 && !(l & (1 << 30)))) {
         fb_set_fullscreen(h, !s_fullscreen);
+        return 0;
+    }
+    if (m == WM_KEYDOWN && w == VK_F1 && !(l & (1 << 30))) {
+        fb_toggle_fps();
         return 0;
     }
     if (m == WM_SYSCHAR && w == VK_RETURN)
@@ -293,8 +417,55 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     /* Alt-tabbing away with a key held would leave it held for ever. */
     case WM_KILLFOCUS:
+        fb_mouse_hold(h, 0);
         memset((void *)s_key_down, 0, sizeof s_key_down);
         return 0;
+
+    case WM_INPUT: {
+        RAWINPUT ri;
+        UINT n = sizeof ri;
+        if (s_mouse_held
+                && GetRawInputData((HRAWINPUT)l, RID_INPUT, &ri, &n,
+                                   sizeof(RAWINPUTHEADER)) != (UINT)-1
+                && ri.header.dwType == RIM_TYPEMOUSE
+                && !(ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE))
+            fb_mouse_add(ri.data.mouse.lLastX, ri.data.mouse.lLastY);
+        break;                          /* DefWindowProc frees the input */
+    }
+    case WM_LBUTTONDOWN:
+        if (!s_mouse_held) {
+            if (xbox_InputUsesMouse())
+                fb_mouse_hold(h, 1);
+            return 0;
+        }
+        s_key_down[0x01] = 1;
+        return 0;
+    case WM_LBUTTONUP:   s_key_down[0x01] = 0; return 0;
+    case WM_RBUTTONDOWN: s_key_down[0x02] = (unsigned char)s_mouse_held; return 0;
+    case WM_RBUTTONUP:   s_key_down[0x02] = 0; return 0;
+    case WM_MBUTTONDOWN: s_key_down[0x04] = (unsigned char)s_mouse_held; return 0;
+    case WM_MBUTTONUP:   s_key_down[0x04] = 0; return 0;
+    case WM_XBUTTONDOWN:
+    case WM_XBUTTONUP:
+        s_key_down[HIWORD(w) == XBUTTON1 ? 0x05 : 0x06] =
+            (unsigned char)(m == WM_XBUTTONDOWN && s_mouse_held);
+        return TRUE;
+    case WM_MOUSEWHEEL:
+        fb_wheel_add(GET_WHEEL_DELTA_WPARAM(w) < 0);
+        return 0;
+    case WM_SETCURSOR:
+        if (s_mouse_held && LOWORD(l) == HTCLIENT) {
+            SetCursor(NULL);
+            return TRUE;
+        }
+        break;
+    /* Fullscreen and back, or the window dragged: keep the pointer inside
+     * where the window now is. */
+    case WM_SIZE:
+    case WM_MOVE:
+        if (s_mouse_held)
+            fb_mouse_hold(h, 1);
+        break;
     }
     return DefWindowProcA(h, m, w, l);
 }
@@ -421,6 +592,16 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     }
     hdc = GetDC(hwnd);
     s_hwnd = hwnd;
+    if (xbox_InputUsesMouse()) {
+        RAWINPUTDEVICE rid;
+        rid.usUsagePage = 0x01;         /* generic desktop: mouse */
+        rid.usUsage     = 0x02;
+        rid.dwFlags     = 0;
+        rid.hwndTarget  = hwnd;
+        if (!RegisterRawInputDevices(&rid, 1, sizeof rid))
+            fprintf(stderr, "  [FBWIN] no raw mouse input (error %lu)\n",
+                    (unsigned long)GetLastError());
+    }
     {
         const char *fs = getenv("RECOMP_FULLSCREEN");
         if (fs && *fs == '1')
@@ -445,6 +626,19 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
+        }
+        /* Input wakes this loop as it arrives (the wait at the bottom), so
+         * keys and mouse motion reach the pad at once instead of in 16 ms
+         * batches, which made mouse look judder; the frame work below still
+         * runs once every 16 ms. */
+        {
+            static DWORD last;
+            DWORD now = GetTickCount();
+            if (now - last < 16) {
+                MsgWaitForMultipleObjects(0, NULL, FALSE, 16 - (now - last), QS_ALLINPUT);
+                continue;
+            }
+            last = now;
         }
         if (s_present_idx >= 0 && s_rgb) {
             /* A finished frame, published by the flip. Copied into s_rgb so
@@ -500,18 +694,19 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             static DWORD t0;
             static LONG f0;
             DWORD now = GetTickCount();
-            if (now - t0 >= 1000) {
+            if (now - t0 >= 500) {
                 LONG f = s_flips;
+                double fps = t0 ? (f - f0) * 1000.0 / (now - t0) : 0.0;
                 wchar_t tb[128];
+                InterlockedExchange(&s_fps_now, (LONG)(fps + 0.5));
                 _snwprintf(tb, 127, L"%ls | FPS: %.1f | draws: %ld", s_title,
-                           t0 ? (f - f0) * 1000.0 / (now - t0) : 0.0,
-                           (long)s_frame_draws);
+                           fps, (long)s_frame_draws);
                 tb[127] = 0;
                 SetWindowTextW(hwnd, tb);
                 t0 = now; f0 = f;
             }
         }
-        Sleep(16);
+        MsgWaitForMultipleObjects(0, NULL, FALSE, 16, QS_ALLINPUT);
     }
 
     s_hwnd = NULL;
@@ -545,8 +740,28 @@ static int fb_vk_from_sdl(SDL_Keycode k)
     if (k >= SDLK_a && k <= SDLK_z) return 'A' + (int)(k - SDLK_a);
     if (k >= SDLK_0 && k <= SDLK_9) return '0' + (int)(k - SDLK_0);
     if (k >= SDLK_KP_1 && k <= SDLK_KP_9) return 0x61 + (int)(k - SDLK_KP_1);
+    if (k >= SDLK_F1 && k <= SDLK_F12) return 0x70 + (int)(k - SDLK_F1);
     switch (k) {
     case SDLK_KP_0:      return 0x60;
+    case SDLK_KP_ENTER:  return 0x0D;
+    case SDLK_CAPSLOCK:  return 0x14;
+    case SDLK_PAGEUP:    return 0x21;
+    case SDLK_PAGEDOWN:  return 0x22;
+    case SDLK_END:       return 0x23;
+    case SDLK_HOME:      return 0x24;
+    case SDLK_INSERT:    return 0x2D;
+    case SDLK_DELETE:    return 0x2E;
+    case SDLK_SEMICOLON: return 0xBA;
+    case SDLK_EQUALS:    return 0xBB;
+    case SDLK_COMMA:     return 0xBC;
+    case SDLK_MINUS:     return 0xBD;
+    case SDLK_PERIOD:    return 0xBE;
+    case SDLK_SLASH:     return 0xBF;
+    case SDLK_BACKQUOTE: return 0xC0;
+    case SDLK_LEFTBRACKET:  return 0xDB;
+    case SDLK_BACKSLASH:    return 0xDC;
+    case SDLK_RIGHTBRACKET: return 0xDD;
+    case SDLK_QUOTE:     return 0xDE;
     case SDLK_UP:        return 0x26;
     case SDLK_DOWN:      return 0x28;
     case SDLK_LEFT:      return 0x25;
@@ -651,6 +866,11 @@ static int fb_thread(void *unused)
                     SDL_SetWindowFullscreen(win, on ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
                     continue;
                 }
+                if (k == SDLK_F1) {
+                    if (ev.type == SDL_KEYDOWN && !ev.key.repeat)
+                        fb_toggle_fps();
+                    continue;
+                }
                 vk = fb_vk_from_sdl(k);
                 if (vk >= 0)
                     s_key_down[vk] = ev.type == SDL_KEYDOWN;
@@ -659,10 +879,46 @@ static int fb_thread(void *unused)
                     if (n++ < 40)
                         fprintf(stderr, "  [KEY] down vk=0x%02X\n", (unsigned)vk);
                 }
+            } else if (ev.type == SDL_MOUSEBUTTONDOWN || ev.type == SDL_MOUSEBUTTONUP) {
+                /* SDL's left, middle, right, X1, X2 as the Win32 keys */
+                static const int vk_of[6] = { -1, 0x01, 0x04, 0x02, 0x05, 0x06 };
+                int down = ev.type == SDL_MOUSEBUTTONDOWN;
+                if (down && !s_mouse_held) {
+                    if (ev.button.button == SDL_BUTTON_LEFT && xbox_InputUsesMouse()
+                            && SDL_SetRelativeMouseMode(SDL_TRUE) == 0)
+                        InterlockedExchange(&s_mouse_held, 1);
+                    continue;
+                }
+                if (ev.button.button < 6 && vk_of[ev.button.button] >= 0)
+                    s_key_down[vk_of[ev.button.button]] = (unsigned char)down;
+            } else if (ev.type == SDL_MOUSEMOTION) {
+                fb_mouse_add(ev.motion.xrel, ev.motion.yrel);
+            } else if (ev.type == SDL_MOUSEWHEEL) {
+                int y = ev.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -ev.wheel.y
+                                                                     : ev.wheel.y;
+                if (y)
+                    fb_wheel_add(y < 0);
             } else if (ev.type == SDL_WINDOWEVENT
                        && ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
+                if (s_mouse_held) {
+                    InterlockedExchange(&s_mouse_held, 0);
+                    SDL_SetRelativeMouseMode(SDL_FALSE);
+                    fb_mouse_buttons_up();
+                }
                 memset((void *)s_key_down, 0, sizeof s_key_down);
             }
+        }
+        /* As the Win32 loop: input wakes it at once, the frame work runs
+         * every 16 ms. Only while the GPU presents -- drawing the software
+         * frames, vsync paces this loop instead. */
+        if (s_gpu_owned || (gpu && !s_gpu_unavailable)) {
+            static Uint32 last;
+            Uint32 now = SDL_GetTicks();
+            if (now - last < 16) {
+                SDL_WaitEventTimeout(NULL, (int)(16 - (now - last)));
+                continue;
+            }
+            last = now;
         }
         if (s_present_idx >= 0 && s_rgb) {
             LONG idx = s_present_idx;
@@ -685,7 +941,7 @@ static int fb_thread(void *unused)
             SDL_RenderCopy(ren, tex, NULL, NULL);
             SDL_RenderPresent(ren);
         } else {
-            SDL_Delay(16);              /* the GPU presents, or nothing to show */
+            SDL_WaitEventTimeout(NULL, 16);   /* the GPU presents, or nothing to show */
         }
         {
             const char *dump = getenv("RECOMP_FB_DUMP");
@@ -704,12 +960,13 @@ static int fb_thread(void *unused)
             static Uint32 t0;
             static LONG f0;
             Uint32 now = SDL_GetTicks();
-            if (now - t0 >= 1000) {
+            if (now - t0 >= 500) {
                 LONG f = s_flips;
+                double fps = t0 ? (f - f0) * 1000.0 / (now - t0) : 0.0;
                 char tb[128];
+                InterlockedExchange(&s_fps_now, (LONG)(fps + 0.5));
                 snprintf(tb, sizeof tb, "%s | FPS: %.1f | draws: %ld", s_title,
-                         t0 ? (f - f0) * 1000.0 / (now - t0) : 0.0,
-                         (long)s_frame_draws);
+                         fps, (long)s_frame_draws);
                 SDL_SetWindowTitle(win, tb);
                 t0 = now; f0 = f;
             }
@@ -746,6 +1003,8 @@ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (v
 void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
 void xbox_FramebufferWindowStart(void) {}
 int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
+void xbox_FramebufferMouseTake(int *dx, int *dy) { *dx = *dy = 0; }
+int xbox_FramebufferOverlayFps(void) { return -1; }
 void xbox_FramebufferWindowSetTitle(const uint16_t *n, int m) { (void)n; (void)m; }
 void xbox_FramebufferWindowFrameStats(uint32_t draws) { (void)draws; }
 void *xbox_FramebufferWindowHwnd(void) { return (void *)0; }
