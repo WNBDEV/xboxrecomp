@@ -45,6 +45,8 @@ typedef struct {
     int cube;
     int linear;                         /* coordinates in texels, not 0..1 */
     int filter_linear;
+    int mipmap;                         /* the title's minification between
+                                         * mip levels: 0 none, 1 nearest, 2 linear */
     int wrap_u, wrap_v;
     const void *tex;
 } Nv2aGpuTexture;

@@ -2906,6 +2906,10 @@ static void gpu_state(Nv2aGpuState *g)
         o->cube = t->cube;
         o->linear = !tex_size_from_format(t->color);
         o->filter_linear = mag == 2 || min == 2 || min == 4 || min == 6;
+        /* MIN 3-6 select a mip level (3/4 the nearest one, 5/6 blending two);
+         * a linear (unswizzled) texture has no levels to select. */
+        o->mipmap = min >= 3 && min <= 6 && t->levels > 1 && !o->linear
+                    ? (min >= 5 ? 2 : 1) : 0;
         o->wrap_u = t->addr_u == 1;
         o->wrap_v = t->addr_v == 1;
         o->tex = t;

@@ -274,6 +274,25 @@ static uint32_t s_scale = 1;
 static ID3D11VertexShader *s_blit_vs;
 static ID3D11PixelShader *s_blit_ps;
 static ID3D11SamplerState *s_blit_smp;
+static ID3D11PixelShader *s_sharp_ps;   /* RECOMP_SHARPEN, at the present */
+static ID3D11Buffer *s_sharp_cb;
+
+/* RECOMP_SHARPEN=0..1 [0]: contrast-adaptive sharpening as the frame goes to
+ * the window. Each pixel is pushed away from its four neighbours, less where
+ * the neighbourhood already spans a wide range (an edge, which would ring)
+ * and more where it is flat (a magnified texture, the softness 2x rendering
+ * of 480i-era art shows). 0 leaves the frame exactly as rendered. */
+static float sharpen_amount(void)
+{
+    static float a = -1.0f;
+    if (a < 0.0f) {
+        const char *e = getenv("RECOMP_SHARPEN");
+        a = e && *e ? (float)atof(e) : 0.0f;
+        if (!(a > 0.0f)) a = 0.0f;
+        if (a > 1.0f) a = 1.0f;
+    }
+    return a;
+}
 
 #define GPU_VB_BYTES (16u << 20)
 #define GPU_IB_BYTES (4u << 20)
@@ -985,8 +1004,19 @@ static uint64_t rt_guest_hash(const GpuRt *r)
  * target or view bound, so either can be bound the other way next. */
 /* src drawn into the viewport (x, y, w, h) of dst, kept inside the scissor
  * rectangle `clip` (left, top, right, bottom). */
+static void blit_rect_ps(ID3D11ShaderResourceView *src, ID3D11RenderTargetView *dst,
+                         float x, float y, float w, float h, const LONG clip[4],
+                         ID3D11PixelShader *ps, ID3D11Buffer *cb);
+
 static void blit_rect(ID3D11ShaderResourceView *src, ID3D11RenderTargetView *dst,
                       float x, float y, float w, float h, const LONG clip[4])
+{
+    blit_rect_ps(src, dst, x, y, w, h, clip, s_blit_ps, NULL);
+}
+
+static void blit_rect_ps(ID3D11ShaderResourceView *src, ID3D11RenderTargetView *dst,
+                         float x, float y, float w, float h, const LONG clip[4],
+                         ID3D11PixelShader *ps, ID3D11Buffer *cb)
 {
     D3D11_VIEWPORT vp;
     D3D11_RECT sc;
@@ -1003,7 +1033,9 @@ static void blit_rect(ID3D11ShaderResourceView *src, ID3D11RenderTargetView *dst
     ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
     ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     ID3D11DeviceContext_VSSetShader(s_ctx, s_blit_vs, NULL, 0);
-    ID3D11DeviceContext_PSSetShader(s_ctx, s_blit_ps, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(s_ctx, ps, NULL, 0);
+    if (cb)
+        ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &cb);
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &src);
     ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &s_blit_smp);
     ID3D11DeviceContext_Draw(s_ctx, 3, 0);
@@ -1252,9 +1284,34 @@ static GpuDs *get_ds(uint32_t addr, uint32_t w, uint32_t h)
 
 /* ---- textures ------------------------------------------------------------ */
 
+/* RECOMP_TEXFILTER: 0 samples the top level only, as this backend used to
+ * (minified textures shimmer); 1 [default] gives a texture the title
+ * minifies between mip levels a full chain, generated on the GPU from the top
+ * level, and samples it as the title asks; 2-16 adds anisotropic filtering
+ * of that many samples where the title filters linearly. The title's own
+ * lower levels are not decoded: the generated ones are box-filtered from its
+ * top level, which is how mip chains are usually made. */
+static int tex_filter_mode(void)
+{
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("RECOMP_TEXFILTER");
+        mode = e && *e ? atoi(e) : 1;
+        if (mode < 0) mode = 0;
+        if (mode > 16) mode = 16;
+    }
+    return mode;
+}
+
+static int tex_wants_mips(const Nv2aGpuTexture *t)
+{
+    return tex_filter_mode() > 0 && t->mipmap && !t->cube && t->width > 1 && t->height > 1;
+}
+
 typedef struct {
     uint32_t addr, bytes, palette, palette_bytes, width, height, pitch, format;
     int cube;
+    int mips;                           /* uploaded with a generated mip chain */
     uint64_t hash;
     uint32_t checked;                   /* frame of the last content check */
     uint32_t last_used;
@@ -1389,13 +1446,28 @@ static int tex_upload(GpuTex *e, const Nv2aGpuTexture *t)
         v.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
         v.Texture2D.MipLevels = 1;
     }
-    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &d, init, &e->tex))
+    e->mips = tex_wants_mips(t);
+    if (e->mips) {
+        /* The whole chain, filled from the top level by GenerateMips: which
+         * needs a render-target-capable texture, so no initial data. */
+        d.MipLevels = 0;
+        d.Usage = D3D11_USAGE_DEFAULT;
+        d.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        d.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+        v.Texture2D.MipLevels = (UINT)-1;
+    }
+    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &d, e->mips ? NULL : init, &e->tex))
         || FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)e->tex,
                                                         &v, &e->srv))) {
         if (e->tex) ID3D11Texture2D_Release(e->tex);
         e->tex = NULL;
         free(buf);
         return 0;
+    }
+    if (e->mips) {
+        ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)e->tex, 0, NULL,
+                                              buf, t->width * 4, 0);
+        ID3D11DeviceContext_GenerateMips(s_ctx, e->srv);
     }
     free(buf);
     return 1;
@@ -1489,7 +1561,8 @@ static ID3D11ShaderResourceView *get_tex(const Nv2aGpuTexture *t)
         GpuTex *c = &s_tex[i];
         if (c->srv && c->addr == t->addr && c->format == t->format
             && c->width == t->width && c->height == t->height && c->pitch == t->pitch
-            && c->palette == t->palette && c->cube == t->cube && c->bytes == t->bytes) {
+            && c->palette == t->palette && c->cube == t->cube && c->bytes == t->bytes
+            && c->mips == tex_wants_mips(t)) {
             e = c;
             break;
         }
@@ -1696,15 +1769,25 @@ static ID3D11DepthStencilState *get_dss(const Nv2aGpuState *st, int has_ds)
     return s;
 }
 
-static ID3D11SamplerState *get_sampler(int linear, int wrap_u, int wrap_v)
+/* `mip`: the title's filtering between mip levels (Nv2aGpuTexture.mipmap),
+ * when the bound view has levels; anisotropic per RECOMP_TEXFILTER. */
+static ID3D11SamplerState *get_sampler(int linear, int wrap_u, int wrap_v, int mip)
 {
-    uint64_t key = (uint64_t)linear | ((uint64_t)wrap_u << 1) | ((uint64_t)wrap_v << 2);
+    uint64_t key = (uint64_t)linear | ((uint64_t)wrap_u << 1) | ((uint64_t)wrap_v << 2)
+                 | ((uint64_t)mip << 3);
     ID3D11SamplerState *s = (ID3D11SamplerState *)cache_get(s_smp, 32, key);
     D3D11_SAMPLER_DESC d;
+    int aniso = tex_filter_mode();
     if (s)
         return s;
     memset(&d, 0, sizeof d);
-    d.Filter = linear ? D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT : D3D11_FILTER_MIN_MAG_MIP_POINT;
+    if (linear && mip && aniso >= 2) {
+        d.Filter = D3D11_FILTER_ANISOTROPIC;
+        d.MaxAnisotropy = (UINT)aniso;
+    } else if (linear)
+        d.Filter = mip == 2 ? D3D11_FILTER_MIN_MAG_MIP_LINEAR : D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+    else
+        d.Filter = mip == 2 ? D3D11_FILTER_MIN_MAG_POINT_MIP_LINEAR : D3D11_FILTER_MIN_MAG_MIP_POINT;
     d.AddressU = wrap_u ? D3D11_TEXTURE_ADDRESS_WRAP : D3D11_TEXTURE_ADDRESS_CLAMP;
     d.AddressV = wrap_v ? D3D11_TEXTURE_ADDRESS_WRAP : D3D11_TEXTURE_ADDRESS_CLAMP;
     d.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
@@ -1934,6 +2017,37 @@ static int gpu_init(void)
                                            ID3D10Blob_GetBufferSize(bps), NULL, &s_blit_ps);
             ID3D10Blob_Release(bps);
         }
+        if (sharpen_amount() > 0.0f) {
+            static const char sharp_src[] =
+                "Texture2D T : register(t0); SamplerState S : register(s0);\n"
+                "cbuffer C : register(b0) { float2 texel; float peak; float pad; };\n"
+                "float4 main(float4 p : SV_Position, float2 uv : TEXCOORD0) : SV_Target\n"
+                "{\n"
+                "  float4 c4 = T.Sample(S, uv);\n"
+                "  float3 c = c4.rgb;\n"
+                "  float3 n = T.Sample(S, uv - float2(0, texel.y)).rgb;\n"
+                "  float3 s = T.Sample(S, uv + float2(0, texel.y)).rgb;\n"
+                "  float3 w = T.Sample(S, uv - float2(texel.x, 0)).rgb;\n"
+                "  float3 e = T.Sample(S, uv + float2(texel.x, 0)).rgb;\n"
+                "  float3 mn = min(c, min(min(n, s), min(w, e)));\n"
+                "  float3 mx = max(c, max(max(n, s), max(w, e)));\n"
+                /* headroom to the nearer of 0 and 1, relative to the brightest:
+                 * small on an edge, large on a flat patch */
+                "  float3 amp = sqrt(saturate(min(mn, 1.0 - mx) / max(mx, 1e-4)));\n"
+                "  float3 k = amp * peak;\n"
+                "  float3 r = (c + (n + s + w + e) * k) / (1.0 + 4.0 * k);\n"
+                "  return float4(saturate(r), c4.a);\n"
+                "}\n";
+            ID3DBlob *bsp = compile(sharp_src, "ps_4_0", "sharpen ps");
+            if (bsp) {
+                ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(bsp),
+                                               ID3D10Blob_GetBufferSize(bsp), NULL, &s_sharp_ps);
+                ID3D10Blob_Release(bsp);
+            }
+            s_sharp_cb = make_cb(16);
+            if (s_sharp_ps && s_sharp_cb)
+                gpu_log("sharpening the presented frame (RECOMP_SHARPEN=%.2f)", sharpen_amount());
+        }
         memset(&sd, 0, sizeof sd);
         sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
         sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
@@ -2160,19 +2274,31 @@ static int swap_create(HWND hwnd, uint32_t w, uint32_t h)
  * [60], the frame at the resolution it was rendered, as <prefix>NNNNN.bmp
  * (32-bit, top-down), read straight from the GPU: what the window shows,
  * without the window having to be on screen, and not the console-sized guest
- * copy RECOMP_FB_DUMP takes. At most 1000. */
-static void gpu_shot(const GpuRt *r, uint32_t w, uint32_t h)
+ * copy RECOMP_FB_DUMP takes. At most 1000. RECOMP_GPU_SHOT_WINDOW=1 takes
+ * the window's back buffer instead, after the present -- letterbox,
+ * window scaling and RECOMP_SHARPEN included. */
+static int gpu_shot_window(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_GPU_SHOT_WINDOW");
+        on = e && *e == '1';
+    }
+    return on;
+}
+
+static void gpu_shot_tex(ID3D11Texture2D *src, uint32_t W, uint32_t H)
 {
     static const char *prefix;
     static int every = -1, n, frames;
-    const uint32_t W = w * s_scale, H = h * s_scale;
     uint8_t hdr[54];
     D3D11_TEXTURE2D_DESC d;
     D3D11_MAPPED_SUBRESOURCE m;
     D3D11_BOX box;
     ID3D11Texture2D *st = NULL;
     char path[512];
-    uint32_t y, v;
+    uint32_t y, x, v;
+    int swap_rb;
     FILE *f;
 
     if (every < 0) {
@@ -2182,18 +2308,20 @@ static void gpu_shot(const GpuRt *r, uint32_t w, uint32_t h)
     }
     if (!prefix || !*prefix || n >= 1000 || ++frames % every)
         return;
-    memset(&d, 0, sizeof d);
+    ID3D11Texture2D_GetDesc(src, &d);       /* the back buffer may be RGBA */
+    swap_rb = d.Format == DXGI_FORMAT_R8G8B8A8_UNORM;
     d.Width = W; d.Height = H; d.MipLevels = 1; d.ArraySize = 1;
-    d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    d.SampleDesc.Count = 1;
+    d.SampleDesc.Count = 1; d.SampleDesc.Quality = 0;
     d.Usage = D3D11_USAGE_STAGING;
+    d.BindFlags = 0;
+    d.MiscFlags = 0;
     d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &d, NULL, &st)))
         return;
     box.left = 0; box.top = 0; box.front = 0;
     box.right = W; box.bottom = H; box.back = 1;
     ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)st, 0, 0, 0, 0,
-                                              (ID3D11Resource *)r->tex, 0, &box);
+                                              (ID3D11Resource *)src, 0, &box);
     if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)st, 0, D3D11_MAP_READ, 0, &m))) {
         snprintf(path, sizeof path, "%s%05d.bmp", prefix, n++);
         f = fopen(path, "wb");
@@ -2207,13 +2335,27 @@ static void gpu_shot(const GpuRt *r, uint32_t w, uint32_t h)
             v = (uint32_t)-(int32_t)H; memcpy(hdr + 22, &v, 4);   /* top-down */
             hdr[26] = 1; hdr[28] = 32;
             fwrite(hdr, 1, sizeof hdr, f);
-            for (y = 0; y < H; y++)
-                fwrite((const uint8_t *)m.pData + (size_t)y * m.RowPitch, 4, W, f);
+            for (y = 0; y < H; y++) {
+                uint8_t *row = (uint8_t *)m.pData + (size_t)y * m.RowPitch;
+                if (swap_rb)
+                    for (x = 0; x < W; x++) {
+                        uint8_t t = row[x * 4];
+                        row[x * 4] = row[x * 4 + 2];
+                        row[x * 4 + 2] = t;
+                    }
+                fwrite(row, 4, W, f);
+            }
             fclose(f);
         }
         ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)st, 0);
     }
     ID3D11Texture2D_Release(st);
+}
+
+static void gpu_shot(const GpuRt *r, uint32_t w, uint32_t h)
+{
+    if (!gpu_shot_window())
+        gpu_shot_tex(r->tex, w * s_scale, h * s_scale);
 }
 
 int nv2a_gpu_present(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, uint32_t h)
@@ -2288,8 +2430,19 @@ int nv2a_gpu_present(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, ui
         float x0 = ((float)cw - vw) * 0.5f, y0 = ((float)ch - vh) * 0.5f;
         const LONG frame[4] = { (LONG)x0, (LONG)y0, (LONG)(x0 + vw + 0.5f),
                                 (LONG)(y0 + vh + 0.5f) };
-        blit_rect(r->srv, rtv, x0, y0, (float)r->w * k, (float)r->h * k, frame);
+        if (s_sharp_ps && s_sharp_cb) {
+            /* one source texel to each side; the CAS-style peak, -1/8 at
+             * the gentlest to -1/5 at full strength */
+            const float c[4] = { 1.0f / (float)(r->w * s_scale), 1.0f / (float)(r->h * s_scale),
+                                 -1.0f / (8.0f - 3.0f * sharpen_amount()), 0.0f };
+            cb_write(s_sharp_cb, c, sizeof c);
+            blit_rect_ps(r->srv, rtv, x0, y0, (float)r->w * k, (float)r->h * k, frame,
+                         s_sharp_ps, s_sharp_cb);
+        } else
+            blit_rect(r->srv, rtv, x0, y0, (float)r->w * k, (float)r->h * k, frame);
     }
+    if (gpu_shot_window())
+        gpu_shot_tex(back, cw, ch);
     ID3D11RenderTargetView_Release(rtv);
     ID3D11Texture2D_Release(back);
     IDXGISwapChain_Present(s_swap, 1, 0);
@@ -2368,17 +2521,20 @@ static GpuRt *pixel_pipeline(const Nv2aGpuState *st)
         int a1 = 0;
         ID3D11ShaderResourceView *view = t->valid ? rt_as_texture(t, r, &tex_w[i], &tex_h[i], &a1)
                                                   : NULL;
+        int mip = 0;
         if (view) {
             key.alpha_one |= (uint8_t)(a1 << i);
         } else {
             tex_w[i] = (float)t->width;
             tex_h[i] = (float)t->height;
             view = get_tex(t);
+            if (view && tex_wants_mips(t))
+                mip = t->mipmap;
         }
         key.cube[i] = (uint8_t)(t->valid && t->cube && view);
         srv[i] = (view && !key.cube[i]) ? view : s_white2d;
         srv[4 + i] = key.cube[i] ? view : s_whitecube;
-        smp[i] = get_sampler(t->filter_linear, t->wrap_u, t->wrap_v);
+        smp[i] = get_sampler(t->filter_linear, t->wrap_u, t->wrap_v, mip);
     }
     rt_begin(r);
 
