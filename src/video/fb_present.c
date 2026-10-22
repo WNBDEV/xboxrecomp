@@ -194,6 +194,23 @@ int xbox_FramebufferKeyDown(int vk)
     return s_key_down[vk] != 0;
 }
 
+/* The player closed the window (Alt+F4, the close button, the desktop's
+ * quit): end the program. A console title never exits by itself, so
+ * stopping only this window's thread left the game running with nothing on
+ * screen and no way to close it short of killing the process. Terminated
+ * outright rather than through ExitProcess: with the title's threads still
+ * running, the graphics and sound libraries' detach code can hang. Shared by
+ * the Win32 window (WM_CLOSE) and the SDL one (SDL_QUIT). */
+static void fb_player_closed(void)
+{
+    fprintf(stderr, "[FB] window closed: exiting\n");
+    fflush(NULL);
+#if defined(_WIN32)
+    TerminateProcess(GetCurrentProcess(), 0);
+#endif
+    _exit(0);
+}
+
 #if defined(_WIN32)
 /* Borderless fullscreen on the window's monitor, and back. Alt+Enter or F11
  * toggles; RECOMP_FULLSCREEN=1 starts that way. The frame keeps the
@@ -225,22 +242,6 @@ static void fb_set_fullscreen(HWND h, int on)
                      SWP_FRAMECHANGED | SWP_SHOWWINDOW);
     }
     s_fullscreen = on;
-}
-
-/* The player closed the window (Alt+F4, the close button, the desktop's
- * quit): end the program. A console title never exits by itself, so
- * stopping only this window's thread left the game running with nothing on
- * screen and no way to close it short of killing the process. Terminated
- * outright rather than through ExitProcess: with the title's threads still
- * running, the graphics and sound libraries' detach code can hang. */
-static void fb_player_closed(void)
-{
-    fprintf(stderr, "[FB] window closed: exiting\n");
-    fflush(NULL);
-#if defined(_WIN32)
-    TerminateProcess(GetCurrentProcess(), 0);
-#endif
-    _exit(0);
 }
 
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
