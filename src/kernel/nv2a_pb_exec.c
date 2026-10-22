@@ -763,8 +763,13 @@ static void clear_surface(uint32_t param)
         holes = getenv("RECOMP_DEBUG_HOLES") != NULL;
     if (nv2a_gpu_enabled()) {
         Nv2aGpuState g;
+        uint32_t color = s_gpu.clear_color;
+        if (holes && !(param & NV097_CLEAR_COLOR_MASK)) {
+            param |= NV097_CLEAR_COLOR_MASK;    /* the probe, on the GPU too */
+            color = 0xFFFF00FFu;
+        }
         gpu_state(&g);
-        nv2a_gpu_clear(&g, param, s_gpu.clear_color, s_gpu.zstencil_clear);
+        nv2a_gpu_clear(&g, param, color, s_gpu.zstencil_clear);
         if (s_gpu.flips == 0)
             xbox_FramebufferWindowSet(dma_resolve(s_gpu.color_offset), s_gpu.pitch);
         xbox_FramebufferWindowStart();
