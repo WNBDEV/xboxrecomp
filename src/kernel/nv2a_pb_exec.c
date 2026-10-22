@@ -2859,6 +2859,41 @@ static int decode_fast(const Texture *t, uint32_t face_off, uint32_t *out)
     return 1;
 }
 
+/* Mip level `level` of face `face`, decoded like level 0 into
+ * max(1, w >> level) x max(1, h >> level) texels: the levels follow level 0
+ * in the face, each sized as tex_face_stride counts them, and a level of a
+ * swizzled or DXT texture is laid out as a texture of its own size. Returns 0
+ * if the texture has no such level. */
+int nv2a_gpu_decode_texture_level(const void *tex, uint32_t face, uint32_t level,
+                                  uint32_t *out)
+{
+    const Texture *t = (const Texture *)tex;
+    uint32_t block = d3d8_format_dxt_block_bytes(t->color);
+    uint32_t levels = t->levels ? t->levels : 1, off, lv, u, v, argb;
+    Texture l;
+
+    if (level >= levels || !tex_size_from_format(t->color))
+        return 0;
+    off = face ? face * tex_face_stride(t) : 0;
+    for (lv = 0; lv < level; lv++) {
+        uint32_t lw = (t->width >> lv) ? (t->width >> lv) : 1;
+        uint32_t lh = (t->height >> lv) ? (t->height >> lv) : 1;
+        off += block ? ((lw + 3) / 4) * ((lh + 3) / 4) * block
+                     : lw * lh * tex_texel_bytes(t->color);
+    }
+    l = *t;
+    l.width = (t->width >> level) ? (t->width >> level) : 1;
+    l.height = (t->height >> level) ? (t->height >> level) : 1;
+    l.levels = 1;
+    if (decode_fast(&l, off, out))
+        return 1;
+    for (v = 0; v < l.height; v++)
+        for (u = 0; u < l.width; u++)
+            out[(size_t)v * l.width + u] = sample_tex(&l, off, u, v, &argb)
+                                           ? argb : 0xFFFFFFFFu;
+    return 1;
+}
+
 void nv2a_gpu_decode_texture(const void *tex, uint32_t face, uint32_t *out)
 {
     const Texture *t = (const Texture *)tex;
@@ -2915,6 +2950,7 @@ static void gpu_state(Nv2aGpuState *g)
          * a linear (unswizzled) texture has no levels to select. */
         o->mipmap = min >= 3 && min <= 6 && t->levels > 1 && !o->linear
                     ? (min >= 5 ? 2 : 1) : 0;
+        o->levels = t->levels ? t->levels : 1;
         o->wrap_u = t->addr_u == 1;
         o->wrap_v = t->addr_v == 1;
         o->tex = t;
