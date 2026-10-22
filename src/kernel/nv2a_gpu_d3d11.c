@@ -978,9 +978,23 @@ typedef struct {
     uint32_t last_used;
 } GpuDs;
 
-#define GPU_RTS 8
+/* Surfaces kept on the GPU, least recently used out. 8 was too few: in a boss
+ * fight four small effect surfaces and the frame's own pushed each other out,
+ * and each came back at its smallest size and grew a step a frame -- every
+ * step a readback -- at 35 fps. */
+#define GPU_RTS 32
 static GpuRt s_rt[GPU_RTS];
 static GpuDs s_ds[GPU_RTS];
+
+/* Surface churn, reported every ten seconds that had any (nv2a_gpu_frame):
+ * render targets made, by why, and readbacks -- each one a wait until the GPU
+ * has finished -- by who asked, with the time they took. */
+enum { RB_GROWN, RB_EVICTED, RB_SYNC };
+static struct {
+    unsigned made_new, made_grown, made_evicted, rb[3];
+    double rb_ms;
+    DWORD since;
+} s_churn;
 
 /* A sample of the surface's guest memory: one word in sixteen of every other
  * row. It only has to notice that something other than the GPU wrote the
@@ -1076,10 +1090,13 @@ static int rt_small(GpuRt *r)
 }
 
 /* GPU -> guest. */
-static void rt_readback(GpuRt *r)
+static void rt_readback(GpuRt *r, int why)
 {
     D3D11_MAPPED_SUBRESOURCE m;
+    LARGE_INTEGER t0, t1, f;
     uint32_t x, y;
+
+    QueryPerformanceCounter(&t0);
 
     if (s_scale > 1) {
         if (!rt_small(r))
@@ -1112,6 +1129,10 @@ static void rt_readback(GpuRt *r)
     r->synced = 1;
     r->guest_hash = rt_guest_hash(r);
     nv2a_gpu_guest_written(r->addr, r->pitch * r->h);
+    QueryPerformanceCounter(&t1);
+    QueryPerformanceFrequency(&f);
+    s_churn.rb[why]++;
+    s_churn.rb_ms += (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart;
 }
 
 /* Guest -> GPU. */
@@ -1172,7 +1193,8 @@ static GpuRt *get_rt(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, ui
                 return &s_rt[i];
             }
             if (s_rt[i].gpu_dirty)          /* growing: keep what it drew */
-                rt_readback(&s_rt[i]);
+                rt_readback(&s_rt[i], RB_GROWN);
+            s_churn.made_grown++;
             if (w < s_rt[i].w) w = s_rt[i].w;
             if (h < s_rt[i].h) h = s_rt[i].h;
             rt_release(&s_rt[i]);
@@ -1188,9 +1210,11 @@ static GpuRt *get_rt(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, ui
         if (!r) {
             r = &s_rt[oldest];
             if (r->gpu_dirty)
-                rt_readback(r);
+                rt_readback(r, RB_EVICTED);
             rt_release(r);
-        }
+            s_churn.made_evicted++;
+        } else
+            s_churn.made_new++;
     }
     memset(&d, 0, sizeof d);
     d.Width = w * s_scale; d.Height = h * s_scale; d.MipLevels = 1; d.ArraySize = 1;
@@ -2259,7 +2283,7 @@ void nv2a_gpu_sync(uint32_t addr, uint32_t bytes)
         GpuRt *r = &s_rt[i];
         if (r->tex && r->gpu_dirty && addr < r->addr + r->pitch * r->h
             && r->addr < addr + bytes)
-            rt_readback(r);
+            rt_readback(r, RB_SYNC);
     }
 }
 
@@ -2360,8 +2384,25 @@ void nv2a_gpu_blit_copy(int src_rt, uint32_t src, uint32_t dst, uint32_t pitch,
 
 void nv2a_gpu_frame(void)
 {
+    DWORD now = GetTickCount();
     if (s_state == 1)
         forget_drain();
+    if (!s_churn.since)
+        s_churn.since = now;
+    if (now - s_churn.since >= 10000) {
+        if (s_churn.made_new + s_churn.made_grown + s_churn.made_evicted
+            + s_churn.rb[RB_GROWN] + s_churn.rb[RB_EVICTED] + s_churn.rb[RB_SYNC])
+            gpu_log("last %.1f s: render targets made %u (new %u, grown %u, evicted "
+                    "another %u); readbacks %u (growing %u, evicting %u, guest "
+                    "reads %u), %.1f ms", (now - s_churn.since) / 1000.0,
+                    s_churn.made_new + s_churn.made_grown + s_churn.made_evicted,
+                    s_churn.made_new, s_churn.made_grown, s_churn.made_evicted,
+                    s_churn.rb[RB_GROWN] + s_churn.rb[RB_EVICTED] + s_churn.rb[RB_SYNC],
+                    s_churn.rb[RB_GROWN], s_churn.rb[RB_EVICTED], s_churn.rb[RB_SYNC],
+                    s_churn.rb_ms);
+        memset(&s_churn, 0, sizeof s_churn);
+        s_churn.since = now;
+    }
     s_frame++;
     if (s_frame == 0)
         s_frame = 1;
