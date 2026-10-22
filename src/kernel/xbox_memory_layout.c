@@ -3469,7 +3469,9 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
  * not one this arena tracks, so the caller can try the general heap. */
 int xbox_ContiguousFree(uint32_t addr)
 {
+    extern void nv2a_gpu_forget(uint32_t addr, uint32_t bytes);
     int i, found = 0;
+    uint32_t freed = 0;
 
     if (!xbox_ContigReclaimEnabled())
         return 0;
@@ -3479,6 +3481,7 @@ int xbox_ContiguousFree(uint32_t addr)
             continue;
         g_contig_blocks[i].free = 1;
         found = 1;
+        freed = g_contig_blocks[i].size;
         if (getenv("RECOMP_CONTIG_TRACE"))
             fprintf(stderr, "  [CONTIG] free  %08X +%X\n", addr, g_contig_blocks[i].size);
         if (i + 1 < g_contig_block_count && g_contig_blocks[i + 1].free
@@ -3498,6 +3501,10 @@ int xbox_ContiguousFree(uint32_t addr)
         break;
     }
     ReleaseSRWLockExclusive(&g_contig_lock);
+    /* Whatever the GPU backend holds over the block is stale from here: the
+     * block can be handed out again (see nv2a_gpu_forget). */
+    if (found)
+        nv2a_gpu_forget(addr, freed);
     return found;
 }
 

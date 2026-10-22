@@ -47,6 +47,7 @@ typedef struct {
     int filter_linear;
     int mipmap;                         /* the title's minification between
                                          * mip levels: 0 none, 1 nearest, 2 linear */
+    uint32_t levels;                    /* mip levels the title provides */
     int wrap_u, wrap_v;
     const void *tex;
 } Nv2aGpuTexture;
@@ -98,6 +99,10 @@ void nv2a_gpu_guest_written(uint32_t addr, uint32_t bytes);
 int  nv2a_gpu_blit_source(uint32_t src, uint32_t pitch, uint32_t bpp, uint32_t w, uint32_t h);
 void nv2a_gpu_blit_copy(int src_rt, uint32_t src, uint32_t dst, uint32_t pitch,
                         uint32_t w, uint32_t h);
+/* The title freed [addr, addr + bytes): whatever the GPU holds over those
+ * bytes is stale and is dropped, not read back, before the next GPU command.
+ * Any thread (the free runs on the title's). */
+void nv2a_gpu_forget(uint32_t addr, uint32_t bytes);
 /* A frame was presented. */
 void nv2a_gpu_frame(void);
 /* Show the w x h surface at addr in the framebuffer window, straight from the
@@ -108,5 +113,9 @@ int  nv2a_gpu_present(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, u
 /* Provided by the executor: decode face `face` of `tex` into width*height
  * A8R8G8B8 texels, unreadable texels white, as the software sampler has it. */
 void nv2a_gpu_decode_texture(const void *tex, uint32_t face, uint32_t *out);
+/* Mip level `level` of it, max(1, width >> level) x max(1, height >> level)
+ * texels; 0 if the title gave it no such level. */
+int  nv2a_gpu_decode_texture_level(const void *tex, uint32_t face, uint32_t level,
+                                   uint32_t *out);
 
 #endif

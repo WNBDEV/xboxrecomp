@@ -1286,11 +1286,9 @@ static GpuDs *get_ds(uint32_t addr, uint32_t w, uint32_t h)
 
 /* RECOMP_TEXFILTER: 0 samples the top level only, as this backend used to
  * (minified textures shimmer); 1 [default] gives a texture the title
- * minifies between mip levels a full chain, generated on the GPU from the top
- * level, and samples it as the title asks; 2-16 adds anisotropic filtering
- * of that many samples where the title filters linearly. The title's own
- * lower levels are not decoded: the generated ones are box-filtered from its
- * top level, which is how mip chains are usually made. */
+ * minifies between mip levels its mip chain -- the title's own levels
+ * (RECOMP_TEXMIPS) -- and samples it as the title asks; 2-16 adds anisotropic
+ * filtering of that many samples where the title filters linearly. */
 static int tex_filter_mode(void)
 {
     static int mode = -1;
@@ -1306,6 +1304,19 @@ static int tex_filter_mode(void)
 static int tex_wants_mips(const Nv2aGpuTexture *t)
 {
     return tex_filter_mode() > 0 && t->mipmap && !t->cube && t->width > 1 && t->height > 1;
+}
+
+/* RECOMP_TEXMIPS: the title's own lower levels, decoded from its texture
+ * [default], or "generate": box-filtered on the GPU from the top level, also
+ * the fallback when a level does not decode. */
+static int tex_mips_from_title(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_TEXMIPS");
+        on = !(e && strcmp(e, "generate") == 0);
+    }
+    return on;
 }
 
 typedef struct {
@@ -1447,6 +1458,53 @@ static int tex_upload(GpuTex *e, const Nv2aGpuTexture *t)
         v.Texture2D.MipLevels = 1;
     }
     e->mips = tex_wants_mips(t);
+    if (e->mips && tex_mips_from_title()) {
+        /* The title's own levels, decoded like the top one -- as many as it
+         * provides, which is often fewer than a full chain: the NV2A samples
+         * only those, so neither does this. */
+        uint32_t n = t->levels, lv, total = 0;
+        D3D11_SUBRESOURCE_DATA lvl[16];
+        uint32_t *chain;
+        if (n > 16) n = 16;
+        for (lv = 0; lv < n; lv++) {
+            uint32_t lw = (t->width >> lv) ? (t->width >> lv) : 1;
+            uint32_t lh = (t->height >> lv) ? (t->height >> lv) : 1;
+            total += lw * lh;
+        }
+        chain = (uint32_t *)malloc((size_t)total * 4);
+        if (chain) {
+            uint32_t at = 0;
+            for (lv = 0; lv < n; lv++) {
+                uint32_t lw = (t->width >> lv) ? (t->width >> lv) : 1;
+                uint32_t lh = (t->height >> lv) ? (t->height >> lv) : 1;
+                if (lv == 0)
+                    memcpy(chain, buf, (size_t)lw * lh * 4);
+                else if (!nv2a_gpu_decode_texture_level(t->tex, 0, lv, chain + at))
+                    break;
+                lvl[lv].pSysMem = chain + at;
+                lvl[lv].SysMemPitch = lw * 4;
+                lvl[lv].SysMemSlicePitch = 0;
+                at += lw * lh;
+            }
+            n = lv;                         /* the levels that decoded */
+            d.MipLevels = n;
+            v.Texture2D.MipLevels = n;
+            if (n > 1
+                && SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &d, lvl, &e->tex))
+                && SUCCEEDED(ID3D11Device_CreateShaderResourceView(
+                       s_dev, (ID3D11Resource *)e->tex, &v, &e->srv))) {
+                free(chain);
+                free(buf);
+                return 1;
+            }
+            if (e->tex) ID3D11Texture2D_Release(e->tex);
+            e->tex = NULL;
+            d.MipLevels = 1;
+            v.Texture2D.MipLevels = 1;
+            free(chain);
+        }
+        /* else: fall through and generate them */
+    }
     if (e->mips) {
         /* The whole chain, filled from the top level by GenerateMips: which
          * needs a render-target-capable texture, so no initial data. */
@@ -2086,6 +2144,78 @@ int nv2a_gpu_enabled(void)
     return s_state == 1;
 }
 
+/* ---- freed memory -------------------------------------------------------- */
+
+/* Surfaces and textures here are known by guest address, and freeing guest
+ * memory told this backend nothing. Once freed blocks were reused
+ * (RECOMP_CONTIG_FREE), a render target the GPU still held over memory the
+ * title had freed and given to something else either stood in for the new
+ * texture (rt_as_texture) or was read back over the title's fresh data
+ * (nv2a_gpu_sync): Alter Echo's talking head for Nevin in the Surface: Arana
+ * level intro came out as nothing above the neck. So a free is queued here,
+ * from the title's thread, and the GPU thread drops what overlaps it before
+ * its next command. Dropping without a readback is right: the title's
+ * Direct3D waits for the GPU to be done with a resource before freeing it. */
+#define GPU_FORGET_MAX 64
+static struct { uint32_t addr, end; } s_forget[GPU_FORGET_MAX];
+static int s_forget_n;
+static volatile LONG s_forget_pending;
+static SRWLOCK s_forget_lock;            /* zero is the initial state */
+
+void nv2a_gpu_forget(uint32_t addr, uint32_t bytes)
+{
+    if (!bytes)
+        return;
+    AcquireSRWLockExclusive(&s_forget_lock);
+    if (s_forget_n < GPU_FORGET_MAX) {
+        s_forget[s_forget_n].addr = addr;
+        s_forget[s_forget_n].end = addr + bytes;
+        s_forget_n++;
+    } else {                            /* full: widen the last range */
+        if (addr < s_forget[GPU_FORGET_MAX - 1].addr)
+            s_forget[GPU_FORGET_MAX - 1].addr = addr;
+        if (addr + bytes > s_forget[GPU_FORGET_MAX - 1].end)
+            s_forget[GPU_FORGET_MAX - 1].end = addr + bytes;
+    }
+    InterlockedExchange(&s_forget_pending, 1);
+    ReleaseSRWLockExclusive(&s_forget_lock);
+}
+
+static void forget_drain(void)
+{
+    static int logged;
+    int i, k, n, dropped = 0;
+    struct { uint32_t addr, end; } q[GPU_FORGET_MAX];
+
+    if (!InterlockedCompareExchange(&s_forget_pending, 0, 0))
+        return;
+    AcquireSRWLockExclusive(&s_forget_lock);
+    n = s_forget_n;
+    memcpy(q, s_forget, sizeof q[0] * (size_t)n);
+    s_forget_n = 0;
+    InterlockedExchange(&s_forget_pending, 0);
+    ReleaseSRWLockExclusive(&s_forget_lock);
+    for (k = 0; k < n; k++) {
+        for (i = 0; i < GPU_RTS; i++) {
+            GpuRt *r = &s_rt[i];
+            if (r->tex && r->addr < q[k].end && q[k].addr < r->addr + r->pitch * r->h) {
+                rt_release(r);
+                dropped++;
+            }
+            if (s_ds[i].tex && s_ds[i].addr >= q[k].addr && s_ds[i].addr < q[k].end) {
+                ID3D11DepthStencilView_Release(s_ds[i].dsv);
+                ID3D11Texture2D_Release(s_ds[i].tex);
+                memset(&s_ds[i], 0, sizeof s_ds[i]);
+            }
+        }
+        for (i = 0; i < GPU_TEXTURES; i++)
+            if (s_tex[i].srv && s_tex[i].addr < q[k].end && q[k].addr < s_tex[i].addr + s_tex[i].bytes)
+                s_tex[i].checked = 0;    /* hash it again before trusting it */
+    }
+    if (dropped && logged++ < 3)
+        gpu_log("dropped %d surface(s) over memory the title freed", dropped);
+}
+
 /* ---- sync points --------------------------------------------------------- */
 
 void nv2a_gpu_sync(uint32_t addr, uint32_t bytes)
@@ -2093,6 +2223,7 @@ void nv2a_gpu_sync(uint32_t addr, uint32_t bytes)
     int i;
     if (s_state != 1)
         return;
+    forget_drain();
     for (i = 0; i < GPU_RTS; i++) {
         GpuRt *r = &s_rt[i];
         if (r->tex && r->gpu_dirty && addr < r->addr + r->pitch * r->h
@@ -2142,6 +2273,7 @@ int nv2a_gpu_blit_source(uint32_t src, uint32_t pitch, uint32_t bpp, uint32_t w,
     }
     if (!on || s_state != 1 || s_scale < 2 || !rt_direct_on())
         return -1;
+    forget_drain();
     for (i = 0; i < GPU_RTS; i++) {
         const GpuRt *r = &s_rt[i];
         uint32_t off;
@@ -2197,6 +2329,8 @@ void nv2a_gpu_blit_copy(int src_rt, uint32_t src, uint32_t dst, uint32_t pitch,
 
 void nv2a_gpu_frame(void)
 {
+    if (s_state == 1)
+        forget_drain();
     s_frame++;
     if (s_frame == 0)
         s_frame = 1;
@@ -2301,13 +2435,23 @@ static void gpu_shot_tex(ID3D11Texture2D *src, uint32_t W, uint32_t H)
     int swap_rb;
     FILE *f;
 
+    static const char *trigger;
     if (every < 0) {
         const char *e = getenv("RECOMP_GPU_SHOT_EVERY");
         prefix = getenv("RECOMP_GPU_SHOT");
         every = e && atoi(e) > 0 ? atoi(e) : 60;
+        /* RECOMP_GPU_SHOT_TRIGGER=<file>: shoot only while it exists, so a
+         * script can take exactly the seconds it wants */
+        trigger = getenv("RECOMP_GPU_SHOT_TRIGGER");
     }
     if (!prefix || !*prefix || n >= 1000 || ++frames % every)
         return;
+    if (trigger && *trigger) {
+        FILE *t = fopen(trigger, "rb");
+        if (!t)
+            return;
+        fclose(t);
+    }
     ID3D11Texture2D_GetDesc(src, &d);       /* the back buffer may be RGBA */
     swap_rb = d.Format == DXGI_FORMAT_R8G8B8A8_UNORM;
     d.Width = W; d.Height = H; d.MipLevels = 1; d.ArraySize = 1;
@@ -2377,6 +2521,7 @@ int nv2a_gpu_present(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, ui
     if (!on || s_state != 1 || s_swap_failed || !addr || !w || !h
         || (bpp != 4 && bpp != 2))
         return 0;
+    forget_drain();
     hwnd = (HWND)xbox_FramebufferWindowHwnd();
     if (!hwnd)
         return 0;                       /* window not open yet */
@@ -2510,6 +2655,7 @@ static GpuRt *pixel_pipeline(const Nv2aGpuState *st)
     uint32_t i;
     int ca;
 
+    forget_drain();
     if (!surface_targets(st, &r, &z))
         return NULL;
 
@@ -2705,6 +2851,8 @@ void nv2a_gpu_clear(const Nv2aGpuState *st, uint32_t flags, uint32_t color,
     UINT8 mask = 0;
     int ca;
 
+    if (s_state == 1)
+        forget_drain();
     if (s_state != 1 || !surface_targets(st, &r, &z))
         return;
     rt_begin(r);
@@ -2766,6 +2914,7 @@ void nv2a_gpu_clear(const Nv2aGpuState *st, uint32_t flags, uint32_t color,
 { (void)st; (void)flags; (void)color; (void)zstencil; }
 void nv2a_gpu_sync(uint32_t addr, uint32_t bytes) { (void)addr; (void)bytes; }
 void nv2a_gpu_guest_written(uint32_t addr, uint32_t bytes) { (void)addr; (void)bytes; }
+void nv2a_gpu_forget(uint32_t addr, uint32_t bytes) { (void)addr; (void)bytes; }
 int nv2a_gpu_blit_source(uint32_t src, uint32_t pitch, uint32_t bpp, uint32_t w, uint32_t h)
 { (void)src; (void)pitch; (void)bpp; (void)w; (void)h; return -1; }
 void nv2a_gpu_blit_copy(int src_rt, uint32_t src, uint32_t dst, uint32_t pitch,
