@@ -124,6 +124,48 @@ static void mixdown_speakers(float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME],
            + c + 0.7071f * lfe2;
 }
 
+/* The GP's command word, found the way the GP program finds it.
+ *
+ * DirectSound posts a command at byte 0x810 of the GP's scratch memory and
+ * spins until it reads zero (the loop is in the RECOMP_DSP_ACK note in
+ * xbox_memory_layout.c). The scratch memory is the pages listed in the
+ * scatter-gather table GPSADDR points at -- the table, not the memory, which
+ * is why comparing the doorbell with GPSADDR itself found nothing -- so the
+ * word is the table's first page + 0x810, and no address has to be observed
+ * and entered by hand. Completing every command instantly is still all this
+ * stub does; no DSP program runs. RECOMP_APU_DSP_AUTOACK=0 turns it off. */
+#define GP_COMMAND_WORD 0x810u
+
+static void dsp_autoack(MCPXAPUState *d)
+{
+    static int on = -1;
+    static uint32_t last_page;
+    static unsigned shown;
+    uint32_t table, page, *w;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_APU_DSP_AUTOACK");
+        on = !(e && *e == '0');
+    }
+    table = d->regs[NV_PAPU_GPSADDR];
+    if (!on || !table)
+        return;
+    page = *(const uint32_t *)mcpx_apu_phys(table) & ~0xFFFu;   /* entry 0 */
+    if (!page)
+        return;
+    if (page != last_page) {
+        last_page = page;
+        fprintf(stderr, "[APU] GP scratch page 0 at 0x%08X: command word 0x%08X\n",
+                page, page + GP_COMMAND_WORD);
+    }
+    w = (uint32_t *)mcpx_apu_phys(page + GP_COMMAND_WORD);
+    if (*w) {
+        if (shown++ < 3)
+            fprintf(stderr, "[APU] GP command 0x%08X completed\n", *w);
+        *w = 0;
+    }
+}
+
 void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
 {
     int i;
@@ -132,6 +174,7 @@ void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
         dsp_ack_init();
     if (!d->ram_ptr)
         return;
+    dsp_autoack(d);
     for (i = 0; i < s_dsp_ack_count; i++) {
         uint32_t *slot = (uint32_t *)(d->ram_ptr + s_dsp_ack[i]);
         if (*slot) {
