@@ -94,12 +94,14 @@ void nv2a_gpu_sync(uint32_t addr, uint32_t bytes);
 /* Something other than the GPU wrote [addr, addr + bytes): textures cached
  * from those bytes are checked again before their next use. */
 void nv2a_gpu_guest_written(uint32_t addr, uint32_t bytes);
-/* An NV09F image blit of a w x h rectangle at src. Before the executor's
- * guest copy: the render target holding src at full scale, or -1 if the GPU
- * does not hold it (or it would gain nothing: RECOMP_SCALE 1, no
- * RECOMP_RT_DIRECT). After it: copy those pixels to dst on the GPU too. */
+/* An NV09F image blit of a w x h rectangle at src: the render target holding
+ * src, or -1 if the GPU does not hold it (or RECOMP_RT_DIRECT is off). Then
+ * nv2a_gpu_blit_copy copies those pixels to dst on the GPU, at full scale,
+ * and returns 1 if it did: dst is then the GPU's, and guest memory catches up
+ * only if something reads it (nv2a_gpu_sync). 0 leaves the copy to the
+ * executor, in guest memory. */
 int  nv2a_gpu_blit_source(uint32_t src, uint32_t pitch, uint32_t bpp, uint32_t w, uint32_t h);
-void nv2a_gpu_blit_copy(int src_rt, uint32_t src, uint32_t dst, uint32_t pitch,
+int  nv2a_gpu_blit_copy(int src_rt, uint32_t src, uint32_t dst, uint32_t pitch,
                         uint32_t w, uint32_t h);
 /* The title freed [addr, addr + bytes): whatever the GPU holds over those
  * bytes is stale and is dropped, not read back, before the next GPU command.

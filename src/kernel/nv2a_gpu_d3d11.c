@@ -990,11 +990,56 @@ static GpuDs s_ds[GPU_RTS];
  * render targets made, by why, and readbacks -- each one a wait until the GPU
  * has finished -- by who asked, with the time they took. */
 enum { RB_GROWN, RB_EVICTED, RB_SYNC };
+/* Why a texture over a surface the GPU drew could not be sampled from it
+ * (rt_as_texture), so had to be read back: it is the surface being drawn
+ * into, it starts elsewhere in the surface or has another pitch, it is larger
+ * than the surface, it is swizzled, a cube map, or RECOMP_RT_DIRECT is off. */
+enum { NS_TARGET, NS_OFFSET, NS_LARGER, NS_SWIZZLED, NS_OTHER, NS_N };
 static struct {
-    unsigned made_new, made_grown, made_evicted, rb[3];
+    unsigned made_new, made_grown, made_evicted, rb[3], unsampled[NS_N];
+    unsigned blits, blits_gpu;          /* image blits, and those from a GPU surface */
     double rb_ms;
     DWORD since;
 } s_churn;
+
+/* The size a title samples a surface at, where that is more than it draws:
+ * an effect drawn into the corner of a 64x64 texture, the corner growing a
+ * pixel or two a frame. Made at the clip's size, the surface was smaller than
+ * the texture, so it could not be sampled straight from (rt_as_texture) and
+ * every draw that used it read it back -- 2,000 a second, after a death and
+ * restart in one boss fight, until the corner reached 64x64 -- and every
+ * step of growth rebuilt it. Surfaces are made at the texture's size instead.
+ * A readback writes the whole surface to guest memory, so a hint is only
+ * taken from a texture at the surface's own address and pitch, and dropped
+ * with the memory (forget_drain). */
+#define GPU_RT_HINTS 64
+static struct { uint32_t addr, pitch, w, h; } s_rt_hint[GPU_RT_HINTS];
+static int s_rt_hint_next;
+
+static void rt_hint_note(uint32_t addr, uint32_t pitch, uint32_t w, uint32_t h)
+{
+    int i;
+    for (i = 0; i < GPU_RT_HINTS; i++)
+        if (s_rt_hint[i].pitch && s_rt_hint[i].addr == addr && s_rt_hint[i].pitch == pitch) {
+            if (w > s_rt_hint[i].w) s_rt_hint[i].w = w;
+            if (h > s_rt_hint[i].h) s_rt_hint[i].h = h;
+            return;
+        }
+    i = s_rt_hint_next++ % GPU_RT_HINTS;
+    s_rt_hint[i].addr = addr; s_rt_hint[i].pitch = pitch;
+    s_rt_hint[i].w = w; s_rt_hint[i].h = h;
+}
+
+static void rt_hint_apply(uint32_t addr, uint32_t pitch, uint32_t *w, uint32_t *h)
+{
+    int i;
+    for (i = 0; i < GPU_RT_HINTS; i++)
+        if (s_rt_hint[i].pitch && s_rt_hint[i].addr == addr && s_rt_hint[i].pitch == pitch) {
+            if (*w < s_rt_hint[i].w) *w = s_rt_hint[i].w;
+            if (*h < s_rt_hint[i].h) *h = s_rt_hint[i].h;
+            return;
+        }
+}
 
 /* A sample of the surface's guest memory: one word in sixteen of every other
  * row. It only has to notice that something other than the GPU wrote the
@@ -1184,6 +1229,8 @@ static GpuRt *get_rt(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, ui
     D3D11_TEXTURE2D_DESC d;
     GpuRt *r = NULL;
     int i, oldest = 0;
+
+    rt_hint_apply(addr, pitch, &w, &h);
 
     for (i = 0; i < GPU_RTS; i++) {
         if (s_rt[i].tex && s_rt[i].addr == addr && s_rt[i].pitch == pitch
@@ -1576,6 +1623,25 @@ static int rt_direct_on(void)
     return on;
 }
 
+/* The first surface the GPU holds under texture t, and why t cannot be
+ * sampled straight from it -- counted for the churn report. */
+static void rt_note_unsampled(const Nv2aGpuTexture *t, const GpuRt *target)
+{
+    int i;
+    for (i = 0; i < GPU_RTS; i++) {
+        const GpuRt *r = &s_rt[i];
+        if (!r->tex || !r->gpu_dirty || t->addr >= r->addr + r->pitch * r->h
+            || r->addr >= t->addr + t->bytes)
+            continue;
+        s_churn.unsampled[r == target ? NS_TARGET
+                          : r->addr != t->addr || r->pitch != t->pitch ? NS_OFFSET
+                          : !t->linear ? NS_SWIZZLED
+                          : t->cube || !rt_direct_on() ? NS_OTHER
+                          : t->width > r->w || t->height > r->h ? NS_LARGER : NS_OTHER]++;
+        return;
+    }
+}
+
 static ID3D11ShaderResourceView *rt_as_texture(const Nv2aGpuTexture *t, const GpuRt *target,
                                                float *tw, float *th, int *alpha_one)
 {
@@ -1606,10 +1672,15 @@ static ID3D11ShaderResourceView *rt_as_texture(const Nv2aGpuTexture *t, const Gp
             break;
         }
     }
-    if (!rt_direct_on() || !t->linear || t->cube)
+    if (!rt_direct_on() || !t->linear || t->cube) {
+        rt_note_unsampled(t, target);
         return NULL;
+    }
     for (i = 0; i < GPU_RTS; i++) {
         GpuRt *r = &s_rt[i];
+        if (r->tex && r->addr == t->addr && r->pitch == t->pitch
+            && (t->width > r->w || t->height > r->h) && t->width * r->bpp <= t->pitch)
+            rt_hint_note(t->addr, t->pitch, t->width, t->height);
         if (!r->tex || r == target || !r->gpu_dirty || r->addr != t->addr
             || r->pitch != t->pitch || t->width > r->w || t->height > r->h)
             continue;
@@ -1623,6 +1694,7 @@ static ID3D11ShaderResourceView *rt_as_texture(const Nv2aGpuTexture *t, const Gp
         r->last_used = s_frame;
         return r->srv;
     }
+    rt_note_unsampled(t, target);
     return NULL;
 }
 
@@ -2266,6 +2338,10 @@ static void forget_drain(void)
         for (i = 0; i < GPU_TEXTURES; i++)
             if (s_tex[i].srv && s_tex[i].addr < q[k].end && q[k].addr < s_tex[i].addr + s_tex[i].bytes)
                 s_tex[i].checked = 0;    /* hash it again before trusting it */
+        for (i = 0; i < GPU_RT_HINTS; i++)
+            if (s_rt_hint[i].pitch && s_rt_hint[i].addr < q[k].end
+                && q[k].addr < s_rt_hint[i].addr + s_rt_hint[i].pitch * s_rt_hint[i].h)
+                s_rt_hint[i].pitch = 0;
     }
     if (dropped && logged++ < 3)
         gpu_log("dropped %d surface(s) over memory the title freed", dropped);
@@ -2326,7 +2402,8 @@ int nv2a_gpu_blit_source(uint32_t src, uint32_t pitch, uint32_t bpp, uint32_t w,
         const char *e = getenv("RECOMP_BLIT_GPU");
         on = !(e && *e == '0');
     }
-    if (!on || s_state != 1 || s_scale < 2 || !rt_direct_on())
+    s_churn.blits++;
+    if (!on || s_state != 1 || !rt_direct_on())
         return -1;
     forget_drain();
     for (i = 0; i < GPU_RTS; i++) {
@@ -2336,29 +2413,31 @@ int nv2a_gpu_blit_source(uint32_t src, uint32_t pitch, uint32_t bpp, uint32_t w,
             || src < r->addr || src >= r->addr + r->pitch * r->h)
             continue;
         off = src - r->addr;
-        if (off % pitch % bpp == 0 && off % pitch / bpp + w <= r->w && off / pitch + h <= r->h)
+        if (off % pitch % bpp == 0 && off % pitch / bpp + w <= r->w && off / pitch + h <= r->h) {
+            s_churn.blits_gpu++;
             return i;
+        }
     }
     return -1;
 }
 
-void nv2a_gpu_blit_copy(int src_rt, uint32_t src, uint32_t dst, uint32_t pitch,
-                        uint32_t w, uint32_t h)
+int nv2a_gpu_blit_copy(int src_rt, uint32_t src, uint32_t dst, uint32_t pitch,
+                       uint32_t w, uint32_t h)
 {
     GpuRt *s, *d;
     uint32_t off, s_addr;
     D3D11_BOX box;
 
     if (s_state != 1 || src_rt < 0 || src_rt >= GPU_RTS || !s_rt[src_rt].tex)
-        return;
+        return 0;
     s = &s_rt[src_rt];
     if (dst < s->addr + s->pitch * s->h && s->addr < dst + pitch * h)
-        return;                         /* within one surface: the guest copy alone */
+        return 0;                       /* within one surface: the guest copy alone */
     s_addr = s->addr;
     s->last_used = s_frame;             /* not the one get_rt evicts */
     d = get_rt(dst, pitch, s->bpp, w, h);
     if (!d || d == s || !s->tex || s->addr != s_addr)
-        return;
+        return 0;
     if (w < d->w || h < d->h)
         rt_check(d);                    /* the rest of it is guest memory's */
     off = src - s->addr;
@@ -2380,6 +2459,7 @@ void nv2a_gpu_blit_copy(int src_rt, uint32_t src, uint32_t dst, uint32_t pitch,
             gpu_log("image blits of GPU-drawn surfaces copied at %ux: %08X -> %08X %ux%u",
                     s_scale, src, dst, w, h);
     }
+    return 1;
 }
 
 void nv2a_gpu_frame(void)
@@ -2390,16 +2470,21 @@ void nv2a_gpu_frame(void)
     if (!s_churn.since)
         s_churn.since = now;
     if (now - s_churn.since >= 10000) {
-        if (s_churn.made_new + s_churn.made_grown + s_churn.made_evicted
+        if (s_churn.made_new + s_churn.made_grown + s_churn.made_evicted + s_churn.blits
             + s_churn.rb[RB_GROWN] + s_churn.rb[RB_EVICTED] + s_churn.rb[RB_SYNC])
             gpu_log("last %.1f s: render targets made %u (new %u, grown %u, evicted "
                     "another %u); readbacks %u (growing %u, evicting %u, guest "
-                    "reads %u), %.1f ms", (now - s_churn.since) / 1000.0,
+                    "reads %u), %.1f ms; textures over a GPU surface not sampled from "
+                    "it: %u target, %u offset/pitch, %u larger, %u swizzled, %u other; "
+                    "image blits %u (%u from a GPU surface)",
+                    (now - s_churn.since) / 1000.0,
                     s_churn.made_new + s_churn.made_grown + s_churn.made_evicted,
                     s_churn.made_new, s_churn.made_grown, s_churn.made_evicted,
                     s_churn.rb[RB_GROWN] + s_churn.rb[RB_EVICTED] + s_churn.rb[RB_SYNC],
                     s_churn.rb[RB_GROWN], s_churn.rb[RB_EVICTED], s_churn.rb[RB_SYNC],
-                    s_churn.rb_ms);
+                    s_churn.rb_ms, s_churn.unsampled[NS_TARGET], s_churn.unsampled[NS_OFFSET],
+                    s_churn.unsampled[NS_LARGER], s_churn.unsampled[NS_SWIZZLED],
+                    s_churn.unsampled[NS_OTHER], s_churn.blits, s_churn.blits_gpu);
         memset(&s_churn, 0, sizeof s_churn);
         s_churn.since = now;
     }
@@ -3034,9 +3119,9 @@ void nv2a_gpu_guest_written(uint32_t addr, uint32_t bytes) { (void)addr; (void)b
 void nv2a_gpu_forget(uint32_t addr, uint32_t bytes) { (void)addr; (void)bytes; }
 int nv2a_gpu_blit_source(uint32_t src, uint32_t pitch, uint32_t bpp, uint32_t w, uint32_t h)
 { (void)src; (void)pitch; (void)bpp; (void)w; (void)h; return -1; }
-void nv2a_gpu_blit_copy(int src_rt, uint32_t src, uint32_t dst, uint32_t pitch,
-                        uint32_t w, uint32_t h)
-{ (void)src_rt; (void)src; (void)dst; (void)pitch; (void)w; (void)h; }
+int nv2a_gpu_blit_copy(int src_rt, uint32_t src, uint32_t dst, uint32_t pitch,
+                       uint32_t w, uint32_t h)
+{ (void)src_rt; (void)src; (void)dst; (void)pitch; (void)w; (void)h; return 0; }
 void nv2a_gpu_frame(void) {}
 int  nv2a_gpu_present(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, uint32_t h)
 { (void)addr; (void)pitch; (void)bpp; (void)w; (void)h; return 0; }

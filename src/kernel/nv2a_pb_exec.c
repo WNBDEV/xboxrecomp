@@ -4155,17 +4155,21 @@ static void image_blit(uint32_t size)
         fprintf(stderr, "[GPU] image blit %ux%u: 0x%08X (pitch %u) -> 0x%08X "
                 "(pitch %u), format %X%s\n", w, h, src, sp, dst, dp,
                 s_2d.format, ok_s && ok_d ? "" : " (DMA object not found)");
-    /* Asked first: the sync below makes the source guest memory's. */
-    gpu_src = nv2a_gpu_blit_source(src, sp, bpp, w, h);
-    nv2a_gpu_sync(src, (h - 1) * sp + w * bpp);
-    nv2a_gpu_sync(dst, (h - 1) * dp + w * bpp);
     if (surface_write_refused(dst, (h - 1) * dp + w * bpp, "blit into"))
         return;
+    /* A source the GPU drew is copied on the GPU and left there. It used to be
+     * copied in guest memory as well, which meant reading back both surfaces
+     * first: after a death and restart in one boss fight the title blits
+     * ~1,200 GPU-drawn rectangles a second, and two readbacks each held it at
+     * 25 fps. Guest memory catches up if anything reads it (nv2a_gpu_sync). */
+    gpu_src = nv2a_gpu_blit_source(src, sp, bpp, w, h);
+    if (gpu_src >= 0 && nv2a_gpu_blit_copy(gpu_src, src, dst, dp, w, h))
+        return;
+    nv2a_gpu_sync(src, (h - 1) * sp + w * bpp);
+    nv2a_gpu_sync(dst, (h - 1) * dp + w * bpp);
     for (r = 0; r < h; r++)
         memmove(mem + dst + r * dp, mem + src + r * sp, (size_t)w * bpp);
     nv2a_gpu_guest_written(dst, (h - 1) * dp + w * bpp);
-    if (gpu_src >= 0)
-        nv2a_gpu_blit_copy(gpu_src, src, dst, dp, w, h);
 }
 
 /* 1 if a non-3D subchannel's method was handled here. */
