@@ -18,9 +18,23 @@
 #define XA2_SAMPLE_RATE   48000
 #define XA2_CHANNELS      2
 #define XA2_BUF_SAMPLES   1024   /* ~21ms per submission */
-#define XA2_NUM_BUFS      3
+#define XA2_NUM_BUFS      6
 
 static void xa2_stats(const int16_t *samples, int n, int dropped);
+static unsigned s_xa2_starved;          /* submits that found the queue empty */
+
+/* What the output keeps queued ahead of what is playing.
+ *
+ * The mixer makes sound at the rate it plays, so the queue stays at whatever
+ * depth it starts at -- which was the one buffer in hand, 21 ms: any delay to
+ * the mixer longer than that and the output ran dry, and once dry it stayed
+ * one late buffer from running dry again. So when a buffer finds the queue
+ * empty -- at start, or after a dropout, which has already been heard --
+ * this much silence goes in front of it, and the next delay is absorbed. The
+ * queue may hold XA2_NUM_BUFS, room for the mixer to catch up after a stall
+ * without dropping what it makes. */
+#define XA2_CUSHION_BUFS  2
+static const int16_t s_xa2_silence[XA2_BUF_SAMPLES * XA2_CHANNELS];
 
 /* RECOMP_AUDIO_MUTE=1: everything as usual -- stats, RECOMP_AUDIO_DUMP --
  * except that the device is handed silence. For tests on a machine someone
@@ -162,6 +176,17 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
         xa2_stats(samples, num_samples, 1);
         return 0;
     }
+    if (state.BuffersQueued == 0) {
+        int k;
+        if (g_xa2_frames_written)
+            s_xa2_starved++;            /* it ran dry: a gap was heard */
+        for (k = 0; k < XA2_CUSHION_BUFS; k++) {
+            memset(&xbuf, 0, sizeof(xbuf));
+            xbuf.AudioBytes = sizeof s_xa2_silence;
+            xbuf.pAudioData = (const BYTE *)s_xa2_silence;
+            IXAudio2SourceVoice_SubmitSourceBuffer(g_xa2_source, &xbuf, NULL);
+        }
+    }
     xa2_stats(samples, num_samples, 0);
     samples = xa2_audible(samples);
 
@@ -233,16 +258,25 @@ int xa2_is_active(void)
 
 /* As the XAudio2 path: at most XA2_NUM_BUFS buffers waiting, and a buffer
  * that would make it more is dropped rather than queued, so a mixer running
- * fast cannot build up latency. */
+ * fast cannot build up latency; and the same cushion after running dry. */
 int xa2_submit_samples(const int16_t *samples, int num_samples)
 {
     const Uint32 bytes_per = XA2_CHANNELS * sizeof(int16_t);
     int n = num_samples > XA2_BUF_SAMPLES ? XA2_BUF_SAMPLES : num_samples;
+    Uint32 queued;
 
     if (!g_sdl_dev) return 0;
-    if (SDL_GetQueuedAudioSize(g_sdl_dev) >= XA2_NUM_BUFS * XA2_BUF_SAMPLES * bytes_per) {
+    queued = SDL_GetQueuedAudioSize(g_sdl_dev);
+    if (queued >= XA2_NUM_BUFS * XA2_BUF_SAMPLES * bytes_per) {
         xa2_stats(samples, num_samples, 1);
         return 0;
+    }
+    if (queued == 0) {
+        int k;
+        if (g_sdl_frames_written)
+            s_xa2_starved++;
+        for (k = 0; k < XA2_CUSHION_BUFS; k++)
+            SDL_QueueAudio(g_sdl_dev, s_xa2_silence, sizeof s_xa2_silence);
     }
     xa2_stats(samples, num_samples, 0);
     samples = xa2_audible(samples);
@@ -298,8 +332,25 @@ static void xa2_stats(const int16_t *samples, int n, int dropped)
     }
     if (on < 0)
         on = getenv("RECOMP_AUDIO_STATS") != NULL;
-    if (!on)
+    if (!on) {
+        /* Always on, and silent unless sound was lost: the output ran dry (a
+         * gap was heard) or a buffer was dropped for a full queue. */
+        static unsigned pdrops;
+        static uint32_t plast;
+        uint32_t pnow = (uint32_t)XA2_TICKS();
+        pdrops += dropped != 0;
+        if (!plast)
+            plast = pnow;
+        if (pnow - plast >= 10000) {
+            if (s_xa2_starved || pdrops)
+                fprintf(stderr, "[XA2] last %.1f s: sound cut out -- the output ran dry %u "
+                        "times, %u buffers dropped\n", (pnow - plast) / 1000.0,
+                        s_xa2_starved, pdrops);
+            s_xa2_starved = pdrops = 0;
+            plast = pnow;
+        }
         return;
+    }
     if (dropped)
         drops++;
     else
@@ -315,10 +366,11 @@ static void xa2_stats(const int16_t *samples, int n, int dropped)
     if (!last)
         last = now;
     if (now - last >= 10000) {
-        fprintf(stderr, "[XA2] %.1f s: %u buffers submitted, %u dropped; peak %d, rms %.1f\n",
-                (now - last) / 1000.0, submitted, drops, peak,
+        fprintf(stderr, "[XA2] %.1f s: %u buffers submitted, %u dropped, %u after the "
+                "queue ran dry; peak %d, rms %.1f\n",
+                (now - last) / 1000.0, submitted, drops, s_xa2_starved, peak,
                 count ? sqrt(sumsq / (double)count) : 0.0);
-        submitted = drops = 0;
+        submitted = drops = s_xa2_starved = 0;
         sumsq = 0;
         count = 0;
         peak = 0;

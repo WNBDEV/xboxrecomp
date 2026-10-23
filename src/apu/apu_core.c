@@ -508,6 +508,22 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
  * Throttle (timing control for frame pacing)
  * ============================================================ */
 
+extern volatile LONG g_apu_lock_waiters;
+static unsigned s_apu_late;             /* times throttle() gave up catching up */
+
+/* How far behind real time the frame thread may fall and still catch up.
+ *
+ * It used to give up on anything over one EP frame (5.3 ms): a wake-up that
+ * late reset the clock, and the time was never made up. Late wake-ups are
+ * routine when every core is busy, so the thread then made sound slower than
+ * it played -- with eight busy loops beside a fight, 73 of the 469 buffers a
+ * second needed, every one after the output had run dry: crackling and
+ * cut-outs, which is what a busy fight sounded like (user report, 23 Oct).
+ * Now frames run back to back until the thread is level again, unless it is
+ * this far behind, after a real stall, when catching up would only queue
+ * stale sound. */
+#define APU_CATCHUP_US 100000
+
 static void throttle(MCPXAPUState *d)
 {
     if (d->ep_frame_div % 8) {
@@ -517,7 +533,9 @@ static void throttle(MCPXAPUState *d)
     int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
 
     if (d->next_frame_time_us == 0 ||
-        now_us - d->next_frame_time_us > EP_FRAME_US) {
+        now_us - d->next_frame_time_us > APU_CATCHUP_US) {
+        if (d->next_frame_time_us)
+            s_apu_late++;
         d->next_frame_time_us = now_us;
     }
 
@@ -543,7 +561,11 @@ static void throttle(MCPXAPUState *d)
  * voices active in one frame, the loudest mixbin sample, and which mixbins
  * carried anything. With the XAudio2 end of the same switch it splits "no
  * sound" into the VP producing nothing and the mixdown losing it. */
-static void apu_stats_frame(float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
+extern float g_apu_mix_peak;
+extern unsigned g_apu_mix_clipped, g_apu_mix_samples, g_apu_voice_hr[8];
+
+static void apu_stats_frame(MCPXAPUState *d,
+                            float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
     static int on = -1, max_voices;
     static float peak;
@@ -555,8 +577,25 @@ static void apu_stats_frame(float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 
     if (on < 0)
         on = getenv("RECOMP_AUDIO_STATS") != NULL;
-    if (!on)
+    if (!on) {
+        /* Always on, and silent unless something went wrong: the final mix
+         * went over full scale (the limiter took it) or the thread fell so
+         * far behind that it gave up catching up. */
+        static int64_t plast;
+        int64_t pnow = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+        if (!plast)
+            plast = pnow;
+        if (pnow - plast >= 10000) {
+            if (g_apu_mix_clipped || s_apu_late)
+                fprintf(stderr, "[APU] last %.1f s: %u samples over full scale (peak %.2f, "
+                        "limited), %u stalls over %d ms\n", (pnow - plast) / 1000.0,
+                        g_apu_mix_clipped, g_apu_mix_peak, s_apu_late, APU_CATCHUP_US / 1000);
+            g_apu_mix_peak = 0.0f;
+            g_apu_mix_clipped = g_apu_mix_samples = s_apu_late = 0;
+            plast = pnow;
+        }
         return;
+    }
     /* voice_process sets these and nothing clears them (xemu's debug UI
      * does, per frame), so count and clear. */
     for (i = 0; i < 256; i++) {
@@ -592,6 +631,22 @@ static void apu_stats_frame(float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
         fprintf(stderr, "[APU]   voice-frames by source rate: <16k %u, 16-24k %u,"
                 " 24-40k %u, 40-46k %u, 46-50k %u, >50k %u\n", rates[0],
                 rates[1], rates[2], rates[3], rates[4], rates[5]);
+        fprintf(stderr, "[APU]   final mix peak %.2f, %u of %u samples over full scale "
+                "(limited); %u stalls over %d ms\n", g_apu_mix_peak, g_apu_mix_clipped,
+                g_apu_mix_samples, s_apu_late, APU_CATCHUP_US / 1000);
+        fprintf(stderr, "[APU]   headroom: submix bins 0-11 %u %u %u %u %u %u %u %u %u %u "
+                "%u %u, HRTF %u; voice-frames by voice headroom 0-7: %u %u %u %u %u %u "
+                "%u %u\n", d->vp.submix_headroom[0], d->vp.submix_headroom[1],
+                d->vp.submix_headroom[2], d->vp.submix_headroom[3],
+                d->vp.submix_headroom[4], d->vp.submix_headroom[5],
+                d->vp.submix_headroom[6], d->vp.submix_headroom[7],
+                d->vp.submix_headroom[8], d->vp.submix_headroom[9],
+                d->vp.submix_headroom[10], d->vp.submix_headroom[11], d->vp.hrtf_headroom,
+                g_apu_voice_hr[0], g_apu_voice_hr[1], g_apu_voice_hr[2], g_apu_voice_hr[3],
+                g_apu_voice_hr[4], g_apu_voice_hr[5], g_apu_voice_hr[6], g_apu_voice_hr[7]);
+        g_apu_mix_peak = 0.0f;
+        g_apu_mix_clipped = g_apu_mix_samples = s_apu_late = 0;
+        memset(g_apu_voice_hr, 0, sizeof g_apu_voice_hr);
         memset(rates, 0, sizeof rates);
         frames = 0;
         max_voices = 0;
@@ -624,7 +679,7 @@ static void se_frame(MCPXAPUState *d)
     memset(mixbins, 0, sizeof(mixbins));
 
     mcpx_apu_vp_frame(d, mixbins);
-    apu_stats_frame(mixbins);
+    apu_stats_frame(d, mixbins);
     mcpx_apu_dsp_frame(d, mixbins);
     mcpx_apu_monitor_frame(d);
 
@@ -698,9 +753,17 @@ static void *mcpx_apu_frame_thread(void *arg)
          * it (voice_lock). A critical section is not fair, so the title's
          * thread starved there indefinitely: Burnout 3 froze on its vehicle
          * select, blocked in voice_lock at raised IRQL, which in turn held
-         * off every USB interrupt. */
+         * off every USB interrupt.
+         *
+         * But only when someone is waiting. Giving up the CPU 1,500 times a
+         * second costs nothing on an idle machine and everything on a busy
+         * one: each yield can wait out another thread's time slice, and with
+         * every core loaded the thread made 15% of the sound it had to --
+         * crackling and cut-outs. Waiters count themselves in voice_lock;
+         * the thread steps aside until they are in, a bounded number of times. */
         qemu_mutex_unlock(&d->lock);
-        SwitchToThread();
+        for (int k = 0; k < 64 && g_apu_lock_waiters; k++)
+            SwitchToThread();
         qemu_mutex_lock(&d->lock);
     }
 

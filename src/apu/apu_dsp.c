@@ -211,6 +211,18 @@ void mcpx_apu_update_dsp_preference(MCPXAPUState *d)
     (void)d;
 }
 
+/* The final mix before it is limited: its peak and how many samples went over
+ * full scale, for the log. */
+float g_apu_mix_peak;
+unsigned g_apu_mix_clipped, g_apu_mix_samples;
+
+/* A sample over full scale used to be clamped, which squares off the wave --
+ * the harsh crackle of a clipped mix. Now the whole mix is turned down at
+ * once, just enough to fit, and comes back up over ~50 ms. Below full scale
+ * the gain is exactly 1 and the output is what it was. */
+static float s_limit_gain = 1.0f;
+#define LIMIT_RELEASE (1.0f / (0.05f * 48000.0f))
+
 void mcpx_apu_dsp_frame(MCPXAPUState *d,
                          float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
@@ -273,6 +285,22 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
             } else {
                 left = mixbins[0][i];
                 right = mixbins[1][i];
+            }
+            {
+                float m = fmaxf(fabsf(left), fabsf(right));
+                float fit = m > 1.0f ? 1.0f / m : 1.0f;
+                if (m > g_apu_mix_peak)
+                    g_apu_mix_peak = m;
+                g_apu_mix_clipped += m > 1.0f;
+                g_apu_mix_samples++;
+                if (fit < s_limit_gain)
+                    s_limit_gain = fit;
+                else if (s_limit_gain < 1.0f)
+                    s_limit_gain = fminf(1.0f, s_limit_gain + LIMIT_RELEASE);
+                if (s_limit_gain < 1.0f) {
+                    left *= s_limit_gain;
+                    right *= s_limit_gain;
+                }
             }
             /* Clamp to [-1, 1] range */
             if (left > 1.0f) left = 1.0f;

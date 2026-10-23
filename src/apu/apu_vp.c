@@ -186,10 +186,15 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
     set_notify_status(d, v, notifier, NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS);
 }
 
+/* Title threads waiting for d->lock; the frame thread steps aside for them. */
+volatile LONG g_apu_lock_waiters;
+
 static void voice_lock(MCPXAPUState *d, uint16_t v, bool lock)
 {
     assert(v < MCPX_HW_MAX_VOICES);
+    InterlockedIncrement(&g_apu_lock_waiters);
     qemu_mutex_lock(&d->lock);
+    InterlockedDecrement(&g_apu_lock_waiters);
 
     uint64_t mask = 1ULL << (v % 64);
     if (lock) {
@@ -1050,12 +1055,17 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
  * Voice processing (main per-voice function)
  * ============================================================ */
 
+/* Voice-frames by the voice's own headroom field, for RECOMP_AUDIO_STATS. */
+unsigned g_apu_voice_hr[8];
+
 static void voice_process(MCPXAPUState *d,
                           float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME],
                           float sample_buf[NUM_SAMPLES_PER_FRAME][2],
                           uint16_t v, int voice_list)
 {
     assert(v < MCPX_HW_MAX_VOICES);
+    g_apu_voice_hr[voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
+                                  NV_PAVS_VOICE_CFG_FMT_HEADROOM) & 7]++;
     bool stereo = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
                                  NV_PAVS_VOICE_CFG_FMT_STEREO) != 0;
     unsigned int channels = stereo ? 2 : 1;
