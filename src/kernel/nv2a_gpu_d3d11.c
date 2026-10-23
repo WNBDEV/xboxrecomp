@@ -2767,8 +2767,10 @@ extern int xbox_FramebufferOverlayFps(void);
 
 /* "NNN FPS" in a 5x7 font, drawn into a small texture whenever the number
  * changes and copied into the top-left corner of the picture at each
- * present, enlarged by whole pixels so it stays crisp. Opaque, so it reads
- * the same over any scene. */
+ * present, enlarged by whole pixels so it stays crisp. White with a black
+ * outline and no background: the texture's empty pixels are transparent and
+ * the shader discards them, so the text reads over any scene without a box
+ * covering it. */
 #define OSD_CHARS 7
 #define OSD_W (3 + OSD_CHARS * 6)
 #define OSD_H 11
@@ -2802,7 +2804,9 @@ static int osd_make(void)
         "Texture2D T : register(t0);\n"
         "float4 main(float4 p : SV_Position, float2 uv : TEXCOORD0) : SV_Target\n"
         "{ uint w, h; T.GetDimensions(w, h);\n"
-        "  return T.Load(int3(min(uv * float2(w, h), float2(w - 1, h - 1)), 0)); }\n";
+        "  float4 c = T.Load(int3(min(uv * float2(w, h), float2(w - 1, h - 1)), 0));\n"
+        "  clip(c.a - 0.5);\n"
+        "  return c; }\n";
     D3D11_TEXTURE2D_DESC d;
     ID3DBlob *b;
 
@@ -2843,13 +2847,22 @@ static void osd_text(int fps)
     if (n > OSD_CHARS)
         n = OSD_CHARS;
     for (i = 0; i < OSD_W * OSD_H; i++)
-        px[i] = 0xFF000000u;                        /* black */
+        px[i] = 0;                                  /* transparent */
     for (i = 0; i < n; i++) {
         const uint8_t *g = osd_glyph(t[i]);
         for (y = 0; y < 7; y++)
             for (x = 0; x < 5; x++)
-                if (g[y] & (0x10 >> x))
-                    px[(2 + y) * OSD_W + 2 + i * 6 + x] = 0xFFFFE040u;   /* yellow */
+                if (g[y] & (0x10 >> x)) {
+                    int gx = 2 + i * 6 + x, gy = 2 + y, dx, dy;
+                    /* the outline: every empty neighbour turns black */
+                    for (dy = -1; dy <= 1; dy++)
+                        for (dx = -1; dx <= 1; dx++) {
+                            uint32_t *q = &px[(gy + dy) * OSD_W + gx + dx];
+                            if (*q != 0xFFFFFFFFu)
+                                *q = 0xFF000000u;
+                        }
+                    px[gy * OSD_W + gx] = 0xFFFFFFFFu;               /* white */
+                }
     }
     ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)s_osd_tex, 0, NULL,
                                           px, OSD_W * 4, 0);
