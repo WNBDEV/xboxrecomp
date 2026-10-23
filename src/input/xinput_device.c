@@ -574,18 +574,35 @@ static SDL_GameController *g_pads[XBOX_MAX_CONTROLLERS];
 static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS];
 static DWORD g_packet[XBOX_MAX_CONTROLLERS];
 
-/* Open up to XBOX_MAX_CONTROLLERS attached game controllers. */
+/* Each attached game controller not open yet goes into the first free slot.
+ * Matched by instance id, not list position, so a pad that stays connected
+ * keeps its slot while others come and go. */
 static void open_controllers(void)
 {
-    int slot = 0;
-    for (int i = 0; i < SDL_NumJoysticks() && slot < XBOX_MAX_CONTROLLERS; i++) {
+    for (int i = 0; i < SDL_NumJoysticks(); i++) {
+        SDL_JoystickID id;
+        int slot, free_slot = -1, have = 0;
         if (!SDL_IsGameController(i))
             continue;
-        if (!g_pads[slot]) {
-            g_pads[slot] = SDL_GameControllerOpen(i);
-            g_controller_connected[slot] = (g_pads[slot] != NULL);
+        id = SDL_JoystickGetDeviceInstanceID(i);
+        for (slot = 0; slot < XBOX_MAX_CONTROLLERS; slot++) {
+            if (!g_pads[slot]) {
+                if (free_slot < 0)
+                    free_slot = slot;
+            } else if (SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(g_pads[slot])) == id) {
+                have = 1;
+            }
         }
-        slot++;
+        if (have || free_slot < 0)
+            continue;
+        g_pads[free_slot] = SDL_GameControllerOpen(i);
+        g_controller_connected[free_slot] = g_pads[free_slot] != NULL;
+        if (g_pads[free_slot])
+            fprintf(stderr, "  [INPUT] pad %d: %s\n", free_slot + 1,
+                    SDL_GameControllerName(g_pads[free_slot]));
+        else
+            fprintf(stderr, "  [INPUT] could not open %s: %s\n",
+                    SDL_JoystickNameForIndex(i), SDL_GetError());
     }
 }
 
@@ -594,8 +611,44 @@ void xbox_InputInit(void)
     /* The pad keeps working while another window has the focus, as XInput
      * does on Windows. */
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
-    if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER))
-        SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
+    if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER)
+            && SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) != 0)
+        fprintf(stderr, "  [INPUT] SDL game controllers unavailable: %s\n", SDL_GetError());
+    open_controllers();
+    if (!g_pads[0])
+        fprintf(stderr, "  [INPUT] no game controller yet (SDL sees %d joysticks); "
+                "one connected later is picked up\n", SDL_NumJoysticks());
+}
+
+/* Nothing calls xbox_InputInit -- XInput needs no setup, so the Windows
+ * build never missed it -- and without it SDL's controller subsystem never
+ * started: natively only the keyboard and mouse worked. So it runs on first
+ * use, and once a second after that pads that went away are closed and new
+ * ones opened, as XInput finds a pad plugged in mid-game. */
+static void controllers_poll(void)
+{
+    static int started;
+    static Uint32 last;
+    Uint32 now;
+
+    if (!started) {
+        started = 1;
+        xbox_InputInit();
+        last = SDL_GetTicks();
+        return;
+    }
+    now = SDL_GetTicks();
+    if (now - last < 1000)
+        return;
+    last = now;
+    for (int slot = 0; slot < XBOX_MAX_CONTROLLERS; slot++) {
+        if (g_pads[slot] && !SDL_GameControllerGetAttached(g_pads[slot])) {
+            fprintf(stderr, "  [INPUT] pad %d disconnected\n", slot + 1);
+            SDL_GameControllerClose(g_pads[slot]);
+            g_pads[slot] = NULL;
+            g_controller_connected[slot] = FALSE;
+        }
+    }
     open_controllers();
 }
 
@@ -603,6 +656,7 @@ static DWORD backend_get_state(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
         return ERROR_DEVICE_NOT_CONNECTED;
+    controllers_poll();
     /* input = keyboard: a pad on port 0 is not asked at all. */
     if (dwPort == 0 && input_mode() == PLAY_KEYBOARD && keyboard_enabled()) {
         keyboard_state(pState);
