@@ -95,6 +95,13 @@ void xbox_InputInit(void);
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState);
 
 /**
+ * For a title whose D-pad takes over from the left stick in some mode: its
+ * test for that mode. While it returns nonzero the keys bound to the left
+ * stick press the D-pad as well.
+ */
+void xbox_InputSetMoveKeysAsDpad(int (*active)(void));
+
+/**
  * Set controller vibration.
  */
 DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration);

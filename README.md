@@ -104,6 +104,7 @@ Environment variables, read at start-up. Defaults in brackets.
 | | `RECOMP_SHADER_CACHE` [shader-cache] | the cache directory; 0 turns it off |
 | | `RECOMP_FULLSCREEN` [0] | 1: start fullscreen (Alt+Enter / F11 toggle) |
 | | `RECOMP_FPS30` [0] | 1: start held at 30 fps (F2 toggles 30/60) |
+| | `RECOMP_CAMERA_FLIP_X` [0] | 1: right stick left/right swapped (pad, mouse and keys), for a camera that turns against the stick |
 | | `RECOMP_CULL` [1] | 0 disables face culling, 2 inverts the winding |
 | | `RECOMP_RASTER_BATCH` [1] | 0: software rasteriser, one triangle at a time |
 | Memory | `RECOMP_HEAP_VFREE` [0] | 1: memory the title frees goes back to the heap |

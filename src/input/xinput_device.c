@@ -359,13 +359,26 @@ static SHORT stick_sum(int v)
     return (SHORT)(v > 32767 ? 32767 : v < -32767 ? -32767 : v);
 }
 
+/* The title's test for "the D-pad is the stick now", or NULL; and the
+ * D-pad bit for each left-stick binding (axis * 2 + positive). */
+static int (*s_move_as_dpad)(void);
+static const WORD s_move_dpad_bit[4] = {
+    XBOX_GAMEPAD_DPAD_LEFT, XBOX_GAMEPAD_DPAD_RIGHT,
+    XBOX_GAMEPAD_DPAD_DOWN, XBOX_GAMEPAD_DPAD_UP,
+};
+
+void xbox_InputSetMoveKeysAsDpad(int (*active)(void))
+{
+    s_move_as_dpad = active;
+}
+
 static void keyboard_state(XBOX_INPUT_STATE *pState)
 {
     static DWORD packet;
     int axis[4] = { 0, 0, 0, 0 };
     SHORT mx = 0, my = 0;
     WORD b = 0;
-    int i;
+    int i, move_dpad = s_move_as_dpad && s_move_as_dpad();
 
     binds_load();
     memset(pState, 0, sizeof(*pState));
@@ -386,6 +399,8 @@ static void keyboard_state(XBOX_INPUT_STATE *pState)
             break;
         case BIND_STICK:
             axis[bd->what / 2] += (bd->what & 1) ? 32767 : -32767;
+            if (move_dpad && bd->what < AXIS_RX * 2)
+                b |= s_move_dpad_bit[bd->what];
             break;
         }
     }
@@ -455,7 +470,7 @@ void xbox_InputInit(void)
     }
 }
 
-DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+static DWORD backend_get_state(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
     XINPUT_STATE xi_state;
     DWORD result;
@@ -584,7 +599,7 @@ void xbox_InputInit(void)
     open_controllers();
 }
 
-DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+static DWORD backend_get_state(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
         return ERROR_DEVICE_NOT_CONNECTED;
@@ -690,3 +705,30 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
 }
 
 #endif /* _WIN32 */
+
+/* RECOMP_CAMERA_FLIP_X=1: the right stick's left and right swapped, for a
+ * pad, the mouse and the look keys alike. A title whose camera swings round
+ * the player the way the stick pushes turns the view the other way: push
+ * right and the scene turns left. Alter Echo's does, and its own options flip
+ * only the pitch. A PC player expects the view to turn the way the stick or
+ * the mouse goes; the game's launcher turns this on, and 0 keeps the
+ * console's way. */
+static int camera_flip_x(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_CAMERA_FLIP_X");
+        on = e && *e == '1';
+    }
+    return on;
+}
+
+DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+{
+    DWORD result = backend_get_state(dwPort, pState);
+    if (result == ERROR_SUCCESS && camera_flip_x()) {
+        SHORT x = pState->Gamepad.sThumbRX;
+        pState->Gamepad.sThumbRX = x == -32768 ? 32767 : (SHORT)-x;
+    }
+    return result;
+}
