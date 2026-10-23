@@ -145,8 +145,10 @@ void nv2a_pb_scan_report(void)
     int i;
 
     if (s_exec_enabled > 0) {
+        extern int nv2a_trace_detail(void);
         nv2a_pb_exec_report();
-        fprintf(stderr, "[PB] %u pushbuffer calls followed\n", s_tot_calls);
+        if (nv2a_trace_detail())
+            fprintf(stderr, "[PB] %u pushbuffer calls followed\n", s_tot_calls);
     }
     if (!s_seen_count || !getenv("RECOMP_PB_SCAN"))
         return;

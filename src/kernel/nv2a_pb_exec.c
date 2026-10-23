@@ -3643,6 +3643,19 @@ static int pb_verbose(void)
     return verbose;
 }
 
+/* The executor's running commentary -- a line per 200 draws, and every ten
+ * seconds the surface, draw and method counts -- is bring-up detail that made
+ * up most of a player's log (40 MB an hour, with the DMA_PUT lines). The
+ * ten-second fps line stays; the rest needs RECOMP_NV2A_TRACE or
+ * RECOMP_PB_EXEC_VERBOSE. */
+int nv2a_trace_detail(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("RECOMP_NV2A_TRACE") != NULL || pb_verbose();
+    return on;
+}
+
 static void draw_primitive(void)
 {
     float v[4];
@@ -3651,7 +3664,7 @@ static void draw_primitive(void)
     if (!s_gpu.prim || !s_gpu.idx_count)
         return;
     s_gpu.draws++;
-    if ((s_gpu.draws % 200) == 0)
+    if ((s_gpu.draws % 200) == 0 && nv2a_trace_detail())
         fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
     s_gpu.verts += s_gpu.idx_count;
 
@@ -4866,6 +4879,10 @@ void nv2a_pb_exec_report(void)
                     s_gpu.flips, 10);
         last_flips = s_gpu.flips;
         last_ms = now;
+    }
+    if (!nv2a_trace_detail()) {
+        fflush(stderr);
+        return;                         /* the rest is for bring-up */
     }
     fprintf(stderr, "[GPU] surface 0x%08X pitch %u clip %ux%u+%u+%u"
                     " clears %u | %u unhandled methods (%d distinct)\n",

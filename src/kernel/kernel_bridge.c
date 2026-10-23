@@ -3673,19 +3673,24 @@ static void bridge_NtReadFile(void)
     {
         const uint8_t *p = (const uint8_t *)XBOX_TO_NATIVE(buffer_va);
         uint32_t got = (uint32_t)ios.Information;
+        static unsigned reads;
+        /* Every read was a line, a hundred a minute in play; the first 200
+         * (boot, the first level) and any that fails or comes back short
+         * are the ones a report needs. */
+        int show = ++reads <= 200 || ios.Status != 0 || got != length || KERNEL_LOG_ON();
         /* The offset matters as much as the length. A title streaming a pack
          * file reads sector-aligned chunks, so the first bytes belong to
          * whatever precedes the file it actually wants, and a read that stops
          * early looks identical to one that never started -- until you can
          * see where each one landed. */
-        if (poff)
+        if (show && poff)
             fprintf(stderr, "  [READ] from=0x%08X ev=%08X apc=%08X @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
                     g_xbox_kernel_caller, STACK_ARG(1), STACK_ARG(2),
                     (long long)off.QuadPart, length, got,
                     (uint32_t)ios.Status,
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
                     got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
-        else
+        else if (show)
             fprintf(stderr, "  [READ] from=0x%08X @seq want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
                     g_xbox_kernel_caller,
                     length, got, (uint32_t)ios.Status,
@@ -9772,7 +9777,10 @@ static void kernel_thunk_dispatch_body(void)
         static DWORD last_summary_tick = 0;
         DWORD now = GetTickCount();
         if (last_summary_tick == 0) last_summary_tick = now;
-        if (now - last_summary_tick >= 2000 && g_kernel_call_count > 200) {
+        /* Every 2 s while tracing; otherwise a minute, a heartbeat in a
+         * player's log (it was 7 lines every 2 s). */
+        if (now - last_summary_tick >= (KERNEL_LOG_ON() ? 2000u : 60000u)
+            && g_kernel_call_count > 200) {
             fprintf(stderr, "  [KERNEL] summary: %lld total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
                     g_kernel_call_count, ordinal, slot, g_esp);
             /* And which ones, ranked. "Latest" names whatever the sample
