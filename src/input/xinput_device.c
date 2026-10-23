@@ -706,29 +706,38 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
 
 #endif /* _WIN32 */
 
-/* RECOMP_CAMERA_FLIP_X=1: the right stick's left and right swapped, for a
- * pad, the mouse and the look keys alike. A title whose camera swings round
- * the player the way the stick pushes turns the view the other way: push
- * right and the scene turns left. Alter Echo's does, and its own options flip
- * only the pitch. A PC player expects the view to turn the way the stick or
- * the mouse goes; the game's launcher turns this on, and 0 keeps the
- * console's way. */
-static int camera_flip_x(void)
+/* RECOMP_CAMERA_FLIP_X=1 and RECOMP_CAMERA_FLIP_Y=1: the right stick's left
+ * and right, or up and down, swapped for a pad, the mouse and the look keys
+ * alike. A title whose camera swings round the player the way the stick
+ * pushes turns the view the other way: push right and the scene turns left,
+ * push up and it tilts down. Alter Echo's does both; its Pitch Axis option
+ * flips up and down again on top of this. A PC player expects the view to go
+ * the way the stick or the mouse goes; the game's launcher turns both on,
+ * and 0 keeps the console's way. */
+static int env_on(const char *name)
 {
-    static int on = -1;
-    if (on < 0) {
-        const char *e = getenv("RECOMP_CAMERA_FLIP_X");
-        on = e && *e == '1';
-    }
-    return on;
+    const char *e = getenv(name);
+    return e && *e == '1';
+}
+
+static SHORT stick_flip(SHORT v)
+{
+    return v == -32768 ? 32767 : (SHORT)-v;
 }
 
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
+    static int flip_x = -1, flip_y;
     DWORD result = backend_get_state(dwPort, pState);
-    if (result == ERROR_SUCCESS && camera_flip_x()) {
-        SHORT x = pState->Gamepad.sThumbRX;
-        pState->Gamepad.sThumbRX = x == -32768 ? 32767 : (SHORT)-x;
+    if (flip_x < 0) {
+        flip_y = env_on("RECOMP_CAMERA_FLIP_Y");
+        flip_x = env_on("RECOMP_CAMERA_FLIP_X");
+    }
+    if (result == ERROR_SUCCESS) {
+        if (flip_x)
+            pState->Gamepad.sThumbRX = stick_flip(pState->Gamepad.sThumbRX);
+        if (flip_y)
+            pState->Gamepad.sThumbRY = stick_flip(pState->Gamepad.sThumbRY);
     }
     return result;
 }
