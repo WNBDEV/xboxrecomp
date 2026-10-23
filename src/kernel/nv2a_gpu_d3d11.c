@@ -310,6 +310,31 @@ static void gpu_log(const char *fmt, ...)
     fflush(stderr);
 }
 
+/* Where a frame's time went (see "frame timing" by nv2a_gpu_frame): the
+ * first-use work the executor does for it, timed where it happens. */
+typedef struct {
+    double ms, wait, tex_new, tex_changed, tex_checks, shaders, present;
+    unsigned n_tex_new, n_tex_changed, n_shaders;
+} FrameCost;
+
+static struct {
+    LARGE_INTEGER fq;
+    double last;
+    FrameCost cur;
+    /* the ten-second report */
+    unsigned slow, logged;
+    double worst;
+} s_ft;
+
+static double ft_ms(void)
+{
+    LARGE_INTEGER t;
+    if (!s_ft.fq.QuadPart)
+        QueryPerformanceFrequency(&s_ft.fq);
+    QueryPerformanceCounter(&t);
+    return (double)t.QuadPart * 1000.0 / (double)s_ft.fq.QuadPart;
+}
+
 static uint8_t *guest(uint32_t va)
 {
     return (uint8_t *)xbox_GetMemoryOffset() + va;
@@ -703,9 +728,12 @@ static ID3D11PixelShader *get_ps(const PsKey *k)
     ID3DBlob *code;
     ID3D11PixelShader *ps = NULL;
 
+    double t0;
+
     for (i = 0; i < s_ps_count; i++)
         if (!memcmp(&s_ps[i].key, k, sizeof *k))
             return s_ps[i].ps;
+    t0 = ft_ms();
     src = gen_ps(k);
     code = compile(src, "ps_4_0", "combiners");
     if (!code && getenv("RECOMP_GPU_TRACE"))
@@ -722,6 +750,8 @@ static ID3D11PixelShader *get_ps(const PsKey *k)
         s_ps[s_ps_count].ps = ps;
         s_ps_count++;
     }
+    s_ft.cur.shaders += ft_ms() - t0;
+    s_ft.cur.n_shaders++;
     return ps;
 }
 
@@ -919,6 +949,7 @@ static ID3D11VertexShader *get_program_vs(void)
     static uint32_t prog[NV2A_VSH_SLOTS][4];
     uint32_t gen = nv2a_vsh_program_gen(), n, i;
     uint64_t h;
+    double t0;
     char *src;
     ID3DBlob *code;
     ID3D11VertexShader *vs = NULL;
@@ -933,6 +964,7 @@ static ID3D11VertexShader *get_program_vs(void)
     for (i = 0; i < (uint32_t)s_vsc_count; i++)
         if (s_vsc[i].hash == h && s_vsc[i].n == n)
             return cur = s_vsc[i].vs;
+    t0 = ft_ms();
     src = gen_vs((const uint32_t (*)[4])prog, n);
     code = compile(src, "vs_4_0", "vertex program");
     if (!code && getenv("RECOMP_GPU_TRACE"))
@@ -951,6 +983,8 @@ static ID3D11VertexShader *get_program_vs(void)
         s_vsc[s_vsc_count].vs = vs;
         s_vsc_count++;
     }
+    s_ft.cur.shaders += ft_ms() - t0;
+    s_ft.cur.n_shaders++;
     return cur = vs;
 }
 
@@ -1701,7 +1735,8 @@ static ID3D11ShaderResourceView *rt_as_texture(const Nv2aGpuTexture *t, const Gp
 static ID3D11ShaderResourceView *get_tex(const Nv2aGpuTexture *t)
 {
     GpuTex *e = NULL;
-    int i, oldest = 0;
+    int i, oldest = 0, ok;
+    double t0;
 
     if (s_ts.on < 0)
         s_ts.on = getenv("RECOMP_TEX_STATS") != NULL;
@@ -1728,17 +1763,25 @@ static ID3D11ShaderResourceView *get_tex(const Nv2aGpuTexture *t)
     }
     if (e) {
         if (e->checked != s_frame) {
+            double t0 = ft_ms(), t1;
             uint64_t h = tex_hash(t);
             e->checked = s_frame;
+            t1 = ft_ms();
+            s_ft.cur.tex_checks += t1 - t0;
             if (h != e->hash) {
+                int ok;
                 e->hash = h;
-                if (!tex_upload(e, t))
+                ok = tex_upload(e, t);
+                s_ft.cur.tex_changed += ft_ms() - t1;
+                s_ft.cur.n_tex_changed++;
+                if (!ok)
                     return NULL;
             }
         }
         e->last_used = s_frame;
         return e->srv;
     }
+    t0 = ft_ms();
     for (i = 0; i < GPU_TEXTURES; i++) {
         if (!s_tex[i].srv) { e = &s_tex[i]; break; }
         if (s_tex[i].last_used < s_tex[oldest].last_used) oldest = i;
@@ -1755,7 +1798,10 @@ static ID3D11ShaderResourceView *get_tex(const Nv2aGpuTexture *t)
     e->hash = tex_hash(t);
     e->checked = s_frame;
     e->last_used = s_frame;
-    if (!tex_upload(e, t)) {
+    ok = tex_upload(e, t);
+    s_ft.cur.tex_new += ft_ms() - t0;
+    s_ft.cur.n_tex_new++;
+    if (!ok) {
         memset(e, 0, sizeof *e);
         return NULL;
     }
@@ -2462,11 +2508,54 @@ int nv2a_gpu_blit_copy(int src_rt, uint32_t src, uint32_t dst, uint32_t pitch,
     return 1;
 }
 
+/* ---- frame timing -------------------------------------------------------- */
+
+/* A frame that misses the vblank is a dip on the F1 counter, and the
+ * ten-second averages cannot say why. So each frame's interval is split up:
+ * how long the executor waited for the title's commands (the poll loop adds
+ * that up in g_nv2a_pb_wait_ms), its first-use work -- textures made, changed
+ * or checked, shaders made -- and Present, which is where a graphics card
+ * that has fallen behind, or vsync, holds the frame; the rest is the commands
+ * themselves. A frame FT_SLOW_MS or more after the one before is logged with
+ * all of that, at most FT_LOG_MAX in ten seconds, and the ten-second line
+ * counts them. Timestamp queries for the card's own time were tried and
+ * dropped: their span includes the card's idle gaps, so it was the frame
+ * interval again. */
+#define FT_SLOW_MS 25.0
+#define FT_LOG_MAX 8
+
+extern double g_nv2a_pb_wait_ms;
+
+static void ft_frame(void)
+{
+    double now = ft_ms();
+    FrameCost *f = &s_ft.cur;
+    f->ms = s_ft.last > 0.0 ? now - s_ft.last : 0.0;
+    s_ft.last = now;
+    f->wait = g_nv2a_pb_wait_ms;
+    g_nv2a_pb_wait_ms = 0.0;
+    if (f->ms >= FT_SLOW_MS) {
+        s_ft.slow++;
+        if (f->ms > s_ft.worst)
+            s_ft.worst = f->ms;
+        if (s_ft.logged++ < FT_LOG_MAX)
+            gpu_log("slow frame: %.1f ms; waiting for the title %.1f ms; textures made %u "
+                    "(%.1f ms), changed %u (%.1f ms), checked %.1f ms; shaders made %u "
+                    "(%.1f ms); Present %.1f ms; the rest %.1f ms", f->ms, f->wait,
+                    f->n_tex_new, f->tex_new, f->n_tex_changed, f->tex_changed,
+                    f->tex_checks, f->n_shaders, f->shaders, f->present, f->ms - f->wait
+                    - f->tex_new - f->tex_changed - f->tex_checks - f->shaders - f->present);
+    }
+    memset(f, 0, sizeof *f);
+}
+
 void nv2a_gpu_frame(void)
 {
     DWORD now = GetTickCount();
-    if (s_state == 1)
+    if (s_state == 1) {
         forget_drain();
+        ft_frame();
+    }
     if (!s_churn.since)
         s_churn.since = now;
     if (now - s_churn.since >= 10000) {
@@ -2485,6 +2574,12 @@ void nv2a_gpu_frame(void)
                     s_churn.rb_ms, s_churn.unsampled[NS_TARGET], s_churn.unsampled[NS_OFFSET],
                     s_churn.unsampled[NS_LARGER], s_churn.unsampled[NS_SWIZZLED],
                     s_churn.unsampled[NS_OTHER], s_churn.blits, s_churn.blits_gpu);
+        if (s_ft.slow)
+            gpu_log("last %.1f s: %u frames %.0f ms or more after the one before (worst "
+                    "%.1f ms, %u logged)", (now - s_churn.since) / 1000.0, s_ft.slow,
+                    FT_SLOW_MS, s_ft.worst, s_ft.logged < FT_LOG_MAX ? s_ft.logged : FT_LOG_MAX);
+        s_ft.slow = s_ft.logged = 0;
+        s_ft.worst = 0.0;
         memset(&s_churn, 0, sizeof s_churn);
         s_churn.since = now;
     }
@@ -2869,7 +2964,11 @@ int nv2a_gpu_present(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, ui
         gpu_shot_tex(back, cw, ch);
     ID3D11RenderTargetView_Release(rtv);
     ID3D11Texture2D_Release(back);
-    IDXGISwapChain_Present(s_swap, 1, 0);
+    {
+        double t0 = ft_ms();
+        IDXGISwapChain_Present(s_swap, 1, 0);
+        s_ft.cur.present += ft_ms() - t0;
+    }
     return 1;
 }
 

@@ -180,6 +180,10 @@ static size_t xbox_TiledApertureSize(void)
 static HANDLE g_nv2a_ack_thread = NULL;
 static volatile LONG g_nv2a_ack_stop = 0;
 static DWORD s_nv2a_last_work_ms;   /* poll loop: when it last ran commands */
+/* Milliseconds the poll loop has waited between runs of the title's commands,
+ * added up; the GPU backend takes it at every flip to tell a frame the title
+ * was late with from one the executor was slow on. */
+double g_nv2a_pb_wait_ms;
 
 /*
  * NV2A busy-bit acknowledgement.
@@ -1157,8 +1161,17 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                         gpu_get = put;
                         have_get = put != 0;
                     } else if (put != gpu_get) {
+                        static LARGE_INTEGER idle_since, qf;
+                        LARGE_INTEGER t;
+                        if (!qf.QuadPart)
+                            QueryPerformanceFrequency(&qf);
+                        QueryPerformanceCounter(&t);
+                        if (idle_since.QuadPart)
+                            g_nv2a_pb_wait_ms += (double)(t.QuadPart - idle_since.QuadPart)
+                                                 * 1000.0 / (double)qf.QuadPart;
                         gpu_get = nv2a_pb_run(gpu_get, put,
                             (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET));
+                        QueryPerformanceCounter(&idle_since);
                         s_nv2a_last_work_ms = GetTickCount();
                     }
                     /* Periodic, because what the title submits at init is not
@@ -3187,35 +3200,149 @@ static int heap_insert_free(int at, uint32_t addr, uint32_t size)
     return 1;
 }
 
-/* Take exactly `size` bytes, aligned, out of the first free block that has room
- * for them; what is left in front of and behind the piece stays free. Returns 0
+/* Free block i has room for `size` bytes at `alignment`: their start, else 0. */
+static uint32_t heap_fits(int i, uint32_t size, uint32_t alignment)
+{
+    uint32_t a = g_heap_blocks[i].addr, start, end;
+    if (!g_heap_blocks[i].free || g_heap_blocks[i].size < size)
+        return 0;
+    start = (a + alignment - 1) & ~(alignment - 1);
+    end = a + g_heap_blocks[i].size;
+    if (start + size > end || start + size < start)
+        return 0;       /* not enough room once aligned */
+    return start;
+}
+
+/* Take exactly `size` bytes at `start` out of free block i; what is left in
+ * front of and behind the piece stays free. 0 if the table is full. */
+static uint32_t heap_take(int i, uint32_t start, uint32_t size)
+{
+    uint32_t a = g_heap_blocks[i].addr, end = a + g_heap_blocks[i].size;
+    uint32_t front = start - a, back = end - (start + size);
+    if (front && !heap_insert_free(i, a, front))
+        return 0;       /* table full: leave this block alone */
+    if (front)
+        i++;            /* the taken piece moved up one slot */
+    g_heap_blocks[i].addr = start;
+    g_heap_blocks[i].size = size;
+    g_heap_blocks[i].free = 0;
+    if (back && !heap_insert_free(i + 1, start + size, back))
+        g_heap_blocks[i].size += back;   /* table full: keep it attached */
+    memset((void *)((uintptr_t)start + g_memory_offset), 0, size);
+    return start;
+}
+
+/* Carve the request out of the first free block that has room. Returns 0
  * when no free block fits. Caller holds g_heap_lock. */
 static uint32_t heap_carve_free(uint32_t size, uint32_t alignment)
 {
     for (int i = 0; i < g_heap_block_count; i++) {
-        uint32_t a, start, end, front, back;
-        if (!g_heap_blocks[i].free || g_heap_blocks[i].size < size)
-            continue;
-        a = g_heap_blocks[i].addr;
-        start = (a + alignment - 1) & ~(alignment - 1);
-        end = a + g_heap_blocks[i].size;
-        if (start + size > end || start + size < start)
-            continue;   /* not enough room once aligned */
-        front = start - a;
-        back = end - (start + size);
-        if (front && !heap_insert_free(i, a, front))
-            continue;   /* table full: leave this block alone */
-        if (front)
-            i++;        /* the taken piece moved up one slot */
-        g_heap_blocks[i].addr = start;
-        g_heap_blocks[i].size = size;
-        g_heap_blocks[i].free = 0;
-        if (back && !heap_insert_free(i + 1, start + size, back))
-            g_heap_blocks[i].size += back;   /* table full: keep it attached */
-        memset((void *)((uintptr_t)start + g_memory_offset), 0, size);
-        return start;
+        uint32_t start = heap_fits(i, size, alignment), r;
+        if (start && (r = heap_take(i, start, size)))
+            return r;
     }
     return 0;
+}
+
+/* The same out of the smallest free block that has room, which leaves the
+ * big ones whole for big requests. */
+static uint32_t heap_carve_best(uint32_t size, uint32_t alignment)
+{
+    int best = -1;
+    for (int i = 0; i < g_heap_block_count; i++)
+        if (heap_fits(i, size, alignment)
+            && (best < 0 || g_heap_blocks[i].size < g_heap_blocks[best].size))
+            best = i;
+    return best < 0 ? 0 : heap_take(best, heap_fits(best, size, alignment), size);
+}
+
+/* Set when a bump allocation could not be recorded (table full): the top of
+ * the heap then holds memory the table does not know, and is never given back. */
+static int g_heap_untracked;
+
+/* The heap's top for this run: XBOX_HEAP_TOP, or lower with RECOMP_HEAP_KB=<n>
+ * (n KB of heap), which exists to test running short of memory. */
+static uint32_t heap_top(void)
+{
+    static uint32_t cap = 1;
+    if (cap == 1) {
+        const char *e = getenv("RECOMP_HEAP_KB");
+        long kb = e ? atol(e) : 0;
+        cap = kb > 0 ? XBOX_HEAP_BASE + (uint32_t)kb * 1024u : 0;
+    }
+    return cap && cap < XBOX_HEAP_TOP ? cap : XBOX_HEAP_TOP;
+}
+
+/* The last try before a request fails for want of room at the top.
+ *
+ * Without RECOMP_HEAP_RECLAIM, which Alter Echo cannot boot under, freed
+ * blocks are only reused whole, and a free never merges across the empty
+ * slot an earlier merge left -- so after enough levels and videos the heap
+ * holds megabytes free in pieces, none big enough, while the top is full. On
+ * 23 Oct a 2.2 MB Bink request failed that way after 75 minutes and eleven
+ * areas, the title used the null it got, and the game crashed. On hardware
+ * the same memory is pages behind a page table and cannot fragment like this.
+ *
+ * So here, and only here: merge every run of adjacent free blocks, give a
+ * free run at the top back to the bump pointer, and then take the request
+ * from the top if it now fits, or out of the first free block with room,
+ * split. Normal allocation is untouched. Returns 0 if nothing fits. */
+static uint32_t heap_compact_locked(uint32_t size, uint32_t alignment)
+{
+    static int logged;
+    uint32_t freed = 0, largest = 0, gave_back = 0, r;
+    int i, j, last = -1, top = 0;
+
+    for (i = 0; i < g_heap_block_count; i++) {
+        if (!g_heap_blocks[i].size)
+            continue;
+        if (g_heap_blocks[i].free) {
+            for (j = i + 1; j < g_heap_block_count; j++) {
+                if (!g_heap_blocks[j].size)
+                    continue;
+                if (!g_heap_blocks[j].free
+                    || g_heap_blocks[i].addr + g_heap_blocks[i].size != g_heap_blocks[j].addr)
+                    break;
+                g_heap_blocks[i].size += g_heap_blocks[j].size;
+                g_heap_blocks[j].size = 0;
+                g_heap_blocks[j].addr = 0;
+            }
+            freed += g_heap_blocks[i].size;
+            if (g_heap_blocks[i].size > largest)
+                largest = g_heap_blocks[i].size;
+        }
+        last = i;
+    }
+    if (last >= 0 && !g_heap_untracked && g_heap_blocks[last].free
+        && g_heap_blocks[last].addr + g_heap_blocks[last].size == g_heap_next) {
+        gave_back = g_heap_blocks[last].size;
+        g_heap_next = g_heap_blocks[last].addr;
+        g_heap_block_count = last;      /* nothing live above it */
+    }
+    r = (g_heap_next + alignment - 1) & ~(alignment - 1);
+    if (r + size <= heap_top() && r + size > r) {
+        top = 1;
+        g_heap_next = r + size;
+        memset((void *)((uintptr_t)r + g_memory_offset), 0, size);
+        if (g_heap_block_count < XBOX_HEAP_MAX_BLOCKS) {
+            g_heap_blocks[g_heap_block_count].addr = r;
+            g_heap_blocks[g_heap_block_count].size = size;
+            g_heap_blocks[g_heap_block_count].free = 0;
+            g_heap_block_count++;
+        } else {
+            g_heap_untracked = 1;
+        }
+    } else {
+        r = heap_carve_best(size, alignment);
+    }
+    if (r && logged++ < 8) {
+        fprintf(stderr, "  [HEAP] no room at the top for %u bytes: %u KB free in pieces "
+                "(largest %u KB once merged), %u KB of it given back to the top; "
+                "took it %s, at 0x%08X\n", size, freed >> 10, largest >> 10,
+                gave_back >> 10, top ? "from the top" : "out of a free block", r);
+        fflush(stderr);
+    }
+    return r;
 }
 
 /*
@@ -3629,11 +3756,11 @@ static void heap_stats_locked(void)
             nlive++;
         }
     }
-    tail = XBOX_HEAP_TOP - g_heap_next;
+    tail = heap_top() - g_heap_next;
     fprintf(stderr, "  [HEAP] stats: reached %u KB of %u KB; live %llu KB in %d"
             " blocks, free %llu KB in the table (largest %u KB), %u KB untouched"
             " at the top%s\n", (g_heap_next - XBOX_HEAP_BASE) >> 10,
-            (unsigned)(XBOX_HEAP_TOP - XBOX_HEAP_BASE) >> 10,
+            (unsigned)(heap_top() - XBOX_HEAP_BASE) >> 10,
             (unsigned long long)(live >> 10), nlive,
             (unsigned long long)(free_b >> 10), largest >> 10, tail >> 10,
             xbox_HeapReclaimEnabled() ? " (reclaim on)" : "");
@@ -3697,10 +3824,21 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
     /* Align the next pointer */
     result = (g_heap_next + alignment - 1) & ~(alignment - 1);
 
-    if (result + size > XBOX_HEAP_TOP) {
-        fprintf(stderr, "xbox_HeapAlloc: out of memory (requested %u, used %u/%u)\n",
+    if (result + size > heap_top()) {
+        uint32_t free_b = 0, largest = 0;
+        result = heap_compact_locked(size, alignment);
+        if (result)
+            return result;
+        for (int i = 0; i < g_heap_block_count; i++)
+            if (g_heap_blocks[i].free) {
+                free_b += g_heap_blocks[i].size;
+                if (g_heap_blocks[i].size > largest)
+                    largest = g_heap_blocks[i].size;
+            }
+        fprintf(stderr, "xbox_HeapAlloc: out of memory (requested %u, used %u/%u; "
+                "%u KB free in pieces, the largest %u KB)\n",
                 size, g_heap_next - XBOX_HEAP_BASE,
-                (unsigned)(XBOX_HEAP_TOP - XBOX_HEAP_BASE));
+                (unsigned)(heap_top() - XBOX_HEAP_BASE), free_b >> 10, largest >> 10);
         /* Who ate the heap? Group live blocks by size -- an exhausted heap is
          * nearly always one request size repeated, and the count names it. */
         {
@@ -3742,6 +3880,8 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
         g_heap_blocks[g_heap_block_count].size = size;
         g_heap_blocks[g_heap_block_count].free = 0;
         g_heap_block_count++;
+    } else {
+        g_heap_untracked = 1;
     }
 
     g_heap_alloc_count++;
