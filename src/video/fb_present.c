@@ -230,6 +230,27 @@ static void fb_toggle_fps(void)
     InterlockedExchange(&s_show_fps, !s_show_fps);
 }
 
+/* F2 holds the frame rate at 30 instead of 60, for comparing the two
+ * (RECOMP_FPS30=1 starts at 30): the swap chain presents on every second
+ * vblank and flip_pace's cap halves. */
+static volatile LONG s_half_rate = -1;
+
+int xbox_FramebufferHalfRate(void)
+{
+    if (s_half_rate < 0) {
+        const char *e = getenv("RECOMP_FPS30");
+        InterlockedExchange(&s_half_rate, (e && *e == '1') ? 1 : 0);
+    }
+    return (int)s_half_rate;
+}
+
+static void fb_toggle_half_rate(void)
+{
+    int on = !xbox_FramebufferHalfRate();
+    InterlockedExchange(&s_half_rate, on);
+    fprintf(stderr, "[FB] F2: frame rate held at %d\n", on ? 30 : 60);
+}
+
 /* Title bar, the way ps3recomp's window shows it. Written by the flip,
  * read once a second by the window thread; a torn read shows one stale
  * number for a second, which nobody can tell apart from a real one. */
@@ -375,6 +396,10 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     }
     if (m == WM_KEYDOWN && w == VK_F1 && !(l & (1 << 30))) {
         fb_toggle_fps();
+        return 0;
+    }
+    if (m == WM_KEYDOWN && w == VK_F2 && !(l & (1 << 30))) {
+        fb_toggle_half_rate();
         return 0;
     }
     if (m == WM_SYSCHAR && w == VK_RETURN)
@@ -871,6 +896,11 @@ static int fb_thread(void *unused)
                         fb_toggle_fps();
                     continue;
                 }
+                if (k == SDLK_F2) {
+                    if (ev.type == SDL_KEYDOWN && !ev.key.repeat)
+                        fb_toggle_half_rate();
+                    continue;
+                }
                 vk = fb_vk_from_sdl(k);
                 if (vk >= 0)
                     s_key_down[vk] = ev.type == SDL_KEYDOWN;
@@ -1005,6 +1035,7 @@ void xbox_FramebufferWindowStart(void) {}
 int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
 void xbox_FramebufferMouseTake(int *dx, int *dy) { *dx = *dy = 0; }
 int xbox_FramebufferOverlayFps(void) { return -1; }
+int xbox_FramebufferHalfRate(void) { return 0; }
 void xbox_FramebufferWindowSetTitle(const uint16_t *n, int m) { (void)n; (void)m; }
 void xbox_FramebufferWindowFrameStats(uint32_t draws) { (void)draws; }
 void *xbox_FramebufferWindowHwnd(void) { return (void *)0; }

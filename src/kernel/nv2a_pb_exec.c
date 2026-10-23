@@ -3573,9 +3573,12 @@ static void frame_trace_flip(void)
  * the compositor is not showing), nothing held flips to the display's rate:
  * light scenes ran at 66 fps and menus at 100-150, where the console shows
  * 60. This caps flips at RECOMP_FLIP_HZ (60;
- * 0 for none) on average. Up to two frames of slack are banked, so a frame
+ * 0 for none) on average, half that while F2 holds the rate at 30. Up to two
+ * frames of slack are banked, so a frame
  * that runs late is followed by one that does not wait, and a scene at 40
  * fps stays at 40 rather than dropping to 30 as strict vsync would. */
+extern int xbox_FramebufferHalfRate(void);   /* fb_present.c, F2 */
+
 static void flip_pace(void)
 {
     static double hz = -1.0;
@@ -3591,7 +3594,7 @@ static void flip_pace(void)
     }
     if (hz <= 0.0)
         return;
-    period = (int64_t)((double)freq.QuadPart / hz);
+    period = (int64_t)((double)freq.QuadPart / (xbox_FramebufferHalfRate() ? hz / 2.0 : hz));
     QueryPerformanceCounter(&now);
     if (next && now.QuadPart < next) {
         int64_t ms = (next - now.QuadPart) * 1000 / freq.QuadPart;

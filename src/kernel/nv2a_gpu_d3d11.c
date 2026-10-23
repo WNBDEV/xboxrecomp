@@ -2520,11 +2520,17 @@ int nv2a_gpu_blit_copy(int src_rt, uint32_t src, uint32_t dst, uint32_t pitch,
  * all of that, at most FT_LOG_MAX in ten seconds, and the ten-second line
  * counts them. Timestamp queries for the card's own time were tried and
  * dropped: their span includes the card's idle gaps, so it was the frame
- * interval again. */
+ * interval again. While F2 holds the rate at 30 the bar is twice as high. */
 #define FT_SLOW_MS 25.0
 #define FT_LOG_MAX 8
 
 extern double g_nv2a_pb_wait_ms;
+extern int xbox_FramebufferHalfRate(void);   /* fb_present.c, F2 */
+
+static double ft_slow_ms(void)
+{
+    return xbox_FramebufferHalfRate() ? 2.0 * FT_SLOW_MS : FT_SLOW_MS;
+}
 
 static void ft_frame(void)
 {
@@ -2534,7 +2540,7 @@ static void ft_frame(void)
     s_ft.last = now;
     f->wait = g_nv2a_pb_wait_ms;
     g_nv2a_pb_wait_ms = 0.0;
-    if (f->ms >= FT_SLOW_MS) {
+    if (f->ms >= ft_slow_ms()) {
         s_ft.slow++;
         if (f->ms > s_ft.worst)
             s_ft.worst = f->ms;
@@ -2577,7 +2583,7 @@ void nv2a_gpu_frame(void)
         if (s_ft.slow)
             gpu_log("last %.1f s: %u frames %.0f ms or more after the one before (worst "
                     "%.1f ms, %u logged)", (now - s_churn.since) / 1000.0, s_ft.slow,
-                    FT_SLOW_MS, s_ft.worst, s_ft.logged < FT_LOG_MAX ? s_ft.logged : FT_LOG_MAX);
+                    ft_slow_ms(), s_ft.worst, s_ft.logged < FT_LOG_MAX ? s_ft.logged : FT_LOG_MAX);
         s_ft.slow = s_ft.logged = 0;
         s_ft.worst = 0.0;
         memset(&s_churn, 0, sizeof s_churn);
@@ -2966,7 +2972,7 @@ int nv2a_gpu_present(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, ui
     ID3D11Texture2D_Release(back);
     {
         double t0 = ft_ms();
-        IDXGISwapChain_Present(s_swap, 1, 0);
+        IDXGISwapChain_Present(s_swap, xbox_FramebufferHalfRate() ? 2 : 1, 0);
         s_ft.cur.present += ft_ms() - t0;
     }
     return 1;

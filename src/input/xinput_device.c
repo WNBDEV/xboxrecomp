@@ -96,7 +96,7 @@ static BOOL key_down(int vk)
 
 /* Key names for the bindings, case-insensitive, as Win32 virtual keys.
  * Letters and digits are their own codes and are not listed. F1 (frame
- * counter) and F11 (fullscreen) are the window's. */
+ * counter), F2 (30 or 60 fps) and F11 (fullscreen) are the window's. */
 static const struct { const char *name; int vk; } s_key_names[] = {
     {"MouseLeft", 0x01}, {"MouseRight", 0x02}, {"MouseMiddle", 0x04},
     {"Mouse4", 0x05}, {"Mouse5", 0x06},
@@ -110,7 +110,7 @@ static const struct { const char *name; int vk; } s_key_names[] = {
     {"Numpad0", 0x60}, {"Numpad1", 0x61}, {"Numpad2", 0x62}, {"Numpad3", 0x63},
     {"Numpad4", 0x64}, {"Numpad5", 0x65}, {"Numpad6", 0x66}, {"Numpad7", 0x67},
     {"Numpad8", 0x68}, {"Numpad9", 0x69},
-    {"F2", 0x71}, {"F3", 0x72}, {"F4", 0x73}, {"F5", 0x74}, {"F6", 0x75},
+    {"F3", 0x72}, {"F4", 0x73}, {"F5", 0x74}, {"F6", 0x75},
     {"F7", 0x76}, {"F8", 0x77}, {"F9", 0x78}, {"F10", 0x79}, {"F12", 0x7B},
     {"Semicolon", 0xBA}, {"Equals", 0xBB}, {"Comma", 0xBC}, {"Minus", 0xBD},
     {"Period", 0xBE}, {"Slash", 0xBF}, {"Grave", 0xC0}, {"LeftBracket", 0xDB},
