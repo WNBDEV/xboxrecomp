@@ -759,6 +759,12 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     return TRUE;
 
 translate:
+    /* As on Windows: the hook, and a line per file the title opens -- what
+     * a report needs to place a problem, and what test scripts wait on. */
+    if (g_xbox_path_hook)
+        g_xbox_path_hook(xbox_path);
+    fprintf(stderr, "  [PATH] %s\n", xbox_path);
+    fflush(stderr);
     {
         char remainder_posix[MAX_PATH];
         snprintf(remainder_posix, sizeof(remainder_posix), "%s", remainder);

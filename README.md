@@ -112,10 +112,12 @@ Environment variables, read at start-up. Defaults in brackets.
 | | `RECOMP_CONTIG_FREE` [0] | 1: freed contiguous blocks are reused |
 | | `RECOMP_STACK_KB` [8192] | size of the main thread's stack region; it comes out of the heap |
 | Input | `RECOMP_IRQL_LOCK` [0] | 1: DPCs and the title never run at DISPATCH_LEVEL together |
+| | `RECOMP_WAIT_POLL` [0] | 1: the old Sleep(1) polling in that lock and in the NV2A software-method stall, instead of waking on an event (for comparison) |
 | | `RECOMP_RUMBLE` [1] | 0: ignore the title's rumble |
 | Audio | `RECOMP_AUDIO_MUTE` [0] | 1: everything as usual, but silence to the device |
 | | `RECOMP_AUDIO_DUMP` | file: append the output as raw 48 kHz stereo s16le |
 | Diagnostics | `RECOMP_WAIT_PROFILE`, `RECOMP_GPU_PROFILE` | where threads block; where GPU time goes |
+| | `RECOMP_IRQL_PROFILE` | each ISR/DPC delivery kept over 4 ms from DISPATCH_LEVEL, with the holder and where it raised |
 | | `RECOMP_AUDIO_STATS`, `RECOMP_APU_VOICES`, `RECOMP_APU_PHYS_STATS` | levels, voices on/off, how APU reads resolve |
 | | `RECOMP_HEAP_STATS`, `RECOMP_CONTIG_TRACE` | heap use; contiguous allocations and frees |
 | | `RECOMP_FRAME_TRACE`, `RECOMP_TRI_PROBE=x,y`, `RECOMP_DEBUG_HOLES`, `RECOMP_TEX_DIAG`, `RECOMP_VSH_NAN` | one frame's methods; the triangles covering a pixel; undrawn pixels in magenta; bad texels; NaN vertex outputs |

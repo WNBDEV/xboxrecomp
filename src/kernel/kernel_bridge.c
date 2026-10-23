@@ -2363,6 +2363,9 @@ static volatile LONG s_pgraph_armed;
 static CRITICAL_SECTION s_pgraph_cs;
 static RECOMP_TLS int s_pgraph_stepping;
 static RECOMP_TLS uint32_t s_pgraph_off, s_pgraph_old;
+/* Set when the handler re-enables the FIFO -- the answer the software-method
+ * wait is waiting for -- so it wakes then, not at its next look. */
+static HANDLE s_swmethod_done;
 
 static LONG CALLBACK pgraph_w1c_veh(PEXCEPTION_POINTERS ep)
 {
@@ -2383,6 +2386,9 @@ static LONG CALLBACK pgraph_w1c_veh(PEXCEPTION_POINTERS ep)
             if (!now)
                 BRIDGE_AND32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0, ~NV2A_PMC_INTR_PGRAPH);
         }
+        if (s_pgraph_off == (NV2A_PGRAPH_FIFO & 0xFFFu) && s_swmethod_done
+                && (*(volatile uint32_t *)((char *)s_pgraph_page + s_pgraph_off) & 1u))
+            SetEvent(s_swmethod_done);
         if (s_pgraph_armed)
             VirtualProtect(s_pgraph_page, 4096, PAGE_READONLY, &old);
         LeaveCriticalSection(&s_pgraph_cs);
@@ -2415,6 +2421,7 @@ static void pgraph_w1c_arm(int on)
         if (!on)
             return;
         InitializeCriticalSection(&s_pgraph_cs);
+        s_swmethod_done = CreateEventA(NULL, FALSE, FALSE, NULL);
         s_pgraph_veh = AddVectoredExceptionHandler(1, pgraph_w1c_veh);
         if (!s_pgraph_veh)
             return;
@@ -2434,6 +2441,8 @@ static HANDLE s_timer_wake;
 static int wait_profile_on(void);
 static double wait_profile_ms(LARGE_INTEGER a, LARGE_INTEGER b);
 static void wait_profile_add(uint32_t ord, uint32_t caller, uint32_t arg, double ms);
+
+extern int xbox_WaitPoll(void);   /* kernel_hal.c */
 
 void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t method, uint32_t param)
 {
@@ -2466,8 +2475,17 @@ void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t method, uint32_t param)
      * spins after its acknowledgement until PMC_INTR_0's PCRTC bit drops, so
      * if the DPC is in there it waits on this thread while this thread waits
      * on it -- for the full timeout, and the method is lost. Do that one job
-     * from here too. */
-    for (waited = 0; waited < 500; waited++) {
+     * from here too.
+     *
+     * It used to Sleep(1) between looks, so every method cost at least a
+     * millisecond however fast the handler answered -- about two methods a
+     * frame, and in heavy moments the frame missed its vblank (perf: 30% of
+     * the GPU thread asleep here). Now it waits on s_swmethod_done, which the
+     * PGRAPH trap sets when the handler re-enables the FIFO, so it goes on
+     * the moment the answer lands; the 1 ms timeout keeps the vblank duty
+     * above going. */
+    for (waited = 0;;) {
+        double ms;
         uint32_t pcrtc = BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0);
         /* As the busy ack thread does: only the acknowledged vblank it read,
          * so one the timer raises meanwhile is not wiped. */
@@ -2479,7 +2497,15 @@ void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t method, uint32_t param)
             handled = 1;
             break;
         }
-        Sleep(1);
+        QueryPerformanceCounter(&t1);
+        ms = wait_profile_ms(t0, t1);
+        waited = (int)ms;
+        if (ms >= 500.0)
+            break;
+        if (s_swmethod_done && !xbox_WaitPoll())
+            WaitForSingleObject(s_swmethod_done, 1);
+        else
+            Sleep(1);
     }
     if (!handled && n_lost < 3) {
         /* What the title's ISR would have seen: a lost method with PMC's

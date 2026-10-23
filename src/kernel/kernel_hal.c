@@ -15,6 +15,7 @@
 #include "xbox_memory_layout.h"   /* RECOMP_TLS, g_fs_base */
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #if defined(_WIN32)
 #include <intrin.h>
 #endif
@@ -197,6 +198,8 @@ static INIT_ONCE s_dispatch_once = INIT_ONCE_STATIC_INIT;
 static int s_dispatch_on;
 static XBOX_THREAD_LOCAL int t_dispatch_held;
 static XBOX_THREAD_LOCAL int t_delivering;   /* inside xbox_IrqlEnterInterrupt */
+static HANDLE s_dispatch_freed;               /* set on a release while someone waits */
+static volatile LONG s_dispatch_waiters;
 
 static BOOL CALLBACK dispatch_init(PINIT_ONCE once, PVOID param, PVOID *ctx)
 {
@@ -204,31 +207,161 @@ static BOOL CALLBACK dispatch_init(PINIT_ONCE once, PVOID param, PVOID *ctx)
     s_dispatch_on = getenv("RECOMP_IRQL_LOCK") != NULL;
     if (s_dispatch_on) {
         InitializeCriticalSection(&s_dispatch_cs);
+        s_dispatch_freed = CreateEventA(NULL, FALSE, FALSE, NULL);
         fprintf(stderr, "  [IRQL] DISPATCH_LEVEL lock on (RECOMP_IRQL_LOCK)\n");
         fflush(stderr);
     }
     return TRUE;
 }
 
+/* Host deliveries (ISR or DPC) waiting for the lock. A guest raise steps
+ * aside while there are any, as an interrupt preempts the console's one CPU.
+ *
+ * Both waits used to be TryEnter and Sleep(1). Alter Echo raises and lowers
+ * about 4,000 times a second and holds the level for microseconds each time,
+ * so a thread that looked once a millisecond kept missing the gaps: perf put
+ * the timer thread at 9 ms a delivery on average, and every vblank and
+ * software-method interrupt reached D3D that late -- the game thread waited
+ * on the event its DPC sets, the frame missed its vblank, and heavy moments
+ * (a sword combo's hits, form swaps) fell to 40 fps. Now a waiter sleeps on
+ * an event the release sets, so it wakes the moment the lock is free, and the
+ * budget still bounds the wait. (Spinning on SwitchToThread instead cost a
+ * core and kept a thread holding another lock off its CPU for 18 ms.) */
+static volatile LONG s_delivery_waiting;
+
+/* RECOMP_WAIT_POLL=1 brings back the old Sleep(1) polling, here and in the
+ * software-method stall (kernel_bridge.c), for comparing the two. */
+int xbox_WaitPoll(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_WAIT_POLL");
+        on = e && *e == '1';
+    }
+    return on;
+}
+
+static double dispatch_ms_since(LARGE_INTEGER t0)
+{
+    static LARGE_INTEGER freq;
+    LARGE_INTEGER now;
+    if (!freq.QuadPart)
+        QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&now);
+    return (double)(now.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart;
+}
+
+/* RECOMP_IRQL_PROFILE=1: every ten seconds, the raises that kept an ISR or
+ * DPC waiting over 4 ms -- the holder's thread and the guest return address
+ * it raised from -- with how often and for how long. */
+#define IRQL_PROF_SLOTS 16
+static struct { LONG tid; uint32_t guest_ra; unsigned n; double ms; } s_irql_prof[IRQL_PROF_SLOTS];
+static CRITICAL_SECTION s_irql_prof_cs;
+
+static void irql_prof_note(LONG tid, uint32_t guest_ra, double ms)
+{
+    static int on = -1;
+    static DWORD last;
+    DWORD now;
+    int i;
+
+    if (on < 0) {
+        on = getenv("RECOMP_IRQL_PROFILE") != NULL;
+        if (on)
+            InitializeCriticalSection(&s_irql_prof_cs);
+    }
+    if (!on)
+        return;
+    {
+        static volatile LONG shown;
+        if (InterlockedIncrement(&shown) <= 40)
+            fprintf(stderr, "  [IRQLPROF] delivery waited %.1f ms; holder tid %ld raised at guest %08X\n",
+                    ms, (long)tid, guest_ra);
+    }
+    EnterCriticalSection(&s_irql_prof_cs);
+    for (i = 0; i < IRQL_PROF_SLOTS; i++)
+        if (!s_irql_prof[i].n || (s_irql_prof[i].tid == tid && s_irql_prof[i].guest_ra == guest_ra))
+            break;
+    if (i < IRQL_PROF_SLOTS) {
+        s_irql_prof[i].tid = tid;
+        s_irql_prof[i].guest_ra = guest_ra;
+        s_irql_prof[i].n++;
+        s_irql_prof[i].ms += ms;
+    }
+    now = GetTickCount();
+    if (!last)
+        last = now;
+    if (now - last >= 10000) {
+        fprintf(stderr, "  [IRQLPROF] last %.1f s, deliveries kept waiting over 4 ms, by holder:\n",
+                (now - last) / 1000.0);
+        for (i = 0; i < IRQL_PROF_SLOTS && s_irql_prof[i].n; i++)
+            fprintf(stderr, "  [IRQLPROF]   tid %ld raised at guest %08X: %u waits, %.1f ms\n",
+                    (long)s_irql_prof[i].tid, s_irql_prof[i].guest_ra,
+                    s_irql_prof[i].n, s_irql_prof[i].ms);
+        memset(s_irql_prof, 0, sizeof s_irql_prof);
+        last = now;
+    }
+    LeaveCriticalSection(&s_irql_prof_cs);
+}
+
 static void dispatch_acquire(void)
 {
-    int budget, waited;
+    LARGE_INTEGER t0;
+    int budget, delivering, i;
+    LONG holder = 0;
+    uint32_t holder_ra = 0;
 
     InitOnceExecuteOnce(&s_dispatch_once, dispatch_init, NULL, NULL);
     if (!s_dispatch_on || t_dispatch_held)
         return;
+    delivering = t_delivering;
+    if (!delivering && s_delivery_waiting && !xbox_WaitPoll()) {
+        QueryPerformanceCounter(&t0);
+        while (s_delivery_waiting && dispatch_ms_since(t0) < 2.0)
+            SwitchToThread();
+    }
     if (TryEnterCriticalSection(&s_dispatch_cs)) {
         t_dispatch_held = 1;
         return;
     }
-    budget = t_delivering ? DISPATCH_WAIT_DELIVERY_MS : DISPATCH_WAIT_GUEST_MS;
-    for (waited = 0; waited < budget; waited++) {
-        Sleep(1);
-        if (TryEnterCriticalSection(&s_dispatch_cs)) {
-            t_dispatch_held = 1;
-            return;
+    budget = delivering ? DISPATCH_WAIT_DELIVERY_MS : DISPATCH_WAIT_GUEST_MS;
+    if (delivering)
+        InterlockedIncrement(&s_delivery_waiting);
+    QueryPerformanceCounter(&t0);
+    for (i = 0; i < IRQL_HOLDERS; i++) {
+        LONG t = s_holders[i].tid;
+        if (t && t != (LONG)GetCurrentThreadId()) {
+            holder = t;
+            holder_ra = s_holders[i].guest_ra;
         }
     }
+    InterlockedIncrement(&s_dispatch_waiters);
+    for (;;) {
+        double ms;
+        if (TryEnterCriticalSection(&s_dispatch_cs)) {
+            t_dispatch_held = 1;
+            break;
+        }
+        ms = dispatch_ms_since(t0);
+        if (ms >= budget)
+            break;
+        /* A short timeout: one release wakes one waiter, so a second one
+         * looks again soon rather than waiting out its whole budget. */
+        if (xbox_WaitPoll())
+            Sleep(1);
+        else
+            WaitForSingleObject(s_dispatch_freed, 2);
+    }
+    InterlockedDecrement(&s_dispatch_waiters);
+    if (delivering)
+        InterlockedDecrement(&s_delivery_waiting);
+    if (delivering) {
+        double ms = dispatch_ms_since(t0);
+        if (ms > 4.0)
+            irql_prof_note(holder, holder_ra, ms);
+    }
+    if (t_dispatch_held)
+        return;
     {
         static volatile LONG n;
         if (InterlockedIncrement(&n) <= 5) {
@@ -246,6 +379,8 @@ static void dispatch_release(void)
     if (t_dispatch_held) {
         t_dispatch_held = 0;
         LeaveCriticalSection(&s_dispatch_cs);
+        if (s_dispatch_waiters)
+            SetEvent(s_dispatch_freed);
     }
 }
 
