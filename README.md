@@ -8,7 +8,7 @@ rather than under a CPU emulator.
 
 This fork branches from upstream **v0.13.1** (7 Oct 2026) and carries the work
 done bringing up *Alter Echo* in
-[alter-echo-recomp](https://github.com/FILL-IN/alter-echo-recomp): a Direct3D
+[alter-echo-recomp](https://github.com/WNBDEV/alter-echo-recomp): a Direct3D
 11 GPU backend, correctness fixes across the translator, graphics, audio and
 kernel layers, and an experimental native Linux build. The branch is
 `gpu-backend`.
@@ -77,7 +77,7 @@ only; real Windows is untested.
 
 The same way as upstream: a game project adds this tree as a subdirectory
 (see the Quick Start in [UPSTREAM-README.md](UPSTREAM-README.md)).
-[alter-echo-recomp](https://github.com/FILL-IN/alter-echo-recomp) is a
+[alter-echo-recomp](https://github.com/WNBDEV/alter-echo-recomp) is a
 complete worked example.
 
 - **Windows executable, built on Linux:** CMake with
