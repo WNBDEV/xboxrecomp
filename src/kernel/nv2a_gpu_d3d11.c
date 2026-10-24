@@ -279,6 +279,38 @@ static ID3D11SamplerState *s_blit_smp;
 static ID3D11PixelShader *s_sharp_ps;   /* RECOMP_SHARPEN, at the present */
 static ID3D11Buffer *s_sharp_cb;
 
+/* RECOMP_WIDESCREEN=1: fill a wide window instead of boxing the console's
+ * picture. The frame keeps the console's shape in memory and is stretched to
+ * the window's shape (up to 21:9) at the present, the way widescreen worked
+ * on the console itself. So that the stretch comes out right, draws that look
+ * through the camera are squeezed towards the centre by the frame's aspect
+ * over the window's, which widens the camera's view by the same amount. A
+ * draw looks through the camera when it has perspective (w is not 1) and goes
+ * to a surface the frame's shape: the screen, or a smaller copy of it. Flat
+ * drawing (w = 1: the HUD, menus, movies) is placed by ws_flat. */
+static int s_ws = -1;
+static float s_ws_squeeze = 0.75f;      /* the frame's aspect over the shown one */
+static uint32_t s_ws_fw = 640, s_ws_fh = 480;   /* the last frame presented */
+static int s_ws_hud = -1;               /* RECOMP_WS_HUD: 0 stretch, 1 centre, 2 sides */
+
+static int ws_dump_frame(void);
+static int ws_dump_auto(void);
+static int ws_on(void)
+{
+    if (s_ws < 0) {
+        const char *e = getenv("RECOMP_WIDESCREEN");
+        s_ws = e && *e == '1';
+    }
+    return s_ws;
+}
+
+/* With RECOMP_WS_LOG set, every 120th present logs how it was shown. */
+static int ws_log_present(void)
+{
+    static uint32_t n;
+    return getenv("RECOMP_WS_LOG") && n++ % 120 == 0;
+}
+
 /* RECOMP_SHARPEN=0..1 [0]: contrast-adaptive sharpening as the frame goes to
  * the window. Each pixel is pushed away from its four neighbours, less where
  * the neighbourhood already spans a wide range (an edge, which would ring)
@@ -451,7 +483,7 @@ static ID3DBlob *compile(const char *src, const char *profile, const char *what)
  * rasteriser the w it needs for perspective-correct interpolation and for
  * clipping triangles that cross behind the eye. */
 static const char s_vs_src[] =
-"cbuffer V : register(b0) { float4 vp; };\n"
+"cbuffer V : register(b0) { float4 vp; float4 ws; };\n"
 "struct VI { float4 p : POSITION; float4 d0 : COLOR0; float4 d1 : COLOR1;\n"
 "  float4 f : FOG; float4 t0 : TEXCOORD0; float4 t1 : TEXCOORD1;\n"
 "  float4 t2 : TEXCOORD2; float4 t3 : TEXCOORD3; };\n"
@@ -460,7 +492,12 @@ static const char s_vs_src[] =
 "  float4 t2 : TEXCOORD2; float4 t3 : TEXCOORD3; };\n"
 "VO main(VI i) {\n"
 "  VO o; float w = i.p.w;\n"
-"  o.p = float4((i.p.x * vp.x - 1.0) * w, (1.0 - i.p.y * vp.y) * w,\n"
+"  float x = i.p.x * vp.x - 1.0;\n"
+"  float y = 1.0 - i.p.y * vp.y;\n"
+"  bool flat = abs(w - 1.0) < 1.0e-5;\n"
+"  x = flat ? x * ws.x + ws.y : x * vp.w;\n"
+"  y = flat ? y * ws.z + ws.w : y;\n"
+"  o.p = float4(x * w, y * w,\n"
 "               i.p.z * vp.z * w, w);\n"
 "  o.d0 = i.d0; o.d1 = i.d1; o.f = i.f;\n"
 "  o.t0 = i.t0; o.t1 = i.t1; o.t2 = i.t2; o.t3 = i.t3;\n"
@@ -818,7 +855,7 @@ static char *gen_vs(const uint32_t (*prog)[4], uint32_t n)
 
     sb(&s,
        "cbuffer K : register(b0) { float4 C[192]; };\n"
-       "cbuffer V : register(b1) { float4 vp; float4 fogp; };\n"
+       "cbuffer V : register(b1) { float4 vp; float4 fogp; float4 ws; };\n"
        "struct VI {\n");
     for (i = 0; i < 16; i++)
         sb(&s, "  float4 v%u : ATTR%u;\n", i, i);
@@ -928,7 +965,12 @@ static char *gen_vs(const uint32_t (*prog)[4], uint32_t n)
     sb(&s,
        "  VO o; float w = P.w;\n"
        "  if (w == 0.0 || w != w || abs(w) > 3.0e38) w = 1.0;\n"
-       "  o.p = float4((P.x * vp.x - 1.0) * w, (1.0 - P.y * vp.y) * w, P.z * vp.z * w, w);\n"
+       "  float x = P.x * vp.x - 1.0;\n"
+       "  float y = 1.0 - P.y * vp.y;\n"
+       "  bool flat = abs(w - 1.0) < 1.0e-5;\n"
+       "  x = flat ? x * ws.x + ws.y : x * vp.w;\n"
+       "  y = flat ? y * ws.z + ws.w : y;\n"
+       "  o.p = float4(x * w, y * w, P.z * vp.z * w, w);\n"
        "  o.d0 = saturate(O[3]); o.d1 = saturate(O[4]);\n"
        "  o.f = float4(fogf(O[5].x), 0.0, 0.0, 1.0);\n"
        "  o.t0 = O[9]; o.t1 = O[10]; o.t2 = O[11]; o.t3 = O[12];\n"
@@ -1003,6 +1045,7 @@ typedef struct {
     uint64_t guest_hash;
     uint32_t last_used;
     uint32_t checked;                   /* s_frame guest memory was last compared */
+    uint32_t draws;                     /* since it was last presented */
 } GpuRt;
 
 typedef struct {
@@ -2186,10 +2229,10 @@ static int gpu_init(void)
     if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_ib)))
         return 0;
     s_const_cb = make_cb(16 * 192);
-    s_prog_cb = make_cb(32);
+    s_prog_cb = make_cb(48);
     if (!s_const_cb || !s_prog_cb)
         return 0;
-    s_vs_cb = make_cb(16);
+    s_vs_cb = make_cb(32);
     s_ps_cb = make_cb(sizeof(float) * 4 * (8 + 8 + 3 + 4 + 1));
     s_clear_cb = make_cb(32);
     if (!s_vs_cb || !s_ps_cb || !s_clear_cb)
@@ -2477,6 +2520,9 @@ int nv2a_gpu_blit_copy(int src_rt, uint32_t src, uint32_t dst, uint32_t pitch,
     if (s_state != 1 || src_rt < 0 || src_rt >= GPU_RTS || !s_rt[src_rt].tex)
         return 0;
     s = &s_rt[src_rt];
+    if (ws_dump_frame() && !ws_dump_auto())
+        gpu_log("ws dump: frame %u blit %ux%u from %08X (%ux%u) to %08X", s_frame, w, h, src,
+                s->w, s->h, dst);
     if (dst < s->addr + s->pitch * s->h && s->addr < dst + pitch * h)
         return 0;                       /* within one surface: the guest copy alone */
     s_addr = s->addr;
@@ -2903,7 +2949,7 @@ int nv2a_gpu_present(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, ui
     HWND hwnd;
     RECT cr;
     uint32_t cw, ch;
-    float sx, sy, k, vw, vh;
+    float sx, sy, k, kx, ky, vw, vh;
     GpuRt *r;
 
     if (on < 0) {
@@ -2963,6 +3009,27 @@ int nv2a_gpu_present(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, ui
     k = sx < sy ? sx : sy;
     vw = (float)w * k;
     vh = (float)h * k;
+    kx = ky = k;
+    /* A frame nothing was drawn into was written by the CPU, a picture made
+     * for 4:3: it keeps its shape, with bars at the sides. */
+    if (ws_on() && r->draws) {
+        /* RECOMP_WIDESCREEN: the window's shape, from the frame's own to
+         * 21:9, and the next frame's camera widened to match. */
+        float fa = (float)w / (float)h, a = (float)cw / (float)ch;
+        if (a < fa) a = fa;
+        if (a > 64.0f / 27.0f) a = 64.0f / 27.0f;
+        vh = (float)cw / a < (float)ch ? (float)cw / a : (float)ch;
+        vw = vh * a;
+        kx = vw / (float)w;
+        ky = vh / (float)h;
+        s_ws_squeeze = fa / a;
+        s_ws_fw = w;
+        s_ws_fh = h;
+    }
+    if (ws_on() && ws_log_present())
+        gpu_log("ws present: frame %u, %ux%u, %u draws: %s", s_frame, w, h, r->draws,
+                r->draws ? "widescreen" : "4:3 (drawn by the CPU)");
+    r->draws = 0;
     {
         float x0 = ((float)cw - vw) * 0.5f, y0 = ((float)ch - vh) * 0.5f;
         const LONG frame[4] = { (LONG)x0, (LONG)y0, (LONG)(x0 + vw + 0.5f),
@@ -2973,10 +3040,10 @@ int nv2a_gpu_present(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, ui
             const float c[4] = { 1.0f / (float)(r->w * s_scale), 1.0f / (float)(r->h * s_scale),
                                  -1.0f / (8.0f - 3.0f * sharpen_amount()), 0.0f };
             cb_write(s_sharp_cb, c, sizeof c);
-            blit_rect_ps(r->srv, rtv, x0, y0, (float)r->w * k, (float)r->h * k, frame,
+            blit_rect_ps(r->srv, rtv, x0, y0, (float)r->w * kx, (float)r->h * ky, frame,
                          s_sharp_ps, s_sharp_cb);
         } else
-            blit_rect(r->srv, rtv, x0, y0, (float)r->w * k, (float)r->h * k, frame);
+            blit_rect(r->srv, rtv, x0, y0, (float)r->w * kx, (float)r->h * ky, frame);
         osd_draw(rtv, x0, y0, vh);
     }
     if (gpu_shot_window())
@@ -2992,6 +3059,393 @@ int nv2a_gpu_present(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, ui
 }
 
 /* ---- draws --------------------------------------------------------------- */
+
+/* RECOMP_WIDESCREEN's squeeze for a draw to r: only surfaces the frame's
+ * shape (the console's 4:3: the screen and its smaller copies) are views of
+ * the screen. */
+static float ws_squeeze(const GpuRt *r)
+{
+    if (!ws_on() || r->w * 3 != r->h * 4)
+        return 1.0f;
+    return s_ws_squeeze;
+}
+
+/* A texture the frame's size: almost always a copy of the frame, which the
+ * game draws back over it for its screen effects. */
+static int ws_frame_sized(const Nv2aGpuTexture *t)
+{
+    return t->valid && t->width == s_ws_fw && t->height == s_ws_fh;
+}
+
+/* A full-screen picture the CPU made -- a movie frame from the game's video
+ * player, a still -- rather than a pass over a surface the GPU drew. (A copy
+ * of the scene made with the image blitter also passes this; ws_flat tells
+ * those apart by when they are drawn.) */
+static int ws_is_picture(const Nv2aGpuState *st)
+{
+    const Nv2aGpuTexture *t = &st->tex[0];
+    int i;
+    if (!t->valid || !t->linear || t->cube)
+        return 0;
+    for (i = 0; i < GPU_RTS; i++) {
+        const GpuRt *g = &s_rt[i];
+        if (g->tex && g->gpu_dirty && t->addr < g->addr + g->pitch * g->h
+            && g->addr < t->addr + t->bytes)
+            return 0;
+    }
+    return 1;
+}
+
+/* Whether the movie playing is letterboxed -- a wide picture with black bands
+ * above and below, as the game's opening and ending are -- so that zooming it
+ * to the screen's width loses nothing but the bands. Judged from a few pixels
+ * of each frame: once there is picture in the middle with the bands still
+ * black, it is; a band ever showing picture settles that it is not, for the
+ * rest of that movie. A pause of a second between frames starts a new movie. */
+static int ws_letterboxed(const Nv2aGpuTexture *t)
+{
+    static int state;                   /* 0 not known yet, 1 letterboxed, 2 not */
+    static uint32_t last;
+    const uint8_t *base;
+    uint32_t i, k, rows[4], bright_band = 0, bright_mid = 0;
+
+    if (s_frame - last > 60)
+        state = 0;
+    last = s_frame;
+    if (t->format != 0x12 && t->format != 0x1E)    /* linear A8R8G8B8 / X8R8G8B8 */
+        return 0;
+    if (state)
+        return state == 1;
+    base = (const uint8_t *)(uintptr_t)t->addr + xbox_GetMemoryOffset();
+    rows[0] = t->height * 3 / 100; rows[1] = t->height * 11 / 100;
+    rows[2] = t->height * 89 / 100; rows[3] = t->height * 97 / 100;
+    for (i = 0; i < 16; i++) {
+        uint32_t x = t->width * (2 * i + 1) / 32;
+        for (k = 0; k < 5; k++) {
+            uint32_t y = k < 4 ? rows[k] : t->height / 2;
+            const uint8_t *p = base + (size_t)y * t->pitch + x * 4;
+            if (p[0] > 24 || p[1] > 24 || p[2] > 24) {
+                if (k < 4) bright_band++; else bright_mid++;
+            }
+        }
+    }
+    if (bright_band)
+        state = 2;
+    else if (bright_mid)
+        state = 1;
+    return state == 1;
+}
+
+/* RECOMP_WIDESCREEN for flat drawing on the screen (w = 1: the HUD, menus,
+ * text). Drawing that spans the screen's width -- fades, full-screen
+ * filters -- stretches with the frame, unless it is a picture the CPU made
+ * (ws_is_picture), which keeps its shape, or zooms to the width when it is
+ * letterboxed. The HUD keeps clear of the screen's edges, which a TV hid,
+ * so these stretch too: a piece of a copy of the frame (ws_frame_sized),
+ * which must stay on what it copies; a grid of tiles from the top-left
+ * corner (below); drawing the screen's height that reaches a side edge or
+ * crosses it (the loading screen's wipe; a dialogue box sliding in from the
+ * side is less than that); and drawing over most of the screen both ways
+ * (an overlay inset from the edges). Anything else keeps its shape in the
+ * middle of the screen, where the console's 4:3 picture would have been.
+ * x0..x1, y0..y1 is the draw's flat extent in guest pixels; writes the
+ * squeeze and offset the shader applies to x in clip space.
+ * RECOMP_WS_HUD=sides moves pieces in the left and right thirds out to the
+ * screen's edges instead (text drawn a word at a time comes apart),
+ * =stretch stretches it all. */
+static void ws_flat(const GpuRt *r, const Nv2aGpuState *st, float x0, float x1,
+                    float y0, float y1, float *out)
+{
+    float cx, s;
+
+    out[0] = 1.0f;
+    out[1] = 0.0f;
+    out[2] = 1.0f;
+    out[3] = 0.0f;
+    if (!ws_on())
+        return;
+    if (s_ws_hud < 0) {
+        const char *e = getenv("RECOMP_WS_HUD");
+        s_ws_hud = !e ? 1 : !strcmp(e, "stretch") ? 0 : !strcmp(e, "sides") ? 2 : 1;
+    }
+    s = ws_squeeze(r);
+    if (s == 1.0f || !s_ws_hud || r->w != s_ws_fw || r->h != s_ws_fh)
+        return;
+    if (x0 > x1)
+        return;
+    if (x0 <= (float)r->w * 0.02f + 1.0f && x1 >= (float)r->w * 0.98f - 1.0f) {
+        /* Full width, give or take the few pixels a blur pass shifts by.
+         * A picture is the frame's first draw: the game's own copies of the
+         * drawn scene, blended back over it, come after the scene. */
+        if (r->draws == 1 && ws_is_picture(st)) {
+            if (ws_letterboxed(&st->tex[0]))
+                out[2] = 1.0f / s;      /* zoomed to the width; the bands go */
+            else
+                out[0] = s;
+        }
+        return;
+    }
+    if (ws_frame_sized(&st->tex[0]))
+        return;                         /* a piece of the frame's copy: on what it copies */
+    {
+        /* A grid of tiles over the screen -- the damage and time-dilation
+         * tints, 10x10 tiles each of its own colour -- is drawn from the
+         * top-left corner, where the HUD never goes: a small tile there
+         * starts one, and the tiles of its size and texture after it in
+         * the frame are the rest of it. */
+        static uint32_t gframe, gtex;
+        static float gw, gh;
+        uint32_t ta = st->tex[0].valid ? st->tex[0].addr : 0;
+        float tw = x1 - x0, th = y1 - y0;
+        if (x0 <= 1.5f && y0 <= 1.5f && tw <= (float)r->w * 0.5f && th <= (float)r->h * 0.5f)
+            gframe = s_frame, gtex = ta, gw = tw, gh = th;
+        else if (gframe != s_frame || ta != gtex || fabsf(tw - gw) > gw * 0.25f
+                 || fabsf(th - gh) > gh * 0.25f)
+            gframe = 0;
+        if (gframe == s_frame && tw > 0.0f && th > 0.0f) {
+            /* Its tiles stop half a console pixel short of the next (63.5
+             * by 47.5 on a 64 by 48 pitch), a gap no pixel of 640x480 falls
+             * in but every higher resolution shows as a seam: each tile
+             * reaches on to the next, keeping its top-left corner. */
+            float l = x0 * 2.0f / (float)r->w - 1.0f, t = 1.0f - y0 * 2.0f / (float)r->h;
+            out[0] = (tw + 0.5f) / tw;
+            out[1] = l * (1.0f - out[0]);
+            out[2] = (th + 0.5f) / th;
+            out[3] = t * (1.0f - out[2]);
+            return;
+        }
+    }
+    if (y1 - y0 >= (float)r->h * 0.98f - 2.0f && (x0 <= 1.5f || x1 >= (float)r->w - 1.5f))
+        return;                         /* a wipe */
+    if (x1 - x0 >= (float)r->w * 0.85f && y1 - y0 >= (float)r->h * 0.85f)
+        return;                         /* an overlay */
+    cx = (x0 + x1) * 0.5f;
+    out[0] = s;
+    if (s_ws_hud == 2 && cx < (float)r->w / 3.0f)
+        out[1] = s - 1.0f;              /* the left edge stays put */
+    else if (s_ws_hud == 2 && cx > (float)r->w * 2.0f / 3.0f)
+        out[1] = 1.0f - s;              /* the right edge stays put */
+}
+
+/* The x extent of a draw's flat vertices (w = 1); x0 > x1 if it has none. */
+static void ws_extent(float x, float w, float *x0, float *x1)
+{
+    if (w == 0.0f || w != w || fabsf(w) > 3.0e38f)
+        w = 1.0f;                       /* no perspective, as the shaders take it */
+    if (fabsf(w - 1.0f) >= 1.0e-5f)
+        return;
+    if (x < *x0) *x0 = x;
+    if (x > *x1) *x1 = x;
+}
+
+/* Where a draw's vertices land: its extent in guest pixels and its depths. */
+typedef struct { float x0, x1, y0, y1, w0, w1, d0[4]; uint32_t n, flat; } WsSpan;
+
+static void ws_span_add(WsSpan *s, const float *pos, const float *d0)
+{
+    float w = pos[3];
+    if (w == 0.0f || w != w || fabsf(w) > 3.0e38f)
+        w = 1.0f;
+    if (!s->n) {
+        memcpy(s->d0, d0, sizeof s->d0);
+        s->x0 = s->x1 = pos[0];
+        s->y0 = s->y1 = pos[1];
+        s->w0 = s->w1 = w;
+    }
+    if (pos[0] < s->x0) s->x0 = pos[0];
+    if (pos[0] > s->x1) s->x1 = pos[0];
+    if (pos[1] < s->y0) s->y0 = pos[1];
+    if (pos[1] > s->y1) s->y1 = pos[1];
+    if (w < s->w0) s->w0 = w;
+    if (w > s->w1) s->w1 = w;
+    s->n++;
+    if (fabsf(w - 1.0f) < 1.0e-5f)
+        s->flat++;
+}
+
+/* Whether a draw's depths so far could still make it a pass over the screen
+ * (ws_screen_pass): all one, or a frame-sized texture. Anything else is
+ * scenery, and the interpreter can stop. */
+static int ws_maybe_pass(const Nv2aGpuState *st, const WsSpan *s)
+{
+    if (s->w0 <= 0.0f)
+        return 0;
+    return s->w1 - s->w0 <= s->w0 * 1.0e-3f || ws_frame_sized(&st->tex[0]);
+}
+
+/* Whether a draw is a tile of an exact grid over the screen: a whole
+ * fraction of it each way, at a multiple of its size (after the half pixel
+ * and a bit the console's Direct3D adds to every position). */
+static int ws_on_grid(const GpuRt *r, const WsSpan *s)
+{
+    float tw = s->x1 - s->x0, th = s->y1 - s->y0, nx, ny, ix, iy;
+    if (tw < 4.0f || th < 4.0f)
+        return 0;
+    nx = (float)r->w / tw, ny = (float)r->h / th;
+    ix = (s->x0 - 0.53125f) / tw, iy = (s->y0 - 0.53125f) / th;
+    return fabsf(nx - roundf(nx)) < 0.01f && fabsf(ny - roundf(ny)) < 0.01f
+        && fabsf(ix - roundf(ix)) < 0.01f && fabsf(iy - roundf(iy)) < 0.01f;
+}
+
+/* A pass over the screen drawn in perspective, which stretches with the
+ * frame like a flat one: widening the view would box it into the middle.
+ * The game draws some of its effects this way rather than flat:
+ * - the flash as stealth comes on or an enemy dies: a copy of the frame in a
+ *   left and a right half, each at one depth (w = 6 or 8). Every corner at
+ *   the same depth and the whole spanning the screen's height or width;
+ *   anything else at one depth that big (a sprite facing the camera) fills
+ *   the view either way.
+ * - the ripples, the frame's copy in 8x8 tiles bent by their own depths:
+ *   as Nevin warps in, tiles moved about at depths around 8; in time
+ *   dilation and as he picks things up, tiles on the grid (ws_on_grid) or
+ *   an edge or two off it (a third of a tile seen), at depths around 68. A small draw of a
+ *   frame-sized texture (a copy of the frame) that starts a run of tiles at
+ *   the top-left corner or is one of that run, is on the screen at depths
+ *   under 32, or is on the grid: the scenery that samples the copy (the
+ *   stealth form's see-through body) is bigger, hundreds of units away, and
+ *   lands anywhere. */
+static int ws_screen_pass(const GpuRt *r, const Nv2aGpuState *st, const WsSpan *s)
+{
+    if (!s->n || s->flat || s->w0 <= 0.0f)
+        return 0;
+    if (s->w1 - s->w0 <= s->w0 * 1.0e-3f
+        && (s->y1 - s->y0 >= (float)r->h * 0.98f - 2.0f
+            || s->x1 - s->x0 >= (float)r->w * 0.98f - 2.0f))
+        return 1;
+    if (!ws_frame_sized(&st->tex[0]) || s->n > 32)
+        return 0;
+    {
+        /* A run of tiles from the top-left corner: the ripples draw their 8x8
+         * from there, the corner tile left in place, the rest bent a little
+         * (an edge moved by a pixel or two) by where the wave is. */
+        static uint32_t gframe, gtex;
+        static float gw, gh;
+        float tw = s->x1 - s->x0, th = s->y1 - s->y0;
+        if (s->x0 <= 1.5f && s->y0 <= 1.5f && tw <= (float)r->w * 0.5f && th <= (float)r->h * 0.5f) {
+            gframe = s_frame, gtex = st->tex[0].addr, gw = tw, gh = th;
+            return 1;
+        }
+        if (gframe == s_frame && st->tex[0].addr == gtex && fabsf(tw - gw) <= gw * 0.5f
+            && fabsf(th - gh) <= gh * 0.5f)
+            return 1;
+    }
+    if (s->w1 < 32.0f && s->x0 >= (float)r->w * -0.1f && s->x1 <= (float)r->w * 1.1f
+        && s->y0 >= (float)r->h * -0.1f && s->y1 <= (float)r->h * 1.1f)
+        return 1;
+    return ws_on_grid(r, s);
+}
+
+/* RECOMP_WS_DUMP=<frame>: every draw and image copy of that frame and the
+ * 30 after it, where it landed and how it was placed. =auto: through the
+ * whole run, grids of tiles laid over the screen and draws that look like
+ * screen effects yet were squeezed into the middle (ws_dump), for a
+ * player to send in. */
+static int s_ws_dump = -1;              /* the frame, 0 off, -2 auto */
+
+static int ws_dump_auto(void)
+{
+    return s_ws_dump == -2;
+}
+
+static int ws_dump_frame(void)
+{
+    if (s_ws_dump == -1) {
+        const char *e = getenv("RECOMP_WS_DUMP");
+        s_ws_dump = !e ? 0 : !strcmp(e, "auto") ? -2 : atoi(e);
+    }
+    if (s_ws_dump == -2)
+        return 1;
+    return s_ws_dump > 0 && s_frame >= (uint32_t)s_ws_dump && s_frame < (uint32_t)s_ws_dump + 30;
+}
+
+static void ws_dump(const char *path, const GpuRt *r, const Nv2aGpuState *st,
+                    const WsSpan *s, float persp, const float *flat)
+{
+    const Nv2aGpuTexture *t = &st->tex[0];
+    static uint32_t lines;
+    if (!ws_dump_frame())
+        return;
+    if (ws_dump_auto()) {
+        /* A run of 16 or more tiles of one size and texture in a frame is
+         * a grid laid over the screen: one line for it. */
+        static uint32_t gf, gn, gtex;
+        static float gw, gh;
+        float tw = s->x1 - s->x0, th = s->y1 - s->y0;
+        uint32_t ta = t->valid ? t->addr : 0;
+        int full = s->x0 <= (float)r->w * 0.02f + 1.0f && s->x1 >= (float)r->w * 0.98f - 1.0f;
+        if (s->n && s->flat == s->n && gf == s_frame && ta == gtex
+            && tw >= (float)r->w / 16.0f && th >= (float)r->h / 16.0f   /* not letters */
+            && fabsf(tw - gw) <= gw * 0.25f && fabsf(th - gh) <= gh * 0.25f) {
+            if (++gn == 16 && ++lines <= 50000)
+                gpu_log("ws dump: frame %u grid of %gx%g tiles from x %g y %g tex0 %ux%u fmt %02X lin %d "
+                        "at %08X frame-sized %d placed x%g%+g", s_frame, gw, gh, s->x0, s->y0,
+                        t->valid ? t->width : 0, t->valid ? t->height : 0, t->format, t->linear,
+                        ta, ws_frame_sized(t), flat[0], flat[1]);
+        } else {
+            gf = s_frame, gtex = ta, gw = tw, gh = th, gn = 1;
+        }
+        /* The rest: what may be a screen effect yet was squeezed into the
+         * middle -- a copy of the frame in perspective (a small draw: the
+         * see-through body is bigger), flat drawing that is a piece of a
+         * copy, big or at an edge. */
+        if (s->flat < s->n ? !ws_frame_sized(t) || s->n > 32 || persp >= 1.0f
+                           : full || flat[0] >= 1.0f
+                             || !(ws_frame_sized(t)
+                                  || (tw >= (float)r->w * 0.5f && th >= (float)r->h * 0.5f)
+                                  || s->x0 <= 1.5f || s->x1 >= (float)r->w - 1.5f))
+            return;
+        if (++lines > 50000)
+            return;
+    }
+    gpu_log("ws dump: frame %u draw %u %s n %u rt %ux%u x %g..%g y %g..%g w %g..%g flat %u "
+            "persp x%g flat x%g%+g y%g tex0 %ux%u fmt %02X lin %d picture %d d0 %.2f %.2f %.2f %.2f",
+            s_frame, r->draws, path, s->n, r->w, r->h, s->x0, s->x1, s->y0, s->y1,
+            s->w0, s->w1, s->flat, persp, flat[0], flat[1], flat[2],
+            t->valid ? t->width : 0, t->valid ? t->height : 0, t->format, t->linear,
+            ws_is_picture(st), s->d0[0], s->d0[1], s->d0[2], s->d0[3]);
+}
+
+/* The same for a vertex program's draw, which runs on the GPU: a small one
+ * (a HUD piece is a quad or two) is run through the interpreter here to see
+ * where it lands. Bigger ones are scenery or full-screen passes and stretch
+ * with the frame. Returns whether it is a screen pass (ws_screen_pass). */
+static int ws_flat_program(const GpuRt *r, const Nv2aGpuState *st,
+                           const float *const attr[16], uint32_t nverts, float *out)
+{
+    float x0 = 1.0e30f, x1 = -1.0e30f, in[NV2A_VSH_INPUTS][4];
+    WsSpan sp = {0};
+    Nv2aVshOutput o;
+    uint32_t i, a;
+    int look, dump = ws_dump_frame() && (!ws_dump_auto() || ws_frame_sized(&st->tex[0])), pass;
+
+    out[0] = 1.0f;
+    out[1] = 0.0f;
+    out[2] = 1.0f;
+    out[3] = 0.0f;
+    look = ws_on() && nverts <= 32 && ws_squeeze(r) != 1.0f
+        && r->w == s_ws_fw && r->h == s_ws_fh;
+    if (!look && !dump)
+        return 0;
+    for (i = 0; i < nverts && i < 4096; i++) {
+        for (a = 0; a < NV2A_VSH_INPUTS; a++) {
+            if (attr[a])
+                memcpy(in[a], attr[a] + i * 4, sizeof in[a]);
+            else
+                in[a][0] = in[a][1] = in[a][2] = 0.0f, in[a][3] = 1.0f;
+        }
+        if (!nv2a_vsh_run(in, &o))
+            return 0;
+        ws_extent(o.pos[0], o.pos[3], &x0, &x1);
+        ws_span_add(&sp, o.pos, o.d0);
+        if (x0 > x1 && !ws_maybe_pass(st, &sp) && !dump)
+            return 0;                   /* scenery */
+    }
+    if (look)
+        ws_flat(r, st, x0, x1, sp.y0, sp.y1, out);
+    pass = look && ws_screen_pass(r, st, &sp);
+    ws_dump("program", r, st, &sp, pass ? 1.0f : ws_squeeze(r), out);
+    return pass;
+}
 
 static void unpack_argb(uint32_t c, float *o)
 {
@@ -3080,6 +3534,7 @@ static GpuRt *pixel_pipeline(const Nv2aGpuState *st)
         smp[i] = get_sampler(t->filter_linear, t->wrap_u, t->wrap_v, mip);
     }
     rt_begin(r);
+    r->draws++;
 
     key.use_rc = (uint8_t)st->use_rc;
     key.tex0 = (uint8_t)(st->tex[0].valid);
@@ -3192,7 +3647,7 @@ static int ring_put_n(ID3D11Buffer *b, uint32_t *pos, uint32_t cap, const void *
 void nv2a_gpu_draw(const Nv2aGpuState *st, const Nv2aGpuVertex *v, uint32_t n)
 {
     GpuRt *r;
-    float vcb[4];
+    float vcb[8];
     uint32_t offset, stride = sizeof(Nv2aGpuVertex);
 
     if (s_state != 1 || n < 3 || st->cull == 3)
@@ -3203,7 +3658,20 @@ void nv2a_gpu_draw(const Nv2aGpuState *st, const Nv2aGpuVertex *v, uint32_t n)
     vcb[0] = 2.0f / (float)r->w;
     vcb[1] = 2.0f / (float)r->h;
     vcb[2] = st->zeta_z16 ? 1.0f / 65535.0f : 1.0f / 16777215.0f;
-    vcb[3] = 0.0f;
+    vcb[3] = ws_squeeze(r);
+    {
+        float x0 = 1.0e30f, x1 = -1.0e30f;
+        WsSpan sp = {0};
+        uint32_t i;
+        for (i = 0; ws_on() && i < n; i++) {
+            ws_extent(v[i].pos[0], v[i].pos[3], &x0, &x1);
+            ws_span_add(&sp, v[i].pos, v[i].d0);
+        }
+        ws_flat(r, st, x0, x1, sp.y0, sp.y1, vcb + 4);
+        if (ws_screen_pass(r, st, &sp))
+            vcb[3] = 1.0f;
+        ws_dump("fixed", r, st, &sp, vcb[3], vcb + 4);
+    }
     cb_write(s_vs_cb, vcb, sizeof vcb);
     if (!ring_put(s_vb, &s_vb_pos, GPU_VB_BYTES, v, n * stride, &offset))
         return;
@@ -3221,7 +3689,7 @@ int nv2a_gpu_draw_program(const Nv2aGpuState *st, const float *const attr[16],
     ID3D11VertexShader *vs;
     ID3D11Buffer *cbs[2], *vbs[16];
     GpuRt *r;
-    float pcb[8];
+    float pcb[12];
     const void *src[16];
     uint32_t bytes[16], off[16], strides[16], offs[16], used[16];
     uint32_t ioff, a, n = 0;
@@ -3244,11 +3712,13 @@ int nv2a_gpu_draw_program(const Nv2aGpuState *st, const float *const attr[16],
     pcb[0] = 2.0f / (float)r->w;
     pcb[1] = 2.0f / (float)r->h;
     pcb[2] = st->zeta_z16 ? 1.0f / 65535.0f : 1.0f / 16777215.0f;
-    pcb[3] = 0.0f;
+    pcb[3] = ws_squeeze(r);
     pcb[4] = st->fog_enable ? 1.0f : 0.0f;
     pcb[5] = (float)st->fog_mode;
     pcb[6] = st->fog_param[0];
     pcb[7] = st->fog_param[1];
+    if (ws_flat_program(r, st, attr, nverts, pcb + 8))
+        pcb[3] = 1.0f;                  /* a screen pass: no wider view */
     cb_write(s_prog_cb, pcb, sizeof pcb);
     for (a = 0; a < 16; a++)
         if (attr[a]) {

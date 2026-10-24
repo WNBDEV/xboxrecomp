@@ -589,8 +589,8 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     }
     /* RECOMP_SCALE renders N times the console's resolution (the GPU
      * backend); open the window that large too, shrunk to fit the screen's
-     * work area with the console's 4:3 kept. It can be resized freely: the
-     * swap chain scales to whatever the window is. */
+     * work area with the console's 4:3 kept (16:9 with RECOMP_WIDESCREEN). It
+     * can be resized freely: the swap chain scales to whatever the window is. */
     {
         const char *e = getenv("RECOMP_SCALE");
         int sc = e ? atoi(e) : 1;
@@ -598,6 +598,9 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         LONG cw, ch;
         if (sc < 1 || sc > 4) sc = 1;
         cw = (LONG)s_fb_width * sc; ch = (LONG)s_fb_height * sc;
+        e = getenv("RECOMP_WIDESCREEN");
+        if (e && *e == '1')
+            cw = ch * 16 / 9;           /* the GPU backend fills any shape */
         if (SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0)) {
             LONG aw = wa.right - wa.left - 16, ah = wa.bottom - wa.top - 48;
             if (ch > ah) { cw = cw * ah / ch; ch = ah; }
@@ -850,6 +853,9 @@ static int fb_thread(void *unused)
         SDL_Rect wa;
         if (sc < 1 || sc > 4) sc = 1;
         cw = (int)s_fb_width * sc; ch = (int)s_fb_height * sc;
+        e = getenv("RECOMP_WIDESCREEN");
+        if (e && *e == '1')
+            cw = ch * 16 / 9;           /* the GPU backend fills any shape */
         if (SDL_GetDisplayUsableBounds(0, &wa) == 0) {
             int aw = wa.w - 16, ah = wa.h - 48;
             if (ch > ah) { cw = cw * ah / ch; ch = ah; }
