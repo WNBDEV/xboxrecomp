@@ -827,6 +827,8 @@ static int fb_sdl_renderer(SDL_Window *win, SDL_Renderer **ren, SDL_Texture **te
     return *tex != NULL;
 }
 
+void xbox_InputPump(void);              /* xinput_device.c */
+
 static int fb_thread(void *unused)
 {
     SDL_Window *win;
@@ -938,6 +940,7 @@ static int fb_thread(void *unused)
                 memset((void *)s_key_down, 0, sizeof s_key_down);
             }
         }
+        xbox_InputPump();               /* the pads: SDL on this thread only */
         /* As the Win32 loop: input wakes it at once, the frame work runs
          * every 16 ms. Only while the GPU presents -- drawing the software
          * frames, vsync paces this loop instead. */

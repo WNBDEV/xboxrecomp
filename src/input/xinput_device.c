@@ -569,10 +569,24 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
 /* ======================================================================== */
 
 #include <SDL.h>
+#include <pthread.h>
 
 static SDL_GameController *g_pads[XBOX_MAX_CONTROLLERS];
 static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS];
 static DWORD g_packet[XBOX_MAX_CONTROLLERS];
+
+/* SDL may be driven from one thread at a time. The window's thread pumps its
+ * events, so once it calls xbox_InputPump all the controller work -- opening,
+ * reading, rumble -- happens there too, and the title's USB thread reads the
+ * pads as that thread last saw them. Before that (and with no window) the
+ * USB thread asks SDL itself. Updating the pads from the USB thread while the
+ * window's thread waited on its events crashed one start in five on Wayland
+ * ("malloc(): unaligned tcache chunk detected"): SDL wakes the waiting thread
+ * with a Wayland call made from the thread that saw the input. */
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_pumped;
+static struct { int attached; XBOX_GAMEPAD pad; } g_snap[XBOX_MAX_CONTROLLERS];
+static struct { int pending; WORD left, right; } g_rumble[XBOX_MAX_CONTROLLERS];
 
 /* Each attached game controller not open yet goes into the first free slot.
  * Matched by instance id, not list position, so a pad that stays connected
@@ -652,34 +666,11 @@ static void controllers_poll(void)
     open_controllers();
 }
 
-static DWORD backend_get_state(DWORD dwPort, XBOX_INPUT_STATE *pState)
+static void read_pad(SDL_GameController *c, XBOX_GAMEPAD *g)
 {
-    if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
-        return ERROR_DEVICE_NOT_CONNECTED;
-    controllers_poll();
-    /* input = keyboard: a pad on port 0 is not asked at all. */
-    if (dwPort == 0 && input_mode() == PLAY_KEYBOARD && keyboard_enabled()) {
-        keyboard_state(pState);
-        return ERROR_SUCCESS;
-    }
-
-    SDL_GameController *c = g_pads[dwPort];
-    if (!c || !SDL_GameControllerGetAttached(c)) {
-        g_controller_connected[dwPort] = FALSE;
-        if (dwPort == 0 && keyboard_enabled()) {
-            keyboard_state(pState);
-            return ERROR_SUCCESS;
-        }
-        return ERROR_DEVICE_NOT_CONNECTED;
-    }
-
-    SDL_GameControllerUpdate();
-    g_controller_connected[dwPort] = TRUE;
-
-    memset(pState, 0, sizeof(XBOX_INPUT_STATE));
-    pState->dwPacketNumber = ++g_packet[dwPort];
-
     WORD btn = 0;
+
+    memset(g, 0, sizeof *g);
     if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_DPAD_UP))    btn |= XBOX_GAMEPAD_DPAD_UP;
     if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_DPAD_DOWN))  btn |= XBOX_GAMEPAD_DPAD_DOWN;
     if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_DPAD_LEFT))  btn |= XBOX_GAMEPAD_DPAD_LEFT;
@@ -688,36 +679,102 @@ static DWORD backend_get_state(DWORD dwPort, XBOX_INPUT_STATE *pState)
     if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_BACK))       btn |= XBOX_GAMEPAD_BACK;
     if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_LEFTSTICK))  btn |= XBOX_GAMEPAD_LEFT_THUMB;
     if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_RIGHTSTICK)) btn |= XBOX_GAMEPAD_RIGHT_THUMB;
-    pState->Gamepad.wButtons = btn;
+    g->wButtons = btn;
 
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A] =
+    g->bAnalogButtons[XBOX_BUTTON_A] =
         SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_A) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B] =
+    g->bAnalogButtons[XBOX_BUTTON_B] =
         SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_B) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_X] =
+    g->bAnalogButtons[XBOX_BUTTON_X] =
         SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_X) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y] =
+    g->bAnalogButtons[XBOX_BUTTON_Y] =
         SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_Y) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK] =
+    g->bAnalogButtons[XBOX_BUTTON_BLACK] =
         SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE] =
+    g->bAnalogButtons[XBOX_BUTTON_WHITE] =
         SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) ? 255 : 0;
 
     /* SDL trigger axes are 0..32767 -> Xbox analog button 0..255 */
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] =
+    g->bAnalogButtons[XBOX_BUTTON_LTRIGGER] =
         (BYTE)(SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_TRIGGERLEFT) >> 7);
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] =
+    g->bAnalogButtons[XBOX_BUTTON_RTRIGGER] =
         (BYTE)(SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) >> 7);
 
     /* SDL Y axis points down; the Xbox Y axis points up -- invert.
      * Use (-1 - v) so v = -32768 does not overflow SHORT. */
-    pState->Gamepad.sThumbLX = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_LEFTX);
-    pState->Gamepad.sThumbLY =
-        (SHORT)(-1 - SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_LEFTY));
-    pState->Gamepad.sThumbRX = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTX);
-    pState->Gamepad.sThumbRY =
-        (SHORT)(-1 - SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTY));
+    g->sThumbLX = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_LEFTX);
+    g->sThumbLY = (SHORT)(-1 - SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_LEFTY));
+    g->sThumbRX = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTX);
+    g->sThumbRY = (SHORT)(-1 - SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTY));
+}
 
+/* On the window's thread, after it pumps SDL's events (which updates the
+ * pads): opens and closes pads, reads them, passes rumble on. */
+void xbox_InputPump(void)
+{
+    pthread_mutex_lock(&g_lock);
+    controllers_poll();
+    for (int slot = 0; slot < XBOX_MAX_CONTROLLERS; slot++) {
+        SDL_GameController *c = g_pads[slot];
+        g_snap[slot].attached = c && SDL_GameControllerGetAttached(c);
+        if (g_snap[slot].attached)
+            read_pad(c, &g_snap[slot].pad);
+        if (g_rumble[slot].pending && g_snap[slot].attached)
+            SDL_GameControllerRumble(c, g_rumble[slot].left, g_rumble[slot].right, 1000);
+        g_rumble[slot].pending = 0;
+    }
+    __atomic_store_n(&g_pumped, 1, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&g_lock);
+}
+
+static DWORD backend_get_state(DWORD dwPort, XBOX_INPUT_STATE *pState)
+{
+    XBOX_GAMEPAD pad;
+    int attached;
+
+    if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
+        return ERROR_DEVICE_NOT_CONNECTED;
+    static int window = -1;
+    if (window < 0) {
+        const char *e = getenv("RECOMP_FB_WINDOW");
+        window = e && *e == '1';
+    }
+    pthread_mutex_lock(&g_lock);
+    if (__atomic_load_n(&g_pumped, __ATOMIC_ACQUIRE)) {
+        attached = g_snap[dwPort].attached;
+        pad = g_snap[dwPort].pad;
+    } else if (window) {
+        attached = 0;                   /* until the window's thread has the pads */
+    } else {
+        SDL_GameController *c;
+        controllers_poll();
+        c = g_pads[dwPort];
+        attached = c && SDL_GameControllerGetAttached(c);
+        if (attached) {
+            SDL_GameControllerUpdate();
+            read_pad(c, &pad);
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+
+    /* input = keyboard: a pad on port 0 is not asked at all. */
+    if (dwPort == 0 && input_mode() == PLAY_KEYBOARD && keyboard_enabled()) {
+        keyboard_state(pState);
+        return ERROR_SUCCESS;
+    }
+    if (!attached) {
+        g_controller_connected[dwPort] = FALSE;
+        if (dwPort == 0 && keyboard_enabled()) {
+            keyboard_state(pState);
+            return ERROR_SUCCESS;
+        }
+        return ERROR_DEVICE_NOT_CONNECTED;
+    }
+    g_controller_connected[dwPort] = TRUE;
+
+    memset(pState, 0, sizeof(XBOX_INPUT_STATE));
+    pState->dwPacketNumber = ++g_packet[dwPort];
+    pState->Gamepad = pad;
     keyboard_merge(dwPort, pState);
     return ERROR_SUCCESS;
 }
@@ -732,8 +789,16 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
 
     /* SDL rumble needs a duration; refresh for ~1s on each call (the game
      * polls vibration continuously). */
-    SDL_GameControllerRumble(c, pVibration->wLeftMotorSpeed,
-                             pVibration->wRightMotorSpeed, 1000);
+    pthread_mutex_lock(&g_lock);
+    if (__atomic_load_n(&g_pumped, __ATOMIC_ACQUIRE)) {
+        g_rumble[dwPort].pending = 1;
+        g_rumble[dwPort].left = pVibration->wLeftMotorSpeed;
+        g_rumble[dwPort].right = pVibration->wRightMotorSpeed;
+    } else {
+        SDL_GameControllerRumble(c, pVibration->wLeftMotorSpeed,
+                                 pVibration->wRightMotorSpeed, 1000);
+    }
+    pthread_mutex_unlock(&g_lock);
     return ERROR_SUCCESS;
 }
 
