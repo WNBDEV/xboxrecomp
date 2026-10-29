@@ -146,6 +146,14 @@ def _parse_operand(cs, cs_op, insn_obj):
         return Operand(type="reg", reg=_reg_names.get(cs_op.reg, f"r{cs_op.reg}"))
 
 
+# Capstone's disasm() decodes its whole buffer before yielding anything, so
+# a walk that stops after a few instructions is fed a window at a time. An
+# x86 instruction is at most 15 bytes, so one that starts at least that far
+# from the end of a window decodes the same as it would from the full buffer.
+_WINDOW = 512
+_MAX_INSN = 15
+
+
 class Disassembler:
     """Capstone-based x86-32 disassembler."""
 
@@ -153,6 +161,30 @@ class Disassembler:
         self._cs = Cs(CS_ARCH_X86, CS_MODE_32)
         self._cs.detail = True
         _init_reg_names(self._cs)
+        self._decoded = {}
+
+    def _disasm_from(self, code, address):
+        """Capstone's instructions for `code` at `address`, as Cs.disasm
+        would give them, decoded a window at a time."""
+        offset = 0
+        while offset < len(code):
+            window = code[offset:offset + _WINDOW]
+            window_end = offset + len(window)
+            whole = window_end == len(code)
+            stop = offset
+            for cs_insn in self._cs.disasm(window, address + offset):
+                rel = cs_insn.address - address
+                if not whole and rel + _MAX_INSN > window_end:
+                    break
+                yield cs_insn
+                stop = rel + cs_insn.size
+            else:
+                # Capstone stopped: at the end, or at bytes that are no
+                # instruction -- unless it was too close to the window's end
+                # to tell.
+                if whole or stop + _MAX_INSN <= window_end:
+                    return
+            offset = stop
 
     def _decode_instruction(self, cs_insn):
         """Convert one Capstone instruction into the translator model."""
@@ -219,6 +251,12 @@ class Disassembler:
         if size <= 0 or size > len(raw_bytes):
             return []
 
+        key = (start_va, bytes(raw_bytes[:size]),
+               frozenset(resync) if resync else None)
+        cached = self._decoded.get(key)
+        if cached is not None:
+            return list(cached)
+
         decoded = {}
         for cs_insn in self._cs.disasm(raw_bytes[:size], start_va):
             decoded[cs_insn.address] = self._decode_instruction(cs_insn)
@@ -229,8 +267,8 @@ class Disassembler:
             for addr in [a for a, i in decoded.items()
                          if a < point < a + i.size]:
                 del decoded[addr]
-            for cs_insn in self._cs.disasm(raw_bytes[point - start_va:size],
-                                           point):
+            for cs_insn in self._disasm_from(raw_bytes[point - start_va:size],
+                                             point):
                 if cs_insn.address in decoded:
                     break          # rejoined a stream we already have
                 # The misaligned stream did not only straddle `point`: until
@@ -245,7 +283,9 @@ class Disassembler:
                     decoded.pop(inner, None)
                 decoded[cs_insn.address] = self._decode_instruction(cs_insn)
 
-        return [decoded[a] for a in sorted(decoded)]
+        result = [decoded[a] for a in sorted(decoded)]
+        self._decoded[key] = result
+        return list(result)
 
     def disassemble_cfg(self, raw_bytes, start_va, end_va, entry_points,
                         stop_addresses=None, stop_mnemonics=()):
@@ -262,7 +302,7 @@ class Disassembler:
             if not (start_va <= entry < end_va) or entry in decoded:
                 continue
             offset = entry - start_va
-            for cs_insn in self._cs.disasm(raw_bytes[offset:size], entry):
+            for cs_insn in self._disasm_from(raw_bytes[offset:size], entry):
                 if cs_insn.address != entry and cs_insn.address in stop_addresses:
                     break
                 if cs_insn.address >= end_va or cs_insn.address in decoded:

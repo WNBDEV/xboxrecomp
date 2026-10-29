@@ -771,8 +771,22 @@ class DisasmEngine:
         worklist = list(start_addresses)
         visited_starts: Set[int] = set()
 
+        # Overlapping and touching ranges merged, so one bisect answers what
+        # scanning every section for every instruction did.
+        starts: List[int] = []
+        ends: List[int] = []
+        for s, e in sorted(section_bounds):
+            if s >= e:
+                continue
+            if ends and s <= ends[-1]:
+                ends[-1] = max(ends[-1], e)
+            else:
+                starts.append(s)
+                ends.append(e)
+
         def in_bounds(addr: int) -> bool:
-            return any(s <= addr < e for s, e in section_bounds)
+            i = bisect.bisect_right(starts, addr) - 1
+            return i >= 0 and addr < ends[i]
 
         while worklist:
             addr = worklist.pop()
