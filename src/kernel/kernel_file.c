@@ -835,6 +835,36 @@ static NTSTATUS errno_to_status(int e)
     }
 }
 
+/* The host path an OBJECT_ATTRIBUTES names. A name relative to its
+ * RootDirectory handle -- XDeleteSaveGame opens each child of a save
+ * directory that way -- is joined to that directory's host path, as the
+ * Windows backend's translate_obj_path does. Without it every such open
+ * failed, so on Linux overwriting a save left the old one behind. */
+static int posix_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
+                          char* host_path, size_t size)
+{
+    const char* xbox_path = get_xbox_path(ObjectAttributes);
+    if (!xbox_path)
+        return 0;
+    if (ObjectAttributes->RootDirectory && xbox_path[0] != '\\' &&
+        !(xbox_path[0] && xbox_path[1] == ':')) {
+        const char* dir = w32_handle_path(ObjectAttributes->RootDirectory);
+        size_t n;
+        char* q;
+        if (!dir || !dir[0])
+            return 0;
+        n = strlen(dir);
+        if ((size_t)snprintf(host_path, size, "%s%s%s", dir,
+                             dir[n - 1] == '/' ? "" : "/", xbox_path) >= size)
+            return 0;
+        for (q = host_path + n; *q; q++)
+            if (*q == '\\')
+                *q = '/';
+        return 1;
+    }
+    return xbox_translate_path(xbox_path, host_path, size);
+}
+
 NTSTATUS __stdcall xbox_NtCreateFile(
     PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
@@ -847,8 +877,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     if (!FileHandle || !ObjectAttributes)
         return STATUS_INVALID_PARAMETER;
 
-    const char* xbox_path = get_xbox_path(ObjectAttributes);
-    if (!xbox_path || !xbox_translate_path(xbox_path, host_path, MAX_PATH)) {
+    if (!posix_obj_path(ObjectAttributes, host_path, MAX_PATH)) {
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_FILE, "NtCreateFile: path translation failed");
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
@@ -972,8 +1001,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
 {
     char host_path[MAX_PATH];
-    const char* xbox_path = get_xbox_path(ObjectAttributes);
-    if (!xbox_path || !xbox_translate_path(xbox_path, host_path, MAX_PATH))
+    if (!posix_obj_path(ObjectAttributes, host_path, MAX_PATH))
         return STATUS_OBJECT_PATH_NOT_FOUND;
     XBOX_TRACE(XBOX_LOG_FILE, "NtDeleteFile: %s", host_path);
     if (unlink(host_path) == 0) return STATUS_SUCCESS;
@@ -1081,10 +1109,16 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
         case XboxFileDispositionInformation: {
             PXBOX_FILE_DISPOSITION_INFORMATION info = (PXBOX_FILE_DISPOSITION_INFORMATION)FileInformation;
             /* POSIX: unlinking an open file removes it on last close -- this
-             * matches NT "delete on close" semantics exactly. */
+             * matches NT "delete on close" semantics exactly. A directory
+             * (a save's, once its files are gone) needs rmdir: unlink fails
+             * on one with EISDIR (EPERM in POSIX). As on Windows, a failure
+             * is logged, not returned. */
             if (info->DeleteFile) {
                 const char* p = w32_handle_path(FileHandle);
-                if (p) unlink(p);
+                if (p && unlink(p) != 0 &&
+                    ((errno != EISDIR && errno != EPERM) || rmdir(p) != 0))
+                    xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
+                             "delete of %s failed: errno=%d", p, errno);
             }
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
@@ -1167,8 +1201,7 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
 
     if (!FileInformation)
         return STATUS_INVALID_PARAMETER;
-    const char* xbox_path = get_xbox_path(ObjectAttributes);
-    if (!xbox_path || !xbox_translate_path(xbox_path, host_path, MAX_PATH))
+    if (!posix_obj_path(ObjectAttributes, host_path, MAX_PATH))
         return STATUS_OBJECT_PATH_NOT_FOUND;
     if (stat(host_path, &st) != 0)
         return STATUS_OBJECT_NAME_NOT_FOUND;
