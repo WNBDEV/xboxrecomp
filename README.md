@@ -118,6 +118,8 @@ Environment variables, read at start-up. Defaults in brackets.
 | | `RECOMP_AUDIO_DUMP` | file: append the output as raw 48 kHz stereo s16le |
 | Diagnostics | `RECOMP_WAIT_PROFILE`, `RECOMP_GPU_PROFILE` | where threads block; where GPU time goes |
 | | `RECOMP_IRQL_PROFILE` | each ISR/DPC delivery kept over 4 ms from DISPATCH_LEVEL, with the holder and where it raised |
+| | `RECOMP_FRAME_STATS` | every 10 s: frame times (mean, p50/p95/p99, max), the title thread's CPU time and kernel waits by caller, the NV2A executor's CPU, idle, flip-pacing and Present time, draws a frame |
+| | `RECOMP_TRACE=<file.json>` | a timeline of both threads (Chrome trace format, opens in ui.perfetto.dev): command runs, pacing, Present, software-method stalls, kernel calls of 50 us or more, flips. `RECOMP_TRACE_FOR` seconds (5), from when `RECOMP_TRACE_TRIGGER`'s file exists or `RECOMP_TRACE_AT` seconds after the first frame (10) |
 | | `RECOMP_PB_TIMING` | every 10 s: the executor's time running commands, how much on the CPU, and per pushbuffer word |
 | | `RECOMP_AUDIO_STATS`, `RECOMP_APU_VOICES`, `RECOMP_APU_PHYS_STATS` | levels, voices on/off, how APU reads resolve |
 | | `RECOMP_HEAP_STATS`, `RECOMP_CONTIG_TRACE` | heap use; contiguous allocations and frees |

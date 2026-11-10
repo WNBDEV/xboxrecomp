@@ -15,6 +15,7 @@
 #include "xbox_memory_layout.h"
 #include "kernel.h"
 #include "guest_vmem.h"
+#include "frame_trace.h"
 #include <stdio.h>
 #include <stdlib.h>
 #ifndef _WIN32
@@ -1092,12 +1093,16 @@ static double thread_cpu_ms(void)
 static void pb_timing_cpu(int end)
 {
     static double t0;
-    if (!pb_timing_on())
+    double d;
+    if (!pb_timing_on() && !xbox_FrameTraceOn())
         return;
-    if (end)
-        s_pb_cpu_ms += thread_cpu_ms() - t0;
-    else
+    if (!end) {
         t0 = thread_cpu_ms();
+        return;
+    }
+    d = thread_cpu_ms() - t0;
+    s_pb_cpu_ms += d;
+    xbox_FrameTraceAdd(FTR_EXEC_CPU, d);
 }
 
 static void pb_timing_add(LARGE_INTEGER a, LARGE_INTEGER b, LARGE_INTEGER f)
@@ -1248,15 +1253,24 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                         if (!qf.QuadPart)
                             QueryPerformanceFrequency(&qf);
                         QueryPerformanceCounter(&t);
-                        if (idle_since.QuadPart)
-                            g_nv2a_pb_wait_ms += (double)(t.QuadPart - idle_since.QuadPart)
-                                                 * 1000.0 / (double)qf.QuadPart;
+                        if (idle_since.QuadPart) {
+                            double idle = (double)(t.QuadPart - idle_since.QuadPart)
+                                          * 1000.0 / (double)qf.QuadPart;
+                            g_nv2a_pb_wait_ms += idle;
+                            if (xbox_FrameTraceOn())
+                                xbox_FrameTraceAdd(FTR_EXEC_IDLE, idle);
+                        }
                         pb_timing_cpu(0);
                         gpu_get = nv2a_pb_run(gpu_get, put,
                             (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET));
                         pb_timing_cpu(1);
                         QueryPerformanceCounter(&idle_since);
                         pb_timing_add(t, idle_since, qf);
+                        if (xbox_FrameTraceOn())
+                            xbox_FrameTraceSpan("commands",
+                                                (double)t.QuadPart * 1e6 / (double)qf.QuadPart,
+                                                (double)idle_since.QuadPart * 1e6 / (double)qf.QuadPart,
+                                                gpu_get, put);
                         s_nv2a_last_work_ms = GetTickCount();
                     }
                     /* Periodic, because what the title submits at init is not

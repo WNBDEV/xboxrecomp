@@ -24,6 +24,7 @@
  * has not given us any vertices". RECOMP_FB_DUMP=<prefix> writes the surface to
  * <prefix>NNN.bmp, so the result can be looked at without a display.
  */
+#include "frame_trace.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -3665,6 +3666,12 @@ static void flip_pace(void)
             QueryPerformanceCounter(&now);
         while (now.QuadPart < next);        /* under a millisecond */
         g_flip_pace_ms += (double)(now.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart;
+        if (xbox_FrameTraceOn()) {
+            xbox_FrameTraceAdd(FTR_PACING,
+                               (double)(now.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart);
+            xbox_FrameTraceSpan("flip pacing", (double)t0.QuadPart * 1e6 / (double)freq.QuadPart,
+                                (double)now.QuadPart * 1e6 / (double)freq.QuadPart, 0, 0);
+        }
     }
     if (!next || now.QuadPart - next > 2 * period)
         next = now.QuadPart - 2 * period;   /* bank at most two frames */
@@ -4591,6 +4598,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             extern void xbox_FramebufferWindowFrameStats(uint32_t);
             static uint32_t draws_at_flip;
             xbox_FramebufferWindowFrameStats(s_gpu.draws - draws_at_flip);
+            if (xbox_FrameTraceOn())
+                xbox_FrameTraceDraws(s_gpu.draws - draws_at_flip);
             draws_at_flip = s_gpu.draws;
         }
         if (s_gpu.pitch) {

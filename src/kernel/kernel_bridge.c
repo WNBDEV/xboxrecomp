@@ -25,6 +25,7 @@
  *   different parameter layouts (pointer vs value), so each needs its own bridge.
  */
 
+#include "frame_trace.h"
 #include "kernel.h"
 #include "guest_vmem.h"
 #include "xbox_memory_layout.h"
@@ -2520,6 +2521,14 @@ void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t method, uint32_t param)
     }
     pgraph_w1c_arm(0);
     InterlockedExchange(&s_swmethod_pending, 0);
+    if (xbox_FrameTraceOn()) {
+        static LARGE_INTEGER f;
+        if (!f.QuadPart)
+            QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&t1);
+        xbox_FrameTraceSpan("software method", (double)t0.QuadPart * 1e6 / (double)f.QuadPart,
+                            (double)t1.QuadPart * 1e6 / (double)f.QuadPart, method, param);
+    }
     if (wait_profile_on()) {
         QueryPerformanceCounter(&t1);
         wait_profile_add(0xFFFF, method, param, wait_profile_ms(t0, t1));
@@ -9876,13 +9885,22 @@ static void kernel_thunk_dispatch_body(void)
         }
     }
 
-    if (bridge && wait_profile_on()) {
+    if (bridge && (wait_profile_on() || xbox_FrameTraceOn())) {
         LARGE_INTEGER t0, t1;
         uint32_t caller = g_xbox_kernel_caller, arg = STACK_ARG(0);
         QueryPerformanceCounter(&t0);
         bridge();
         QueryPerformanceCounter(&t1);
-        wait_profile_add(ordinal, caller, arg, wait_profile_ms(t0, t1));
+        if (wait_profile_on())
+            wait_profile_add(ordinal, caller, arg, wait_profile_ms(t0, t1));
+        if (xbox_FrameTraceOn()) {
+            static LARGE_INTEGER f;
+            if (!f.QuadPart)
+                QueryPerformanceFrequency(&f);
+            xbox_FrameTraceKernelCall(ordinal, caller, arg,
+                                      (double)t0.QuadPart * 1e6 / (double)f.QuadPart,
+                                      (double)t1.QuadPart * 1e6 / (double)f.QuadPart);
+        }
     } else if (bridge) {
         bridge();
     } else {

@@ -15,6 +15,7 @@
  * Linux libraries -- when built with XBOX_DXVK_NATIVE; see the block below
  * the includes.
  */
+#include "frame_trace.h"
 #include "nv2a_gpu.h"
 #include "nv2a_vsh_interp.h"
 
@@ -2602,6 +2603,8 @@ static void ft_frame(void)
                     f->tex_checks, f->n_shaders, f->shaders, f->present, f->ms - f->wait
                     - f->tex_new - f->tex_changed - f->tex_checks - f->shaders - f->present);
     }
+    if (xbox_FrameTraceOn())
+        xbox_FrameTraceFrame();
     g_ft_tot_present += f->present;
     g_ft_tot_tex += f->tex_new + f->tex_changed + f->tex_checks;
     g_ft_tot_shaders += f->shaders;
@@ -3061,6 +3064,10 @@ int nv2a_gpu_present(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, ui
         double t0 = ft_ms();
         IDXGISwapChain_Present(s_swap, xbox_FramebufferHalfRate() ? 2 : 1, 0);
         s_ft.cur.present += ft_ms() - t0;
+        if (xbox_FrameTraceOn()) {
+            xbox_FrameTraceAdd(FTR_PRESENT, ft_ms() - t0);
+            xbox_FrameTraceSpan("Present", t0 * 1000.0, ft_ms() * 1000.0, 0, 0);
+        }
     }
     return 1;
 }
