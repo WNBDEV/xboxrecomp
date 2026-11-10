@@ -2578,6 +2578,10 @@ static double ft_slow_ms(void)
     return xbox_FramebufferHalfRate() ? 2.0 * FT_SLOW_MS : FT_SLOW_MS;
 }
 
+/* RECOMP_PB_TIMING: the frames' Present, texture and shader time summed, for
+ * xbox_memory_layout.c's ten-second line (which resets them). */
+double g_ft_tot_present, g_ft_tot_tex, g_ft_tot_shaders;
+
 static void ft_frame(void)
 {
     double now = ft_ms();
@@ -2598,6 +2602,9 @@ static void ft_frame(void)
                     f->tex_checks, f->n_shaders, f->shaders, f->present, f->ms - f->wait
                     - f->tex_new - f->tex_changed - f->tex_checks - f->shaders - f->present);
     }
+    g_ft_tot_present += f->present;
+    g_ft_tot_tex += f->tex_new + f->tex_changed + f->tex_checks;
+    g_ft_tot_shaders += f->shaders;
     memset(f, 0, sizeof *f);
 }
 

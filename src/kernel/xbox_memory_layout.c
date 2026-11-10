@@ -17,6 +17,9 @@
 #include "guest_vmem.h"
 #include <stdio.h>
 #include <stdlib.h>
+#ifndef _WIN32
+#include <time.h>   /* CLOCK_THREAD_CPUTIME_ID, for RECOMP_PB_TIMING */
+#endif
 #include <string.h>
 #include <setjmp.h>
 #if !defined(_WIN32)
@@ -1054,6 +1057,80 @@ static DWORD WINAPI nv2a_busy_ack_thread(LPVOID param)
     return 0;
 }
 
+/* RECOMP_PB_TIMING=1: every ten seconds, how long the executor spent running
+ * the title's commands, how much of that it was on the CPU, and how many words
+ * that was. The CPU time per word is its speed, apart from how much a scene
+ * asks of it; the wall time also holds the flip pacing's sleep (flip_pace,
+ * shown on the line) and anything else that blocked it. */
+static double s_pb_cpu_ms;
+double g_flip_pace_ms;
+
+static int pb_timing_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("RECOMP_PB_TIMING") != NULL;
+    return on;
+}
+
+/* This thread's CPU time, ms. */
+static double thread_cpu_ms(void)
+{
+#ifdef _WIN32
+    FILETIME c, e, k, u;
+    if (!GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u))
+        return 0.0;
+    return ((double)(((uint64_t)k.dwHighDateTime << 32) | k.dwLowDateTime)
+            + (double)(((uint64_t)u.dwHighDateTime << 32) | u.dwLowDateTime)) / 1e4;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+#endif
+}
+
+static void pb_timing_cpu(int end)
+{
+    static double t0;
+    if (!pb_timing_on())
+        return;
+    if (end)
+        s_pb_cpu_ms += thread_cpu_ms() - t0;
+    else
+        t0 = thread_cpu_ms();
+}
+
+static void pb_timing_add(LARGE_INTEGER a, LARGE_INTEGER b, LARGE_INTEGER f)
+{
+    static double ms;
+    static uint32_t words0;
+    static DWORD last;
+    extern uint32_t nv2a_pb_words(void);
+    DWORD now;
+
+    if (!pb_timing_on())
+        return;
+    ms += (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)f.QuadPart;
+    now = GetTickCount();
+    if (!last) {
+        last = now;
+        words0 = nv2a_pb_words();
+    } else if (now - last >= 10000) {
+        extern double g_ft_tot_present, g_ft_tot_tex, g_ft_tot_shaders;
+        uint32_t w = nv2a_pb_words() - words0;
+        fprintf(stderr, "[PB-TIME] last %.1f s: %u words, %.0f ms running them (%.0f on the CPU, "
+                "%.1f ns a word), of which Present %.0f, textures %.0f, shaders %.0f; "
+                "flip pacing slept %.0f ms\n", (now - last) / 1000.0, w, ms, s_pb_cpu_ms,
+                w ? s_pb_cpu_ms * 1e6 / w : 0.0, g_ft_tot_present, g_ft_tot_tex,
+                g_ft_tot_shaders, g_flip_pace_ms);
+        s_pb_cpu_ms = g_flip_pace_ms = 0.0;
+        g_ft_tot_present = g_ft_tot_tex = g_ft_tot_shaders = 0.0;
+        ms = 0.0;
+        last = now;
+        words0 = nv2a_pb_words();
+    }
+}
+
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
@@ -1174,9 +1251,12 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                         if (idle_since.QuadPart)
                             g_nv2a_pb_wait_ms += (double)(t.QuadPart - idle_since.QuadPart)
                                                  * 1000.0 / (double)qf.QuadPart;
+                        pb_timing_cpu(0);
                         gpu_get = nv2a_pb_run(gpu_get, put,
                             (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET));
+                        pb_timing_cpu(1);
                         QueryPerformanceCounter(&idle_since);
+                        pb_timing_add(t, idle_since, qf);
                         s_nv2a_last_work_ms = GetTickCount();
                     }
                     /* Periodic, because what the title submits at init is not

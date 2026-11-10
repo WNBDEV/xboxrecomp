@@ -59,10 +59,25 @@ static int s_exec_enabled = -1;
  * (perf, ~300 distinct methods). Methods are word offsets below 0x2000. */
 static uint16_t s_seen_at[8][0x800];
 
+/* The survey's count of each method. Only RECOMP_PB_SCAN prints it, and the
+ * executor walks every word through here, so without it this returns at
+ * once: counting was a few percent of the executor's time in heavy fights. */
+static int s_survey = -1;
+
+static int survey_on(void)
+{
+    if (s_survey < 0)
+        s_survey = getenv("RECOMP_PB_SCAN") != NULL;
+    return s_survey;
+}
+
 static void note(uint32_t subch, uint32_t method)
 {
-    uint16_t *at = &s_seen_at[subch & 7u][(method >> 2) & 0x7FFu];
+    uint16_t *at;
 
+    if (!survey_on())
+        return;
+    at = &s_seen_at[subch & 7u][(method >> 2) & 0x7FFu];
     if (*at) {
         s_seen[*at - 1].count++;
         return;
@@ -259,6 +274,15 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
     s_tot_segments++;
 }
 
+/* Words consumed so far, for RECOMP_PB_TIMING. */
+uint32_t nv2a_pb_words(void)
+{
+    return s_tot_words;
+}
+
+extern uint32_t nv2a_pb_exec_bulk(uint32_t method, int noninc, const uint32_t *p,
+                                  uint32_t n);
+
 /* Consume the ring from GET to PUT the way the GPU's puller does: in order,
  * taking the main ring's JUMPs (D3D ends each lap with one back to the start)
  * rather than stopping at them. Returns the new GET.
@@ -336,10 +360,21 @@ uint32_t nv2a_pb_run(uint32_t get, uint32_t put, volatile uint32_t *get_reg)
             uint32_t subch  = (w >> 13) & 7u;
             uint32_t method =  w & 0x1FFCu;
             int noninc = (w & 0xE0000000u) == 0x40000000u;
+            uint32_t i = 0;
 
             va += 4;
             words++;
-            for (uint32_t i = 0; i < count && va != put_va; i++) {
+            /* The bulk methods in one go (nv2a_pb_exec_bulk), unless the
+             * survey is counting every word. Never past PUT. */
+            if (s_exec_enabled && subch == 0 && count && !survey_on()) {
+                uint32_t n = count;
+                if (put_va >= va && n > (put_va - va) / 4)
+                    n = (put_va - va) / 4;
+                i = nv2a_pb_exec_bulk(method, noninc, (const uint32_t *)(mem + va), n);
+                va += 4 * i;
+                words += i;
+            }
+            for (; i < count && va != put_va; i++) {
                 uint32_t m = noninc ? method : method + i * 4;
                 note(subch, m);
                 if (s_exec_enabled)

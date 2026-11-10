@@ -414,6 +414,10 @@ static struct {
 #define PB_EXEC_MAX_UNHANDLED 2048
 typedef struct { uint32_t method, count, last_param; } PbUnhandled;
 static PbUnhandled s_unhandled[PB_EXEC_MAX_UNHANDLED];
+/* Slot + 1 of each method in s_unhandled, 0 for none: a title that leaves
+ * dozens of methods unhandled sent every one of them on a walk down the
+ * list. */
+static uint16_t s_unhandled_at[0x800];
 static int s_unhandled_count;
 
 /* Every texture-stage register, as the title last set it.
@@ -526,21 +530,20 @@ static void note_texture_use(void)
 
 static void note_unhandled(uint32_t method, uint32_t param)
 {
-    int i;
+    uint16_t *at = &s_unhandled_at[(method >> 2) & 0x7FFu];
 
     s_gpu.unhandled_total++;
-    for (i = 0; i < s_unhandled_count; i++) {
-        if (s_unhandled[i].method == method) {
-            s_unhandled[i].count++;
-            s_unhandled[i].last_param = param;
-            return;
-        }
+    if (*at && s_unhandled[*at - 1].method == method) {
+        s_unhandled[*at - 1].count++;
+        s_unhandled[*at - 1].last_param = param;
+        return;
     }
     if (s_unhandled_count < PB_EXEC_MAX_UNHANDLED) {
         s_unhandled[s_unhandled_count].method = method;
         s_unhandled[s_unhandled_count].count = 1;
         s_unhandled[s_unhandled_count].last_param = param;
         s_unhandled_count++;
+        *at = (uint16_t)s_unhandled_count;
     }
 }
 
@@ -3150,6 +3153,32 @@ static void gpu_draw_batch(uint32_t n)
     note_drawn();
 }
 
+/* fetch_attr for the batch loop: floats and D3DCOLOR from guest memory, the
+ * bulk of every vertex, without the call; anything else goes to fetch_attr. */
+static inline void fetch_attr_fast(const VertexAttr *a, uint32_t index, float out[4])
+{
+    const uint8_t *p;
+    uint32_t i;
+
+    if (s_gpu.inline_active || !a->offset || !a->size || !a->stride
+            || (a->type != 2 && a->type != 0)) {
+        fetch_attr(a, index, out);
+        return;
+    }
+    p = (const uint8_t *)xbox_GetMemoryOffset() + a->offset + (size_t)index * a->stride;
+    if (a->type == 0) {
+        out[0] = (float)p[2] / 255.0f;
+        out[1] = (float)p[1] / 255.0f;
+        out[2] = (float)p[0] / 255.0f;
+        out[3] = (float)p[3] / 255.0f;
+        return;
+    }
+    out[0] = out[1] = out[2] = 0.0f;
+    out[3] = 1.0f;
+    for (i = 0; i < a->size && i < 4; i++)
+        out[i] = ((const float *)p)[i];
+}
+
 /* Vertex programs on the GPU too (RECOMP_GPU_VS, on unless 0): each distinct
  * index's attributes fetched once, only those the program reads, and an
  * index list in the batch's primitive order. 0 when the program has to stay
@@ -3165,10 +3194,11 @@ static int gpu_draw_batch_program(uint32_t n)
     /* Open addressing, kept under half full: up to NV_MAX_INDICES distinct
      * indices in 2^17 slots. */
     static struct { uint32_t index, gen, slot; } map[1u << 17];
+    static uint32_t near_gen[NV_MAX_INDICES], near_slot[NV_MAX_INDICES];
     static uint32_t gen;
     static int on = -1;
     Nv2aGpuState g;
-    uint32_t i, a, k = 0, nv = 0, mask;
+    uint32_t i, a, k = 0, nv = 0, mask, lo, hi, act[16], na = 0;
 
     if (on < 0) {
         const char *e = getenv("RECOMP_GPU_VS");
@@ -3179,8 +3209,37 @@ static int gpu_draw_batch_program(uint32_t n)
     mask = nv2a_vsh_input_mask();
     if (++gen == 0) {
         memset(map, 0, sizeof map);
+        memset(near_gen, 0, sizeof near_gen);
         gen = 1;
     }
+    /* A batch's indices are nearly always a narrow range, and then a table
+     * indexed by the distance from the lowest one does the hash's job in
+     * order: the hash scattered every index over 1.5 MB, a cache miss each,
+     * and was the executor's own costliest step in heavy fights. Same slots
+     * in the same order, so the same draw. */
+    lo = hi = n ? s_gpu.idx[0] : 0;
+    for (i = 1; i < n; i++) {
+        if (s_gpu.idx[i] < lo)
+            lo = s_gpu.idx[i];
+        if (s_gpu.idx[i] > hi)
+            hi = s_gpu.idx[i];
+    }
+    for (a = 0; a < 16; a++)
+        if (mask & (1u << a))
+            act[na++] = a;
+    if (n && hi - lo < NV_MAX_INDICES) {
+        for (i = 0; i < n; i++) {
+            uint32_t idx = s_gpu.idx[i], d = idx - lo;
+            if (near_gen[d] != gen) {
+                near_gen[d] = gen;
+                near_slot[d] = nv;
+                for (a = 0; a < na; a++)
+                    fetch_attr_fast(&s_gpu.attr[act[a]], idx, attr[act[a]][nv]);
+                nv++;
+            }
+            local[i] = near_slot[d];
+        }
+    } else
     for (i = 0; i < n; i++) {
         uint32_t idx = s_gpu.idx[i], h = (idx * 2654435761u) >> 15;
         for (;;) {
@@ -3597,12 +3656,15 @@ static void flip_pace(void)
     period = (int64_t)((double)freq.QuadPart / (xbox_FramebufferHalfRate() ? hz / 2.0 : hz));
     QueryPerformanceCounter(&now);
     if (next && now.QuadPart < next) {
+        extern double g_flip_pace_ms;       /* RECOMP_PB_TIMING */
         int64_t ms = (next - now.QuadPart) * 1000 / freq.QuadPart;
+        LARGE_INTEGER t0 = now;
         if (ms > 0)
             Sleep((DWORD)ms);
         do
             QueryPerformanceCounter(&now);
         while (now.QuadPart < next);        /* under a millisecond */
+        g_flip_pace_ms += (double)(now.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart;
     }
     if (!next || now.QuadPart - next > 2 * period)
         next = now.QuadPart - 2 * period;   /* bank at most two frames */
@@ -4697,6 +4759,44 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     }
 }
 
+/* A run of parameters for one method header, for the methods that come in
+ * bulk: indices (ARRAY_ELEMENT16), inline vertex data (INLINE_ARRAY) and
+ * vertex-program constants (TRANSFORM_CONSTANT). They are most of the words
+ * in a frame -- in a heavy fight 37%, 9% and 27% of about six million a
+ * second -- and one at a time each paid for nv2a_pb_exec_method's way in.
+ * This does what those cases do, word for word, in a loop; nothing before
+ * the switch applies to them (the frame trace leaves them out). Returns how
+ * many it took, 0 for any other method; the caller sends the rest of the run
+ * one at a time. Subchannel 0 only. */
+uint32_t nv2a_pb_exec_bulk(uint32_t method, int noninc, const uint32_t *p, uint32_t n)
+{
+    uint32_t i;
+
+    if (noninc && method == NV097_ARRAY_ELEMENT16) {
+        for (i = 0; i < n; i++) {
+            if (s_gpu.prim && s_gpu.idx_count + 2 <= NV_MAX_INDICES) {
+                s_gpu.idx[s_gpu.idx_count++] = p[i] & 0xFFFF;
+                s_gpu.idx[s_gpu.idx_count++] = p[i] >> 16;
+            } else if (s_gpu.prim) {
+                index_overflow();
+            }
+        }
+        return n;
+    }
+    if (noninc && method == NV097_INLINE_ARRAY) {
+        for (i = 0; i < n && s_gpu.prim && s_gpu.inline_count < NV_MAX_INLINE; i++)
+            s_gpu.inline_buf[s_gpu.inline_count++] = p[i];
+        return n;
+    }
+    if (method >= 0x0B80 && method < 0x0C00) {      /* TRANSFORM_CONSTANT(i) */
+        if (!noninc && n > (0x0C00 - method) / 4)
+            n = (0x0C00 - method) / 4;              /* the rest is past the range */
+        nv2a_vsh_constant_words(p, n);
+        return n;
+    }
+    return 0;
+}
+
 /* Find where the title actually wrote its quad.
  *
  * The GPU is pointed at a buffer that stays zero, which says the data went
@@ -4981,6 +5081,8 @@ void nv2a_pb_exec_report(void)
             PbUnhandled t = s_unhandled[i];
             s_unhandled[i] = s_unhandled[best];
             s_unhandled[best] = t;
+            s_unhandled_at[(s_unhandled[i].method >> 2) & 0x7FFu] = (uint16_t)(i + 1);
+            s_unhandled_at[(s_unhandled[best].method >> 2) & 0x7FFu] = (uint16_t)(best + 1);
         }
         {
             /* The value as well as the count. A method nobody decoded is

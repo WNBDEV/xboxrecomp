@@ -118,6 +118,7 @@ Environment variables, read at start-up. Defaults in brackets.
 | | `RECOMP_AUDIO_DUMP` | file: append the output as raw 48 kHz stereo s16le |
 | Diagnostics | `RECOMP_WAIT_PROFILE`, `RECOMP_GPU_PROFILE` | where threads block; where GPU time goes |
 | | `RECOMP_IRQL_PROFILE` | each ISR/DPC delivery kept over 4 ms from DISPATCH_LEVEL, with the holder and where it raised |
+| | `RECOMP_PB_TIMING` | every 10 s: the executor's time running commands, how much on the CPU, and per pushbuffer word |
 | | `RECOMP_AUDIO_STATS`, `RECOMP_APU_VOICES`, `RECOMP_APU_PHYS_STATS` | levels, voices on/off, how APU reads resolve |
 | | `RECOMP_HEAP_STATS`, `RECOMP_CONTIG_TRACE` | heap use; contiguous allocations and frees |
 | | `RECOMP_FRAME_TRACE`, `RECOMP_TRI_PROBE=x,y`, `RECOMP_DEBUG_HOLES`, `RECOMP_TEX_DIAG`, `RECOMP_VSH_NAN` | one frame's methods; the triangles covering a pixel; undrawn pixels in magenta; bad texels; NaN vertex outputs |
